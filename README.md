@@ -84,15 +84,42 @@ claude mcp add --transport http share https://share.<your-tailnet>.ts.net/mcp
 ### MCP
 
 A Streamable HTTP MCP server at `/mcp`, stateless — no session IDs, no server
-state, so it scales to as many workers as you like. Five tools:
+state, so it scales to as many workers as you like.
+
+**It never carries the file itself, in either direction.** Every tool deals in
+URLs; the agent moves the bytes with curl, straight off disk. Four tools:
 
 | tool | what it does |
 |---|---|
-| `share_file` | upload text or base64 and get the URL to hand over |
-| `list_shared_files` | what this `session_id` has shared, still live, with URLs |
-| `get_shared_file` | read a file back — markdown as text, images as images |
-| `get_shared_file_metadata` | name, kind, size, checksum, expiry, view count |
+| `get_upload_url` | a URL, and a ready-to-run curl command, for putting a file in |
+| `list_shared_files` | what this `session_id` has shared, with both URLs for each |
+| `get_shared_file` | one file: metadata, the human's `url`, and the `content_url` to fetch |
 | `delete_shared_file` | delete now, before expiry |
+
+The reason is arithmetic. A tool argument or result passes through the model's
+context verbatim, and base64 inflates by a third: a 20 KB screenshot costs
+thousands of tokens to send and thousands more to read back, and a 3 MB PDF does
+not fit at all. `curl -F file=@…` moves it off disk for nothing.
+
+The upload flow is three steps and no state:
+
+```
+get_upload_url(filename: "report.md", path: "/tmp/report.md", session_id: …)
+  → { "command": "curl -fsS -F 'file=@/tmp/report.md' 'https://…/api/v1/files?…'", … }
+
+run the command
+  → { "url": "https://share.…/f/rK7mQ2…", "content_url": "…", … }
+
+give the human the "url"
+```
+
+Nothing is reserved and nothing is written until the bytes arrive, so an
+abandoned `get_upload_url` costs exactly nothing — there is no half-finished
+upload to expire and reap.
+
+The cost, stated plainly: an MCP client with **no shell and no HTTP tool cannot
+upload** through this server at all. That is the trade, and it is the right one
+for a coding agent, which has both.
 
 The `initialize` response carries `instructions` built from the **running
 configuration** — your real retention, your real size cap, your own
@@ -123,10 +150,9 @@ Upload answers `201` with JSON; the field to hand over is `url`. Optional on any
 upload: `session_id`, `title`, `note`, `ttl_days` (shorter than the configured
 maximum, never longer).
 
-**For binaries, prefer REST over MCP.** `share_file` takes base64 in the tool
-call, which means the bytes pass through the agent's context — a 20 KB PNG costs
-thousands of tokens. `curl -F file=@…` reads straight from disk. Same service,
-same store, same URL.
+The REST API is the data plane for agents too — `get_upload_url` hands back a
+URL into exactly these endpoints. It still accepts JSON with base64, which is
+useful for a client that has HTTP but no shell.
 
 ### The web page
 

@@ -1,6 +1,22 @@
 package Share::MCP;
 
-# A Streamable HTTP MCP server, stateless.
+# A Streamable HTTP MCP server, stateless, and deliberately WITHOUT a data path.
+#
+# No tool here carries file bytes in either direction. Uploading means calling
+# get_upload_url and then running the command it hands back; reading a file back
+# means fetching its content_url. MCP is the control plane, HTTP is the data
+# plane, and the two never mix.
+#
+# The reason is arithmetic. A tool argument or result passes through the model's
+# context verbatim, and base64 inflates by a third: a 20 KB screenshot costs
+# thousands of tokens to send and thousands more to read back, and a 3 MB PDF
+# does not fit at all. Meanwhile `curl -F file=@…` moves it off disk for nothing.
+# Once uploads work that way, having downloads work differently would just be an
+# inconsistency for an agent to trip over.
+#
+# The cost, stated plainly: an MCP client with no shell and no HTTP tool can no
+# longer upload through this server at all. That is the trade — it is the right
+# one for a coding agent, which has both.
 #
 # "Stateless" is doing real work here: we never issue an Mcp-Session-Id, so
 # there is nothing to expire, nothing pinning a client to a particular worker,
@@ -15,10 +31,10 @@ package Share::MCP;
 use Mojo::Base -strict, -signatures;
 use utf8;
 
-use JSON::PP    ();
-use Mojo::JSON  qw(false true);
-use Mojo::Util  qw(b64_encode);
-use Share::Store qw(human_size payload_bytes);
+use JSON::PP     ();
+use Mojo::JSON   qw(false true);
+use Mojo::URL    ();
+use Share::Store qw(human_size);
 
 our $VERSION = '1.0.0';
 
@@ -27,11 +43,6 @@ our $VERSION = '1.0.0';
 # newest, and the client decides whether it can live with that.
 use constant VERSIONS => [qw(2025-06-18 2025-03-26 2024-11-05)];
 use constant LATEST   => VERSIONS->[0];
-
-# Images come back as a real MCP image block — that is the point of an agent
-# being able to re-read a screenshot it shared. Past this size it is a link
-# instead, because nobody wants 20 MB of base64 in a context window.
-use constant MAX_INLINE => 5 * 1024 * 1024;
 
 # Pretty and key-ordered: this JSON is read by a model, and by a human reading
 # the model's transcript.
@@ -51,32 +62,41 @@ sub _instructions ($c) {
   $notice = defined $notice && length $notice ? "  * $notice\n" : '';
 
   return sprintf <<'TXT', human_size($cfg->{max_bytes}), $cfg->{ttl_days}, $notice;
-This server hands a file from you to a human being.
+This server hands a file from you to a human being, and back.
 
-Upload with share_file and you get back a URL. Give that URL to the person you
-are talking to, in plain text, and they open it in a browser. They see a page
-with the file's name, size and expiry at the top, and the file itself rendered
-below: markdown gets real typography and mermaid diagrams get drawn, images are
-displayed, PDFs open in the browser's own viewer.
+IT NEVER CARRIES THE FILE ITSELF. Every tool here deals in URLs; you move the
+bytes yourself with curl, straight off disk. That keeps a 3 MB PDF out of your
+context entirely.
+
+To give a human a file:
+
+  1. Call get_upload_url with the filename, and your session_id.
+  2. Run the "command" it hands back. It is a one-line curl.
+  3. The JSON that curl prints contains "url". Give THAT to the person you are
+     talking to, in plain text.
+
+They open it in a browser and see the file's name, size and expiry at the top,
+with the file itself rendered below: markdown gets real typography and mermaid
+diagrams get drawn, images are displayed, PDFs open in the browser's own viewer.
 
 Use it whenever the answer is something to LOOK at rather than to read in a
 terminal: a long report, a generated diagram, a screenshot, a PDF.
 
-It works the other way too. A human can upload through the same web page and
-hand you a URL; read what they sent with get_shared_file.
+To read a file back, including one a human uploaded and sent you: call
+get_shared_file for its metadata, then fetch the "content_url" it returns. Do
+not ask this server for the contents; it will only ever give you the URL.
 
 Things worth knowing:
 
-  * Only markdown (.md), images (.png .jpg .gif .webp .svg) and .pdf are
+  * Only markdown (.md), images (.png .jpg .gif .webp .svg .heic) and .pdf are
     accepted, up to %s each. The extension on the filename must match the
-    actual bytes.
+    actual bytes, or the upload is refused.
   * Files are deleted %s days after upload and the URL dies with them. Pass
     ttl_days for something shorter. Nothing here is durable storage.
   * The URL is the only credential. It is unguessable, but treat it as a
     secret: anyone holding it can read and delete the file.
-%s  * Pass your session_id on every upload. It costs nothing, and it is the only
-    way list_shared_files can later tell you what you shared in this
-    conversation.
+%s  * Pass your session_id every time. It costs nothing, and it is the only way
+    list_shared_files can later tell you what you shared in this conversation.
 TXT
 }
 
@@ -86,21 +106,22 @@ sub _str ($desc, %extra) { {type => 'string', description => $desc, %extra} }
 
 sub tools {
   return [
-    { name        => 'share_file',
-      title       => 'Share a file with a human',
-      description => 'Upload a markdown document, an image or a PDF and get back a '
-        . 'URL to give to a human. Send text files in "content"; send binary files '
-        . '(images, PDFs) base64-encoded in "content_base64". The extension on '
-        . '"filename" decides how the file is rendered and must match the bytes.',
+    { name        => 'get_upload_url',
+      title       => 'Get a URL to upload a file to',
+      description => 'Hand back a URL, and a ready-to-run curl command, for putting a '
+        . 'file where a human can read it. Run the command; the JSON it prints contains '
+        . '"url", which is what you give the person. This server never accepts the file '
+        . 'itself — that is what keeps a large PDF or screenshot out of your context.',
       inputSchema => {
         type       => 'object',
         required   => ['filename'],
         properties => {
-          filename => _str('Filename with an extension: .md, .png, .jpg, .gif, .webp, .svg or .pdf'),
-          content  => _str('The file as text. Use this for markdown and SVG.'),
-          content_base64 =>
-            _str('The file base64-encoded. Use this for PNG, JPEG, GIF, WebP and PDF.'),
-          session_id => _str('Your session id, so list_shared_files can find this again later.'),
+          filename => _str('The name to store it under, WITH an extension: .md, .png, '
+              . '.jpg, .gif, .webp, .svg, .heic or .pdf. The extension must match the '
+              . 'actual bytes or the upload is refused.'),
+          path       => _str('Where the file is on your disk. Only used to write the '
+              . 'example command for you; this server never sees it.'),
+          session_id => _str('Your session id, so list_shared_files can find this later.'),
           title      => _str('A short heading shown to the human above the file.'),
           note       => _str('One or two sentences of context shown to the human.'),
           ttl_days   => {
@@ -114,8 +135,9 @@ sub tools {
 
     { name        => 'list_shared_files',
       title       => 'List what I have shared',
-      description => 'List the files still live for a session id, newest first, each '
-        . 'with the URL to hand to the human. Expired files are gone and are not listed.',
+      description => 'List the files still live for a session id, newest first. Each one '
+        . 'carries "url" (the page to give a human) and "content_url" (the bytes, for '
+        . 'you to fetch). Expired files are gone and are not listed.',
       inputSchema => {
         type       => 'object',
         required   => ['session_id'],
@@ -123,22 +145,12 @@ sub tools {
       },
     },
 
-    { name        => 'get_shared_file_metadata',
-      title       => 'Describe a shared file',
-      description => 'Name, kind, size, checksum, expiry and view count for one shared '
-        . 'file. Does not return the contents.',
-      inputSchema => {
-        type       => 'object',
-        required   => ['id'],
-        properties => {id => _str('The file id — the random part of its URL.')},
-      },
-    },
-
     { name        => 'get_shared_file',
-      title       => 'Read a shared file back',
-      description => 'Return the contents of a file you shared. Markdown comes back as '
-        . 'text and images come back as images; PDFs and anything oversized come back '
-        . 'as metadata plus the URL.',
+      title       => 'Describe a shared file and say where to fetch it',
+      description => 'Everything known about one shared file — name, kind, size, '
+        . 'checksum, expiry, view count — plus "url" for the human and "content_url" '
+        . 'for you. To read the contents, fetch content_url; this tool will not return '
+        . 'them.',
       inputSchema => {
         type       => 'object',
         required   => ['id'],
@@ -236,15 +248,43 @@ sub _message ($err) {
 
 # -------------------------------------------------------------- the tools ----
 
-sub _tool_share_file ($class, $c, $args) {
-  my $row = $c->store->add(bytes => payload_bytes($args),
-    map { $_ => $args->{$_} } qw(filename session_id title note ttl_days));
-  my $info = $c->store->public($row, $c->base_url);
+# Stateless on purpose: no reservation is created, nothing is written, and there
+# is no half-finished upload to expire and reap later. The URL this returns is
+# just the ordinary REST endpoint with the metadata already encoded into it, so
+# an abandoned call costs exactly nothing.
+#
+# If authentication ever arrives, THIS is where a one-time ticket would be
+# minted — which is the other reason the flow goes through a tool at all rather
+# than the instructions simply naming the endpoint.
+sub _tool_get_upload_url ($class, $c, $args) {
+  my $filename = $args->{filename};
+  return _tool_failed('filename is required, and it needs an extension so the type can '
+      . 'be checked against the bytes')
+    unless defined $filename && length $filename;
 
-  return _data($info,
+  my $url = Mojo::URL->new($c->base_url . '/api/v1/files');
+  my %query = (filename => $filename);
+  for my $key (qw(session_id title note ttl_days)) {
+    $query{$key} = $args->{$key} if defined $args->{$key} && length $args->{$key};
+  }
+  $url->query(\%query);
+
+  my $path = $args->{path} // "/path/to/$filename";
+  my $command = sprintf q{curl -fsS -F 'file=@%s' '%s'}, $path, $url;
+
+  return _data(
+    { upload_url => "$url",
+      method     => 'POST',
+      command    => $command,
+      body       => 'multipart/form-data with a part named "file"; or the raw bytes as '
+        . 'the request body, since the filename is already in the query string',
+      max_bytes  => 0 + $c->app->config->{max_bytes},
+      next       => 'The JSON response contains "url" — give that to the human, and '
+        . '"content_url" if you need to read the file back yourself.',
+    },
     { type => 'text',
-      text => "Shared. Give this URL to the human, exactly as written:\n\n$info->{url}\n\n"
-        . "It stops working in $info->{expires_in}.",
+      text => "Run this, then give the human the \"url\" from the JSON it prints:\n\n"
+        . "  $command\n",
     });
 }
 
@@ -255,38 +295,16 @@ sub _tool_list_shared_files ($class, $c, $args) {
   return _data({count => scalar @info, files => \@info});
 }
 
-sub _tool_get_shared_file_metadata ($class, $c, $args) {
-  my $row = $c->store->find($args->{id}) or return _tool_failed(_gone($args->{id}));
-  return _data($c->store->public($row, $c->base_url));
-}
-
 sub _tool_get_shared_file ($class, $c, $args) {
   my $row = $c->store->find($args->{id}) or return _tool_failed(_gone($args->{id}));
   my $info = $c->store->public($row, $c->base_url);
 
-  my $bytes = $c->store->contents($row);
-  return _tool_failed("the metadata for $info->{id} is here but its contents are missing")
-    unless defined $bytes;
-
-  if ($row->{kind} eq 'markdown') {
-    utf8::decode($bytes);
-    return _text($bytes);
-  }
-
-  if ($row->{kind} eq 'image' && length($bytes) <= MAX_INLINE) {
-    my ($mime) = $row->{content_type} =~ /\A([^;]+)/;
-    return _result(
-      { content => [
-          {type => 'image', data => b64_encode($bytes, ''), mimeType => $mime},
-          {type => 'text',  text => $JSON->encode($info)},
-        ],
-      });
-  }
-
   return _data($info,
     { type => 'text',
-      text => "$info->{filename} is a $info->{kind} of $info->{size_human}; it is not "
-        . "returned inline. Open $info->{url} to see it.",
+      text => "$info->{filename} is a $info->{kind} of $info->{size_human}, expiring in "
+        . "$info->{expires_in}.\n\n"
+        . "Give the human:  $info->{url}\n"
+        . "Read it yourself: curl -fsS '$info->{content_url}'\n",
     });
 }
 

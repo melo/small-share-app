@@ -130,6 +130,37 @@ changed a row. One worker reaps; the rest no-op.
 No cron entry, no second deployment artifact, correct at any worker count.
 `bin/reap` runs the same code by hand for when you want it now.
 
+## MCP carries no bytes
+
+No tool moves file contents, in either direction. Uploading means calling
+`get_upload_url` and running the curl command it returns; reading a file back
+means fetching its `content_url`. MCP is the control plane; HTTP is the data
+plane.
+
+The reason is arithmetic, not taste. A tool argument or result passes through
+the model's context verbatim, and base64 inflates by a third: a 20 KB screenshot
+costs thousands of tokens to send and thousands more to read back, and a 3 MB
+PDF does not fit at all. Meanwhile `curl -F file=@…` moves it off disk for
+nothing. This was not theoretical — an agent using an earlier version of this
+server hit the tool-output cap trying to read back a 20 KB PNG it had just
+shared, and fell back to curl on its own.
+
+Once uploads work that way, making downloads work differently would only be an
+inconsistency for an agent to trip over. So `get_shared_file` returns metadata
+and a URL, and says so in its own description, even for a 2 KB markdown file
+where inlining would have been cheap. One rule, no judgement call.
+
+`get_upload_url` deliberately creates **no reservation**. It returns the
+ordinary REST endpoint with the metadata already encoded into the query string,
+so an abandoned call writes nothing and there is no half-finished upload to
+expire and reap. It exists as a tool rather than a line in the instructions for
+two reasons: it fills in the base URL and the encoding so the agent cannot get
+them wrong, and it is where a one-time ticket would be minted if authentication
+ever arrives.
+
+The cost is real: an MCP client with no shell and no HTTP tool cannot upload at
+all. For a coding agent, which has both, that is the right trade.
+
 ## Stateless MCP
 
 The Streamable HTTP transport allows a server to answer a request with a single

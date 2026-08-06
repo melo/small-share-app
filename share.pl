@@ -537,10 +537,14 @@ __DATA__
   <h2>For agents</h2>
   <p>The easy way is MCP. Register it once:</p>
   <pre><code>claude mcp add --transport http share <%= $c->base_url %>/mcp</code></pre>
-  <p>then call <code>share_file</code>. The tools are <code>share_file</code>,
-  <code>list_shared_files</code>, <code>get_shared_file</code>,
-  <code>get_shared_file_metadata</code> and <code>delete_shared_file</code>, and
-  the server explains itself on connect.</p>
+  <p>then call <code>get_upload_url</code>. The tools are
+  <code>get_upload_url</code>, <code>list_shared_files</code>,
+  <code>get_shared_file</code> and <code>delete_shared_file</code>, and the
+  server explains itself on connect.</p>
+
+  <p><strong>The MCP server never carries the file itself</strong>, in either
+  direction — it hands out URLs and the agent moves the bytes with curl. A 3 MB
+  PDF has no business passing through a model's context.</p>
 
   <p>There is also a plain REST API, which needs nothing but curl:</p>
   <pre><code>curl --data-binary @report.md \

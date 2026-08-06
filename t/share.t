@@ -10,7 +10,13 @@ use utf8;
 
 use File::Temp   ();
 use Mojo::File   qw(curfile);
-use Mojo::JSON   qw(decode_json encode_json);
+# from_json, not decode_json, for anything read out of an MCP result: those
+# fields have already been decoded from the response, so they are characters.
+# decode_json expects BYTES and dies with "Wide character" on the first
+# non-ASCII one — which is a landmine that only goes off once a filename or a
+# note happens to contain an em-dash.
+use Mojo::JSON   qw(encode_json from_json to_json);
+use Mojo::URL    ();
 use Mojo::Util   qw(b64_encode);
 use Test::Mojo   ();
 use Test::More;
@@ -162,6 +168,27 @@ subtest 'JSON + base64 upload' => sub {
     ->status_is(201)->json_is('/kind' => 'image')->json_is('/content_type' => 'image/png');
 };
 
+subtest 'PDFs go to the browser own viewer' => sub {
+  $t->post_ok('/api/v1/files' => {'Content-Type' => 'application/json'} =>
+      encode_json({filename => 'doc.pdf', content_base64 => $PDF_B64}))->status_is(201)
+    ->json_is('/kind' => 'pdf')->json_is('/content_type' => 'application/pdf');
+  my $pdf_id = $t->tx->res->json('/id');
+
+  # No sandbox attribute at all: it breaks the built-in PDF viewer in several
+  # browsers, and the browser already sandboxes that viewer itself.
+  $t->get_ok("/f/$pdf_id")->status_is(200)->content_unlike(qr/sandbox=/);
+
+  $t->get_ok("/f/$pdf_id/view")->status_is(302)
+    ->header_like(Location => qr{/f/\Q$pdf_id\E/raw\z});
+
+  # ...and PDF raw bytes are the one case that does NOT get CSP: sandbox, for
+  # the same reason.
+  $t->get_ok("/f/$pdf_id/raw")->status_is(200)->content_type_is('application/pdf')
+    ->header_is('Content-Security-Policy' => undef);
+
+  $t->delete_ok("/api/v1/files/$pdf_id")->status_is(200);
+};
+
 # ----------------------------------------------------------------- viewer ----
 
 subtest 'the viewer frames the file and never leaks the secret' => sub {
@@ -284,104 +311,99 @@ subtest 'MCP: notifications get a 202 and no body' => sub {
 subtest 'MCP: tools/list' => sub {
   $t->post_ok('/mcp' => json => {jsonrpc => '2.0', id => 3, method => 'tools/list'})
     ->status_is(200);
-  my @names = sort map { $_->{name} } @{$t->tx->res->json('/result/tools')};
-  is_deeply \@names,
-    [qw(delete_shared_file get_shared_file get_shared_file_metadata list_shared_files share_file)],
-    'all five tools are advertised';
+  my $tools = $t->tx->res->json('/result/tools');
+  is_deeply [sort map { $_->{name} } @$tools],
+    [qw(delete_shared_file get_shared_file get_upload_url list_shared_files)],
+    'four tools, and not one of them moves bytes';
+
+  # The whole point of this server's shape, asserted structurally rather than by
+  # grepping prose — the descriptions legitimately talk about bytes and content.
+  # If a tool ever grows a parameter that carries a file, it belongs on the HTTP
+  # side instead.
+  my @carriers = grep { /\A(?:content|content_base64|data|bytes|body|file)\z/ }
+    map { keys %{$_->{inputSchema}{properties} // {}} } @$tools;
+  is_deeply \@carriers, [], 'no tool takes file contents as an argument';
 };
 
-my $mcp_id;
+subtest 'MCP: get_upload_url hands back a command, not a byte sink' => sub {
+  my $res = _mcp('tools/call', {
+    name      => 'get_upload_url',
+    arguments => {filename => 'report.md', path => '/tmp/report.md',
+      session_id => $SESSION, title => 'A report', ttl_days => 3},
+  });
+  ok !$res->{result}{isError}, 'it succeeded';
 
-subtest 'MCP: share_file' => sub {
-  $t->post_ok('/mcp' => json => {
-    jsonrpc => '2.0', id => 4, method => 'tools/call',
-    params  => {
-      name      => 'share_file',
-      arguments => {filename => 'via-mcp.md', content => "# via mcp\n", session_id => $SESSION},
-    },
-  })->status_is(200)->json_hasnt('/result/isError');
+  my $out = from_json($res->{result}{content}[0]{text});
+  is $out->{method}, 'POST', 'POST';
+  like $out->{upload_url}, qr{\Ahttps://share\.example\.test/api/v1/files\?},
+    'pointing at the ordinary REST endpoint';
+  like $out->{upload_url}, qr/filename=report\.md/,     'with the filename baked in';
+  like $out->{upload_url}, qr/session_id=$SESSION/,      'and the session';
+  like $out->{upload_url}, qr/title=A(?:%20|\+)report/,  'and the title, encoded';
+  like $out->{upload_url}, qr/ttl_days=3/,               'and the ttl';
+  like $out->{command}, qr{\Acurl -fsS -F 'file=\@/tmp/report\.md'}, 'a runnable command';
+  like $res->{result}{content}[1]{text}, qr/give the human the "url"/i,
+    'and prose telling the model what to do with the output';
 
-  my $text = $t->tx->res->json('/result/content/0/text');
-  my $info = decode_json($text);
-  $mcp_id = $info->{id};
-  like $info->{url}, qr{\Ahttps://share\.example\.test/f/\Q$mcp_id\E\z}, 'the URL is spelled out';
-  like $t->tx->res->json('/result/content/1/text'), qr/Give this URL to the human/,
-    'and it is repeated in prose the model will actually read';
+  # Nothing was written: an abandoned call must cost nothing, because there is
+  # deliberately no reservation to expire and reap.
+  $t->get_ok("/api/v1/files?session_id=$SESSION")->status_is(200)->json_is('/count' => 2);
+
+  # And the URL it produced actually works — this is the contract.
+  my $upload = Mojo::URL->new($out->{upload_url});
+  $t->post_ok($upload->path_query => form => {file => {content => "# a report\n",
+      filename => 'report.md'}})->status_is(201)->json_is('/session_id' => $SESSION)
+    ->json_is('/title' => 'A report')->json_like('/expires_in' => qr/^(?:2|3) days$/);
+  my $made = $t->tx->res->json('/id');
+
+  $t->post_ok('/mcp' => json => {jsonrpc => '2.0', id => 41, method => 'tools/call',
+    params => {name => 'get_upload_url', arguments => {}}})->status_is(200)
+    ->json_is('/result/isError' => 1)->json_like('/result/content/0/text' => qr/filename is required/);
+
+  $t->delete_ok("/api/v1/files/$made")->status_is(200);
 };
 
-subtest 'MCP: read it back, then delete it' => sub {
-  $t->post_ok('/mcp' => json => {
-    jsonrpc => '2.0', id => 5, method => 'tools/call',
-    params  => {name => 'get_shared_file', arguments => {id => $mcp_id}},
-  })->status_is(200)->json_like('/result/content/0/text' => qr/# via mcp/);
+subtest 'MCP: reading a file back means being told where it is' => sub {
+  my $res = _mcp('tools/call', {name => 'get_shared_file', arguments => {id => $id}});
+  my $info = from_json($res->{result}{content}[0]{text});
 
-  $t->post_ok('/mcp' => json => {
-    jsonrpc => '2.0', id => 6, method => 'tools/call',
-    params  => {name => 'delete_shared_file', arguments => {id => $mcp_id}},
-  })->status_is(200)->json_like('/result/content/0/text' => qr/Deleted/);
+  is $info->{id}, $id, 'the right file';
+  is $info->{kind}, 'markdown', 'described fully';
+  like $info->{url}, qr{/f/\Q$id\E\z}, 'the page for the human';
+  like $info->{content_url}, qr{/api/v1/files/\Q$id\E/content\z}, 'the bytes for the agent';
+  like $res->{result}{content}[1]{text}, qr/curl -fsS '.*\/content'/, 'with the command spelled out';
 
-  $t->get_ok("/f/$mcp_id")->status_is(404);
+  # The contents themselves are NOT in the response, at any size. That is the
+  # property the whole design turns on. to_json, not encode_json: the result
+  # holds characters, and encoding it to UTF-8 bytes here just to grep it warns
+  # and dies under -w.
+  unlike to_json($res->{result}), qr/# Report/,
+    'the markdown itself never crosses the MCP boundary';
+
+  # And content_url is real.
+  $t->get_ok("/api/v1/files/$id/content")->status_is(200)->content_like(qr/# Report/);
 };
 
-subtest 'MCP: reading files back in each shape' => sub {
-  # An image comes back as a real MCP image block — the point of an agent being
-  # able to re-read a screenshot it shared — with the metadata alongside it.
-  my $png = _mcp('tools/call',
-    {name => 'share_file', arguments => {filename => 'inline.png', content_base64 => $PNG_B64}});
-  my $png_id = decode_json($png->{result}{content}[0]{text})->{id};
+subtest 'MCP: listing gives both URLs for every file' => sub {
+  my $res = _mcp('tools/call',
+    {name => 'list_shared_files', arguments => {session_id => $SESSION}});
+  my $out = from_json($res->{result}{content}[0]{text});
+  is $out->{count}, 2, 'both files';
+  ok $_->{url} && $_->{content_url}, 'each carries a page URL and a content URL'
+    for @{$out->{files}};
 
-  my $got = _mcp('tools/call', {name => 'get_shared_file', arguments => {id => $png_id}});
-  is $got->{result}{content}[0]{type}, 'image', 'an image comes back as an image block';
-  is $got->{result}{content}[0]{mimeType}, 'image/png', 'with its real mime type';
-  is $got->{result}{content}[0]{data}, $PNG_B64, 'and the bytes round-trip exactly';
+  $res = _mcp('tools/call',
+    {name => 'list_shared_files', arguments => {session_id => 'nobody at all'}});
+  like $res->{result}{content}[0]{text}, qr/Nothing shared under that session id/,
+    'and an empty session says so plainly';
+};
 
-  # A PDF is described rather than inlined: nobody wants megabytes of base64 in
-  # a context window.
-  my $pdf = _mcp('tools/call', {name => 'share_file',
-    arguments => {filename => 'doc.pdf', content_base64 => $PDF_B64}});
-  my $pdf_id = decode_json($pdf->{result}{content}[0]{text})->{id};
-
-  $got = _mcp('tools/call', {name => 'get_shared_file', arguments => {id => $pdf_id}});
-  is $got->{result}{content}[0]{type}, 'text', 'a PDF is not inlined';
-  like $got->{result}{content}[1]{text}, qr/not\s+returned inline/,
-    'and it says so, with the URL to open';
-
-  my $meta = _mcp('tools/call',
-    {name => 'get_shared_file_metadata', arguments => {id => $pdf_id}});
-  my $info = decode_json($meta->{result}{content}[0]{text});
-  is $info->{kind}, 'pdf', 'metadata knows what it is';
-  is $info->{content_type}, 'application/pdf', 'and its content type';
-
-  # Every "no such thing" path answers the same way.
-  for my $tool (qw(get_shared_file get_shared_file_metadata delete_shared_file)) {
+subtest 'MCP: the missing-id paths' => sub {
+  for my $tool (qw(get_shared_file delete_shared_file)) {
     my $res = _mcp('tools/call', {name => $tool, arguments => {id => 'n' x 32}});
     ok $res->{result}{isError}, "$tool on a missing id is a tool error";
     like $res->{result}{content}[0]{text}, qr/no live file/, "$tool says why";
   }
-
-  $t->post_ok('/mcp' => json =>
-      {jsonrpc => '2.0', id => 90, method => 'tools/call',
-        arguments => {}, params => {name => 'list_shared_files',
-          arguments => {session_id => 'nobody at all'}}})->status_is(200)
-    ->json_like('/result/content/0/text' => qr/Nothing shared under that session id/);
-
-  $t->delete_ok("/api/v1/files/$png_id")->status_is(200);
-  $t->delete_ok("/api/v1/files/$pdf_id")->status_is(200);
-};
-
-subtest 'MCP: base64 that is not base64, and text that is' => sub {
-  my $res = _mcp('tools/call', {name => 'share_file',
-    arguments => {filename => 'x.png', content_base64 => '!!! not base64 !!!'}});
-  ok $res->{result}{isError}, 'a bad base64 payload is a tool error';
-  like $res->{result}{content}[0]{text}, qr/not valid base64/, 'and says so';
-
-  # base64url — '-' and '_' instead of '+' and '/' — is a common enough mistake
-  # that it is simply accepted.
-  my $url_safe = $PNG_B64 =~ tr{+/}{-_}r;
-  $res = _mcp('tools/call',
-    {name => 'share_file', arguments => {filename => 'urlsafe.png', content_base64 => $url_safe}});
-  ok !$res->{result}{isError}, 'base64url is accepted rather than refused';
-  $t->delete_ok('/api/v1/files/' . decode_json($res->{result}{content}[0]{text})->{id});
 };
 
 subtest 'MCP: ping, and a batch from an older client' => sub {
@@ -409,9 +431,9 @@ subtest 'MCP: ping, and a batch from an older client' => sub {
 subtest 'MCP: a bad call is a tool error, not a protocol error' => sub {
   $t->post_ok('/mcp' => json => {
     jsonrpc => '2.0', id => 7, method => 'tools/call',
-    params  => {name => 'share_file', arguments => {filename => 'nope.md'}},
+    params  => {name => 'get_upload_url', arguments => {}},
   })->status_is(200)->json_is('/result/isError' => 1)
-    ->json_like('/result/content/0/text' => qr/content/);
+    ->json_like('/result/content/0/text' => qr/filename is required/);
 
   $t->post_ok('/mcp' => json =>
       {jsonrpc => '2.0', id => 8, method => 'tools/call', params => {name => 'no_such_tool'}})

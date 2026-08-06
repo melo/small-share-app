@@ -316,7 +316,11 @@ sub public ($self, $row, $base_url) {
   my $left = $row->{expires_at} - time;
   return {
     id           => $row->{secret},
+    # Two URLs, because they are for two different readers. `url` is the page a
+    # human opens; `content_url` is the bytes, which is what an agent fetches
+    # with curl. Neither is derived from the other by anyone but this line.
     url          => "$base_url/f/$row->{secret}",
+    content_url  => "$base_url/api/v1/files/$row->{secret}/content",
     filename     => $row->{filename},
     kind         => $row->{kind},
     content_type => $row->{content_type},
