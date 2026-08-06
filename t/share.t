@@ -102,9 +102,13 @@ sub _upload ($filename, $content, %extra) {
 
 subtest 'the home page is the uploader, and nothing else' => sub {
   $t->get_ok('/')->status_is(200)
-    ->content_like(qr{<a class="brand" href="/">share</a>})
+    ->content_like(qr{<a class="brand" href="/">.*<span>share</span>}s)
     ->content_like(qr{<a href="/how-to">How to use it</a>})
     ->content_like(qr{<a href="/api">API</a>})
+    ->content_like(qr{github\.com/melo/small-share-app})
+    # The burger is a checkbox and a label, so the menu costs no script source.
+    ->content_like(qr{<input class="nav-toggle" type="checkbox"})
+    ->content_like(qr{<label class="nav-burger"})
     ->content_like(qr{<section class="uploader">})
     ->content_like(qr{<section class="recent" hidden>})
     ->header_like('Content-Security-Policy' => qr/default-src 'none'/);
@@ -364,9 +368,10 @@ subtest 'no route lets a client choose or overwrite an id' => sub {
 
 subtest 'the viewer frames the file and never leaks the secret' => sub {
   $t->get_ok("/f/$id")->status_is(200)->content_like(qr/report\.md/)
-    # Arriving from a link someone sent you is the common case; without this the
-    # service is a dead end.
-    ->content_like(qr{<a class="brand filebar-brand" href="/">share</a>})
+    # Arriving from a link someone sent you is the common case, so the viewer
+    # carries the same header as everything else rather than suppressing it.
+    ->content_like(qr{<header class="topbar">})
+    ->content_like(qr{<a class="brand" href="/">})
     ->content_like(qr/have a look/)->content_like(qr/sandbox="allow-scripts"/)
     ->header_is('Referrer-Policy' => 'no-referrer')
     ->header_like('X-Robots-Tag'  => qr/noindex/)

@@ -1,0 +1,71 @@
+# small-share-app behind an existing Traefik.
+#
+# For a host that already terminates TLS with Traefik and routes by container
+# label. Nothing is published on the host: Traefik discovers this container
+# through the Docker provider and dials its private IP directly.
+#
+#   docker compose -f docker-compose.traefik.yml up -d --build
+#
+# WHAT THIS EXPOSES, AND TO WHOM. The other two compose files put the service on
+# a private network. This one puts it wherever your Traefik is reachable from —
+# very possibly the open internet. Read the README's security section first:
+# there is NO authentication, so anyone who can reach the hostname can upload
+# and list. That is the right trade on a tailnet and the wrong one in public.
+# Deleting is the exception, and needs the password from the upload response.
+#
+# Assumptions, all overridable in .env:
+#   * an entrypoint named `websecure` that already carries a certResolver, so no
+#     certificate label is needed here
+#   * `exposedByDefault: false` on the Docker provider, hence traefik.enable
+#   * Traefik reaching backends on their own docker IP (host networking, or a
+#     shared network you add below)
+
+services:
+
+  share:
+    image: ${SHARE_IMAGE:-ghcr.io/melo/small-share-app:latest}
+    build: .
+
+    # Own the data directory as a real account so the SQLite file and the stored
+    # files stay readable from a normal shell. `id -u`, `id -g`.
+    user: "${SHARE_UID:-1000}:${SHARE_GID:-1000}"
+
+    environment:
+      SHARE_ROOT: /workspace
+
+      # Set explicitly here rather than derived from the request: it is what
+      # every share URL is built from, and behind a proxy chain (Cloudflare, then
+      # Traefik) a header is a poor thing to trust with that.
+      SHARE_BASE_URL: ${SHARE_BASE_URL:?set SHARE_BASE_URL, e.g. https://share.example.com}
+
+      SHARE_TTL_DAYS: ${SHARE_TTL_DAYS:-15}
+      SHARE_MAX_BYTES: ${SHARE_MAX_BYTES:-33554432}
+      SHARE_NOTICE: ${SHARE_NOTICE:-}
+
+      MOJO_MODE: production
+      # Traefik sets X-Forwarded-*; without this the app would report every
+      # request as plain http on its own container port.
+      MOJO_REVERSE_PROXY: "1"
+
+    volumes:
+      - ${SHARE_DATA:-./data}:/workspace
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${TRAEFIK_ROUTER:-share}.rule=Host(`${SHARE_HOST:?set SHARE_HOST, e.g. share.example.com}`)"
+      - "traefik.http.routers.${TRAEFIK_ROUTER:-share}.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.services.${TRAEFIK_ROUTER:-share}.loadbalancer.server.port=8080"
+      # Active health check, so Traefik drains this backend on a rollout instead
+      # of routing to a container that is still opening its database.
+      - "traefik.http.services.${TRAEFIK_ROUTER:-share}.loadbalancer.healthcheck.path=/api/v1/health"
+      - "traefik.http.services.${TRAEFIK_ROUTER:-share}.loadbalancer.healthcheck.interval=10s"
+
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+
+    healthcheck:
+      test: ["CMD", "perl", "/app/bin/health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

@@ -33,6 +33,10 @@ use Share::Store  qw(human_size payload_bytes);
 
 our $VERSION = '1.0.0';
 
+# Where this came from. Linked in the header of every page: the whole point of a
+# small self-hosted tool is that whoever lands on one can go and read it.
+package Share { use constant SOURCE_URL => 'https://github.com/melo/small-share-app'; }
+
 # --------------------------------------------------------------- config ------
 
 my %CFG = (
@@ -587,15 +591,36 @@ __DATA__
     <link rel="stylesheet" href="/assets/share.css">
   </head>
   <body class="<%= stash('body_class') // '' %>">
-    % unless (stash 'bare') {
+    %# One header, on every page including the viewer. It used to be suppressed
+    %# there to save vertical space, which left a file someone sent you with no
+    %# way back to the service at all.
+    %#
+    %# The burger is a checkbox and a label, not a script: the pages that carry a
+    %# secret run under `default-src 'none'` with no script source, and a menu is
+    %# not worth loosening that for.
     <header class="topbar">
-      <a class="brand" href="/">share</a>
+      <a class="brand" href="/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M8.5 10.5H6.5A2.5 2.5 0 0 0 4 13v6.5A2.5 2.5 0 0 0 6.5 22h11a2.5 2.5 0 0 0 2.5-2.5V13a2.5 2.5 0 0 0-2.5-2.5h-2"/>
+          <path d="M12 15V3"/>
+          <path d="M7.75 7.25 12 3l4.25 4.25"/>
+        </svg>
+        <span>share</span>
+      </a>
+
+      <input class="nav-toggle" type="checkbox" id="nav-toggle">
+      <label class="nav-burger" for="nav-toggle" aria-label="Menu"><span></span></label>
+
       <nav>
         <a href="<%= url_for 'how_to' %>">How to use it</a>
         <a href="<%= url_for 'api' %>">API</a>
+        <a class="gh" href="<%= Share::SOURCE_URL %>" rel="noopener">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          <span>GitHub</span>
+        </a>
       </nav>
     </header>
-    % }
 %= content
     % if (stash 'uploader') {
     <script src="/assets/upload.js"></script>
@@ -745,12 +770,6 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 @@ viewer.html.ep
 % layout 'chrome', title => $file->{filename}, body_class => 'viewing';
 <header class="filebar">
-  %# The viewer suppresses the top bar — it is a full-height two-pane layout and
-  %# a second bar would eat the frame. But arriving here from a link handed to
-  %# you is the COMMON case, and with no way home the service is a dead end. So
-  %# the brand comes along, same tile as the home page, set apart from the file's
-  %# own metadata so the two do not read as one heading.
-  <a class="brand filebar-brand" href="<%= url_for 'index' %>">share</a>
   <div class="facts">
     <h1><%= $file->{title} // $file->{filename} %></h1>
     % if (defined $file->{title}) {

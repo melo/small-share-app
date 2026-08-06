@@ -104,18 +104,6 @@ body.viewing { display: flex; flex-direction: column; overflow: hidden; }
   word-break: break-word;
 }
 
-/* Padding, not just a gap: the separator earns its keep by stopping "share"
- * from reading as the first word of the filename next to it. */
-.filebar-brand {
-  flex: 0 0 auto;
-  align-self: stretch;
-  padding-right: 1.25rem;
-  margin-right: 0.25rem;
-  border-right: 1px solid var(--line);
-  font-size: 1.1rem;
-  line-height: 1.4;
-}
-
 .filebar .sub, .filebar .note {
   margin: 0.25rem 0 0;
   font-size: 0.85rem;
@@ -161,29 +149,117 @@ form { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.5rem; }
 
 /* ------------------------------------------------------------------ topbar */
 
+/* One header on every page, viewer included. Sticky and translucent so it stays
+ * reachable without taking a slice of the fold with it. */
 .topbar {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
-  max-width: 46rem;
-  margin: 0 auto;
-  padding: 1.25rem 1.5rem 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
 }
 
-.topbar .brand {
+.topbar,
+.topbar > nav { display: flex; align-items: center; }
+
+.topbar {
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem 1.5rem;
+}
+
+/* The wordmark. A logo, not a link — same treatment on every page, and it does
+ * not turn blue or sprout an underline just because it happens to be clickable. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   font-size: 1.35rem;
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.025em;
   color: var(--fg);
   text-decoration: none;
 }
 
-.topbar nav a { font-size: 0.9rem; }
+.brand svg { width: 21px; height: 21px; flex: 0 0 auto; }
+.brand:hover { color: var(--fg); }
 
-/* The viewer has its own bar; a second one would eat the preview frame. The
- * brand is carried into .filebar instead — see .filebar-brand. */
-body.viewing .topbar { display: none; }
+.topbar > nav { gap: 1.4rem; font-size: 0.9rem; }
+.topbar > nav a { color: var(--fg-muted); text-decoration: none; }
+.topbar > nav a:hover { color: var(--fg); }
+
+.topbar .gh {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.topbar .gh:hover { border-color: var(--fg-muted); }
+.topbar .gh svg { width: 15px; height: 15px; fill: currentColor; }
+
+/* The burger is a checkbox and a label. No script, because the pages carrying a
+ * secret run with no script source at all and a menu is not worth loosening
+ * that for. Hidden on wide screens; the checkbox itself is never visible. */
+.nav-toggle { position: absolute; opacity: 0; width: 0; height: 0; }
+
+.nav-burger {
+  display: none;
+  position: relative;
+  width: 2.25rem;
+  height: 2.25rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+/* Three bars from one element: the middle is the span, the outer two are its
+ * pseudo-elements. */
+.nav-burger span,
+.nav-burger span::before,
+.nav-burger span::after {
+  position: absolute;
+  left: 50%;
+  width: 1.05rem;
+  height: 2px;
+  margin-left: -0.525rem;
+  background: var(--fg);
+  border-radius: 2px;
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.nav-burger span { top: 50%; margin-top: -1px; }
+.nav-burger span::before { content: ""; left: 0; margin-left: 0; top: -6px; }
+.nav-burger span::after  { content: ""; left: 0; margin-left: 0; top: 6px; }
+
+.nav-toggle:focus-visible + .nav-burger { outline: 2px solid var(--accent); }
+
+/* Open: the bars become a cross. */
+.nav-toggle:checked + .nav-burger span { background: transparent; }
+.nav-toggle:checked + .nav-burger span::before { transform: translateY(6px) rotate(45deg); }
+.nav-toggle:checked + .nav-burger span::after  { transform: translateY(-6px) rotate(-45deg); }
+
+@media (max-width: 40rem) {
+  .topbar { flex-wrap: wrap; padding: 0.6rem 1rem; }
+  .nav-burger { display: block; }
+
+  .topbar > nav {
+    display: none;
+    flex-basis: 100%;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+    margin-top: 0.6rem;
+    border-top: 1px solid var(--line);
+  }
+
+  .nav-toggle:checked ~ nav { display: flex; }
+  .topbar > nav a { width: 100%; padding: 0.7rem 0; }
+  .topbar .gh { border: 0; padding: 0.7rem 0; border-radius: 0; }
+}
 
 /* ---------------------------------------------------------------- uploader */
 
@@ -344,14 +420,6 @@ p.failed {
 
 @media (max-width: 40rem) {
   .filebar { flex-direction: column; gap: 0.75rem; }
-
-  /* Stacked, the vertical rule points nowhere. */
-  .filebar-brand {
-    align-self: flex-start;
-    padding-right: 0;
-    border-right: 0;
-    padding-bottom: 0.5rem;
-  }
   .actions { width: 100%; }
   .btn { flex: 1; text-align: center; }
 }
