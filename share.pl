@@ -32,7 +32,7 @@ use Share::OpenAPI qw(openapi_type);
 use Share::Render qw(render_markdown);
 use Share::Store  qw(human_size payload_bytes);
 
-our $VERSION = '1.0.0';
+our $VERSION = '1.1.0';
 
 # Where this came from. Linked in the header of every page: the whole point of a
 # small self-hosted tool is that whoever lands on one can go and read it.
@@ -952,9 +952,13 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
       <div><dt>Expires</dt><dd class="expiry">in <%= $file->{expires_in} %></dd></div>
     </dl>
   </div>
+  %# No Delete here. Deleting needs the password handed back once at upload, and
+  %# whoever opens a link they were SENT does not have it — the button was a
+  %# door they could never open. Whoever does have it either uses "recent
+  %# uploads" on the home page, which keeps the password in this browser, or the
+  %# link on the upload result page. /f/<id>/delete still works if you go there.
   <nav class="actions">
     <a class="btn primary" href="<%= url_for 'download' %>">Download</a>
-    <a class="btn danger" href="<%= url_for 'confirm_delete' %>">Delete</a>
   </nav>
 </header>
 %# The preview is a separate document in a frame: it keeps an untrusted file's
@@ -1057,7 +1061,8 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
       %# there is no dead button on the page, just the URL to select.
       <button class="btn result-copy" type="button" data-copy="<%= $f->{url} %>" hidden>Copy</button>
       % if (defined $f->{delete_password}) {
-      <span class="result-secret">delete password: <code><%= $f->{delete_password} %></code></span>
+      <span class="result-secret">delete password: <code><%= $f->{delete_password} %></code>
+        — <a href="<%= url_for('confirm_delete', secret => $f->{id}) %>">delete it early</a></span>
       % }
     </li>
       % } else {

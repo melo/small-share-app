@@ -355,9 +355,15 @@ test('the share URL alone cannot delete: the confirm page demands the password',
   const record = (await history(page)).find((r) => r.id === id);
   expect(record.delete_password, 'the browser was handed the password once').toBeTruthy();
 
+  // The viewer offers Download and nothing else: whoever opens a link they were
+  // sent has no password, so a Delete button there would be a door they could
+  // never open.
   await page.goto(url);
-  await page.click('.actions .btn.danger');
-  await expect(page).toHaveURL(/\/delete$/);
+  await expect(page.locator('.actions .btn')).toHaveCount(1);
+  await expect(page.locator('.actions .btn')).toHaveText('Download');
+
+  // The page still works for whoever does have the password.
+  await page.goto(url + '/delete');
   await expect(page.locator('h1')).toHaveText('Delete this file?');
 
   // Whoever was merely SENT the link does not have this, which is the point.

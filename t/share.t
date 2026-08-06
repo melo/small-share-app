@@ -559,6 +559,20 @@ subtest 'a hammering client is refused, in both dialects' => sub {
 
 # ----------------------------------------------------------------- viewer ----
 
+subtest 'the viewer offers no Delete it cannot honour' => sub {
+  # Whoever opens a link they were sent does not have the delete password, so a
+  # Delete button there is a door they can never open. Download is the only
+  # action on a page reached from a shared link.
+  $t->get_ok("/f/$id")->status_is(200)
+    ->content_like(qr{<a class="btn primary" href="/f/$id/download">Download</a>})
+    ->content_unlike(qr{class="btn danger"})
+    ->content_unlike(qr{/delete"});
+
+  # The page itself still works for whoever DOES have the password — it is how
+  # the no-JavaScript path deletes anything at all.
+  $t->get_ok("/f/$id/delete")->status_is(200)->content_like(qr/Delete this file/);
+};
+
 subtest 'the viewer frames the file and never leaks the secret' => sub {
   $t->get_ok("/f/$id")->status_is(200)->content_like(qr/report\.md/)
     # Arriving from a link someone sent you is the common case, so the viewer
@@ -615,7 +629,11 @@ subtest 'the browser upload path' => sub {
     ->content_like(qr{<button class="btn result-copy" type="button" data-copy="https://share\.example\.test/f/[A-Za-z0-9]{32}" hidden>Copy</button>})
     # ...and enough metadata for upload.js to fold a no-JavaScript upload into
     # the same localStorage history the scripted path writes.
-    ->content_like(qr{<li data-record="[^"]*expires_at[^"]*">});
+    ->content_like(qr{<li data-record="[^"]*expires_at[^"]*">})
+    # The password is shown once here, so this is also the one place a
+    # no-JavaScript uploader can be handed a route to deleting it.
+    ->content_like(qr{delete password: <code>[A-Za-z0-9]{24}</code>})
+    ->content_like(qr{>delete it early</a>});
 
   # Several at once, one of them bad: the good ones still land and the bad one
   # says why, rather than the whole batch failing.
@@ -835,6 +853,8 @@ subtest 'MCP: an unknown tool is an error, not a crash' => sub {
 };
 
 subtest 'deleting from the browser takes two clicks, a password, and no JavaScript' => sub {
+  # Reached from the upload result page, or by knowing the URL — not from the
+  # viewer, which no longer offers it.
   $t->get_ok("/f/$id/delete")->status_is(200)->content_like(qr/Delete this file/)
     ->content_like(qr{name="delete_password"})->content_unlike(qr/<script/);
 

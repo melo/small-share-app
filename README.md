@@ -322,8 +322,10 @@ it fits. A public box that fills its disk goes down, which is a worse outcome
 than losing the oldest thing on it.
 
 **Reading and deleting are separate capabilities.** The share URL grants
-reading. Deleting needs the `delete_password` returned by the upload — passed as
-`X-Delete-Password`, a JSON field, or a form field. A wrong password and a file
+reading, and the page it opens offers only Download — a Delete button there
+would be a door its reader could never open. Deleting needs the
+`delete_password` returned by the upload, passed as `X-Delete-Password`, a JSON
+field, or a form field. A wrong password and a file
 that never existed get the same answer with the same status, so the endpoint
 cannot be used to discover which ids exist. Lose the password and the file
 simply expires on its own. In the browser this is invisible: the drop zone keeps
