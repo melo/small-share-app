@@ -6,13 +6,11 @@
 #   * manual         -> whatever the ref implies
 #
 # GHCR needs no secrets: the built-in GITHUB_TOKEN plus `packages: write` below
-# is enough. The first push creates the package as PRIVATE — make it public once
-# at Profile -> Packages -> small-share-app -> Package settings -> Change
-# visibility.
+# is enough.
 #
-# Docker Hub is OPTIONAL and skipped unless you set it up. See README, "Publishing
-# your own images". You need, in the repository's Settings -> Secrets and
-# variables -> Actions:
+# Docker Hub is OPTIONAL and skipped unless you set it up. See MAINTAINING.md,
+# "Publishing from a fork". You need, in the repository's Settings -> Secrets
+# and variables -> Actions:
 #
 #   Secret  DOCKERHUB_TOKEN     an access token from hub.docker.com ->
 #                               Account settings -> Personal access tokens,
@@ -33,6 +31,16 @@ on:
     tags: ['v*.*.*']
   workflow_dispatch:
 
+# One publish at a time, and never cancel one in flight.
+#
+# Pushing a commit and a tag together — which is what cutting a release looks
+# like — fires two runs seconds apart. They then race for the same `type=gha`
+# cache scope and the same tags, and both take twenty minutes and fail, where
+# either alone takes two. Serialised, the second one starts warm.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
@@ -49,12 +57,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # arm64 is emulated through QEMU. It makes the build noticeably slower —
-      # DBD::SQLite is compiled from source — but a Raspberry Pi or an Apple
-      # Silicon box is exactly where a small self-hosted service like this ends
-      # up, so it is worth the minutes.
+      # arm64 is emulated through QEMU and compiles DBD::SQLite and CryptX from
+      # source, which is most of this workflow's wall-clock. A Raspberry Pi or an
+      # Apple Silicon box is exactly where a service like this ends up, so
+      # RELEASES carry it — but an ordinary push to main does not need to pay
+      # for it, so `main` and `edge` are amd64 only. See `platforms` below.
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+
+      - name: Which platforms?
+        id: platforms
+        run: |
+          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            echo "list=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo "list=linux/amd64" >> "$GITHUB_OUTPUT"
+            echo "::notice::Not a release — building linux/amd64 only. Tags get both."
+          fi
 
       - name: Is Docker Hub configured?
         id: hub
@@ -110,7 +129,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ steps.platforms.outputs.list }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
