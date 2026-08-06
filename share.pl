@@ -74,6 +74,13 @@ my %CFG = (
   : 50 * 1024 * 1024 * 1024,
   rate_per_second => defined $ENV{SHARE_RATE_PER_SECOND} ? 0 + $ENV{SHARE_RATE_PER_SECOND} : 1,
   rate_per_minute => defined $ENV{SHARE_RATE_PER_MINUTE} ? 0 + $ENV{SHARE_RATE_PER_MINUTE} : 10,
+
+  # How much is being held is nobody's business but the operator's. On a public
+  # instance it tells a stranger how busy the box is, roughly how much disk is
+  # in play, and whether an upload of theirs is still around — so it is OFF
+  # unless asked for, and asking for it is a deliberate act on a private
+  # deployment with a monitoring agent that needs the numbers.
+  health_detail => !!$ENV{SHARE_HEALTH_DETAIL},
 );
 
 sub _decoded ($value) {
@@ -167,7 +174,10 @@ get '/api' => sub ($c) {
 
 get '/how-to' => sub ($c) {
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
-  $c->render('how_to', stats => $store->stats, cfg => \%CFG);
+  # Same reasoning as /api/v1/health: how much is being held is the operator's
+  # business, not a visitor's.
+  $c->render('how_to', cfg => \%CFG,
+    stats => $c->app->config->{health_detail} ? $store->stats : undef);
 } => 'how_to';
 
 # The other direction: a human hands a file to an agent.
@@ -324,10 +334,19 @@ post '/f/<secret:id>/delete' => sub ($c) {
 
 my $api = app->routes->under('/api/v1' => sub ($c) {1});
 
+# Liveness, and nothing else by default. A health endpoint on a public box is
+# reachable by anyone, so it says only that it is alive and what it is running;
+# the inventory is added back with SHARE_HEALTH_DETAIL for a private deployment
+# whose collector needs it.
 $api->get('/health' => sub ($c) {
-  my $stats = $store->stats;
-  $c->render(json =>
-      {status => 'ok', version => $VERSION, files => $stats->{files}, bytes => $stats->{bytes}});
+  my $health = {status => 'ok', version => $VERSION};
+
+  if ($c->app->config->{health_detail}) {
+    my $stats = $store->stats;
+    @{$health}{qw(files bytes)} = @{$stats}{qw(files bytes)};
+  }
+
+  $c->render(json => $health);
 });
 
 $api->post('/files' => sub ($c) {
@@ -728,8 +747,7 @@ __DATA__
   in your browser's own viewer.</p>
 
   <p><strong>Files are deleted <%= $cfg->{ttl_days} %> days after upload</strong> and the URL dies
-  with them. This is a hand-off, not storage. Right now it is holding
-  <%= $stats->{files} %> file<%= $stats->{files} == 1 ? '' : 's' %>.</p>
+  with them. This is a hand-off, not storage.<%= $stats ? " Right now it is holding $stats->{files} file" . ($stats->{files} == 1 ? '' : 's') . '.' : '' %></p>
 
   <h2>Sending one to an agent</h2>
   <p>Use the drop zone on the <a href="/">home page</a>. You get a URL back; paste

@@ -207,8 +207,21 @@ subtest 'the API page, and the OpenAPI document behind it' => sub {
     'File does not carry a delete password, in the schema either';
 };
 
-subtest 'health' => sub {
-  $t->get_ok('/api/v1/health')->status_is(200)->json_is('/status' => 'ok');
+subtest 'health says it is alive and nothing more' => sub {
+  # Reachable by anyone on a public instance, so it must not report how many
+  # files are held or how much disk is in play. That tells a stranger how busy
+  # the box is and whether something of theirs is still on it.
+  $t->get_ok('/api/v1/health')->status_is(200)->json_is('/status' => 'ok')
+    ->json_has('/version')->json_hasnt('/files')->json_hasnt('/bytes');
+
+  # The same number used to sit on /how-to.
+  $t->get_ok('/how-to')->status_is(200)->content_unlike(qr/it is holding/);
+
+  # A private deployment can turn the inventory back on for its collector.
+  my $was = $t->app->config->{health_detail};
+  $t->app->config->{health_detail} = 1;
+  $t->get_ok('/api/v1/health')->status_is(200)->json_has('/files')->json_has('/bytes');
+  $t->app->config->{health_detail} = $was;
 };
 
 # ----------------------------------------------------------------- upload ----

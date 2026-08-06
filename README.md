@@ -142,7 +142,7 @@ curl "$S/api/v1/files/$ID"                   # metadata
 curl "$S/api/v1/files/$ID/content"           # the bytes
 curl -X DELETE -H "x-delete-password: $PW" \
   "$S/api/v1/files/$ID"                      # delete early
-curl "$S/api/v1/health"                      # liveness, count, bytes held
+curl "$S/api/v1/health"                      # liveness
 ```
 
 Upload answers `201` with JSON. Three fields matter: `url` is what you give a
@@ -196,6 +196,7 @@ All of it is environment variables. All of it is optional except where noted.
 | `SHARE_MAX_TOTAL_BYTES` | 50 GB | ceiling on everything held at once; the oldest are evicted over it |
 | `SHARE_RATE_PER_SECOND` | `1` | upload attempts per client per second; `0` disables |
 | `SHARE_RATE_PER_MINUTE` | `10` | upload attempts per client per minute; `0` disables |
+| `SHARE_HEALTH_DETAIL` | off | let `/api/v1/health` report files and bytes held |
 | `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
 | `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
 | `MOJO_REVERSE_PROXY` | `0` | set to `1` behind a proxy that sets `X-Forwarded-*` |
@@ -273,6 +274,12 @@ anything that can reach the service can POST to the endpoint directly. What it
 buys today is that a ticket cannot be altered in transit or hoarded forever, and
 what it buys later is a place for a real credential to live. Set
 `SHARE_REQUIRE_SIGNED_UPLOADS=1` to make tickets mandatory.
+
+**The health endpoint says only that it is alive.** How many files are held and
+how much disk is in play is the operator's business — on a public instance it
+tells a stranger how busy the box is and whether something of theirs is still
+there. `SHARE_HEALTH_DETAIL=1` adds the counts back for a private deployment
+whose monitoring needs them.
 
 **Uploads are rate limited, per client**: one a second and ten a minute by
 default, counted in SQLite rather than in process memory — the app runs prefork,

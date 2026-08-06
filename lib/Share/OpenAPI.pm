@@ -238,8 +238,12 @@ sub document ($class, $c) {
       '/health' => {
         get => {
           operationId => 'health',
-          summary     => 'Liveness, and what is being held',
-          responses   => {
+          summary     => 'Liveness',
+          description => 'Says only that the service is alive and what it is running. '
+            . 'How much it is holding is the operator business, not a caller — the '
+            . '`files` and `bytes` fields appear only where the operator has turned '
+            . 'them on for a monitoring agent.',
+          responses => {
             200 => {
               description => 'Alive.',
               content     => {
@@ -249,8 +253,8 @@ sub document ($class, $c) {
                     properties => {
                       status  => {type => 'string'},
                       version => {type => 'string'},
-                      files   => {type => 'integer'},
-                      bytes   => {type => 'integer'},
+                      files   => {type => 'integer', description => 'Only when enabled.'},
+                      bytes   => {type => 'integer', description => 'Only when enabled.'},
                     },
                   },
                 },
