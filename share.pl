@@ -76,11 +76,15 @@ my %CFG = (
   rate_per_second => defined $ENV{SHARE_RATE_PER_SECOND} ? 0 + $ENV{SHARE_RATE_PER_SECOND} : 1,
   rate_per_minute => defined $ENV{SHARE_RATE_PER_MINUTE} ? 0 + $ENV{SHARE_RATE_PER_MINUTE} : 10,
 
-  # How much is being held is nobody's business but the operator's. On a public
-  # instance it tells a stranger how busy the box is, roughly how much disk is
-  # in play, and whether an upload of theirs is still around — so it is OFF
-  # unless asked for, and asking for it is a deliberate act on a private
-  # deployment with a monitoring agent that needs the numbers.
+  # Lets /api/v1/health — and ONLY /api/v1/health — report how many files are
+  # held and how many bytes. No page a human can open carries that at any
+  # setting.
+  #
+  # It is inventory: on an instance a stranger can reach it says how busy the
+  # box is, roughly how much disk is in play, and, watched for a few minutes,
+  # whether something they uploaded is still there or has been evicted. So it is
+  # OFF by default, and turning it on is a deliberate act on a private
+  # deployment whose collector needs the numbers. Leave it off in public.
   health_detail => !!$ENV{SHARE_HEALTH_DETAIL},
 );
 
@@ -223,10 +227,12 @@ get '/api' => sub ($c) {
 
 get '/how-to' => sub ($c) {
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
-  # Same reasoning as /api/v1/health: how much is being held is the operator's
-  # business, not a visitor's.
-  $c->render('how_to', cfg => \%CFG,
-    stats => $c->app->config->{health_detail} ? $store->stats : undef);
+  # No inventory here, and no setting that can put it back. A page a stranger
+  # can open is not the place for how many files exist or how much disk is in
+  # play — see the note above SHARE_HEALTH_DETAIL. The one endpoint that may
+  # report it is /api/v1/health, because a collector needs numbers and an
+  # operator turns that on deliberately.
+  $c->render('how_to', cfg => \%CFG);
 } => 'how_to';
 
 # The other direction: a human hands a file to an agent.
@@ -796,7 +802,7 @@ __DATA__
   in your browser's own viewer.</p>
 
   <p><strong>Files are deleted <%= $cfg->{ttl_days} %> days after upload</strong> and the URL dies
-  with them. This is a hand-off, not storage.<%= $stats ? " Right now it is holding $stats->{files} file" . ($stats->{files} == 1 ? '' : 's') . '.' : '' %></p>
+  with them. This is a hand-off, not storage.</p>
 
   <h2>Sending one to an agent</h2>
   <p>Use the drop zone on the <a href="/">home page</a>. You get a URL back; paste

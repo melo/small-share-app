@@ -266,14 +266,27 @@ subtest 'health says it is alive and nothing more' => sub {
   $t->get_ok('/api/v1/health')->status_is(200)->json_is('/status' => 'ok')
     ->json_has('/version')->json_hasnt('/files')->json_hasnt('/bytes');
 
-  # The same number used to sit on /how-to.
-  $t->get_ok('/how-to')->status_is(200)->content_unlike(qr/it is holding/);
-
-  # A private deployment can turn the inventory back on for its collector.
+  # A private deployment can turn the inventory back on for its collector...
   my $was = $t->app->config->{health_detail};
   $t->app->config->{health_detail} = 1;
   $t->get_ok('/api/v1/health')->status_is(200)->json_has('/files')->json_has('/bytes');
+
+  # ...but that setting must NOT be able to put it on a page a human opens. It
+  # used to say "Right now it is holding N files" here.
+  $t->get_ok('/how-to')->status_is(200)
+    ->content_unlike(qr/it is holding/)->content_unlike(qr/\bholding \d+ file/);
   $t->app->config->{health_detail} = $was;
+
+  # Nothing else a stranger can reach reports the inventory either. This is a
+  # sweep rather than a spot check, because the leak was added twice: once on
+  # the health endpoint and once, separately, in prose.
+  for my $path ('/', '/how-to', '/api', '/api?openapi=1') {
+    $t->get_ok($path)->status_is(200);
+    my $body = $t->tx->res->text;
+    unlike $body, qr/\bholding \d+ file/i, "$path does not say how many files are held";
+    unlike $body, qr/"files"\s*:\s*\d/,   "$path does not report a file count";
+    unlike $body, qr/"bytes"\s*:\s*\d/,   "$path does not report bytes held";
+  }
 };
 
 # ----------------------------------------------------------------- upload ----

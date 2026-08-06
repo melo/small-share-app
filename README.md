@@ -196,7 +196,7 @@ All of it is environment variables. All of it is optional except where noted.
 | `SHARE_MAX_TOTAL_BYTES` | 50 GB | ceiling on everything held at once; the oldest are evicted over it |
 | `SHARE_RATE_PER_SECOND` | `1` | upload attempts per client per second; `0` disables |
 | `SHARE_RATE_PER_MINUTE` | `10` | upload attempts per client per minute; `0` disables |
-| `SHARE_HEALTH_DETAIL` | off | let `/api/v1/health` report files and bytes held |
+| `SHARE_HEALTH_DETAIL` | off | let `/api/v1/health` report files and bytes held. **Leave off in public.** |
 | `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
 | `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
 | `MOJO_REVERSE_PROXY` | `0` | set to `1` behind a proxy that sets `X-Forwarded-*` |
@@ -275,11 +275,17 @@ buys today is that a ticket cannot be altered in transit or hoarded forever, and
 what it buys later is a place for a real credential to live. Set
 `SHARE_REQUIRE_SIGNED_UPLOADS=1` to make tickets mandatory.
 
-**The health endpoint says only that it is alive.** How many files are held and
-how much disk is in play is the operator's business — on a public instance it
-tells a stranger how busy the box is and whether something of theirs is still
-there. `SHARE_HEALTH_DETAIL=1` adds the counts back for a private deployment
-whose monitoring needs them.
+**Nothing a stranger can open reports the inventory.** How many files are held
+and how much disk is in play is the operator's business: it says how busy the
+box is, roughly how much disk is in play, and — watched for a few minutes —
+whether something a visitor uploaded is still there or has been evicted.
+
+No page carries it at any setting. The single exception is `/api/v1/health`,
+because a monitoring agent needs numbers; that is off by default and
+`SHARE_HEALTH_DETAIL=1` turns it on for a private deployment. The suite sweeps
+every page a stranger can reach for both the prose and the JSON forms, because
+this leaked twice — once on the health endpoint, and separately in a sentence on
+the how-to page.
 
 **Uploads are rate limited, per client**: one a second and ten a minute by
 default, counted in SQLite rather than in process memory — the app runs prefork,
