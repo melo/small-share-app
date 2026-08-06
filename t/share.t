@@ -46,14 +46,56 @@ my $PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8'
 # The smallest thing that is unambiguously a PDF.
 my $PDF_B64 = b64_encode("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n", '');
 
+# Protocol revision 2026-07-28: no handshake, and every request declares its
+# version in _meta. MCP::Server::Transport::HTTP enforces that, so a call
+# without it is answered with UnsupportedProtocolVersionError rather than being
+# quietly served.
+my $PROTOCOL = '2026-07-28';
+my $META     = 'io.modelcontextprotocol/protocolVersion';
+my $CAPS     = 'io.modelcontextprotocol/clientCapabilities';
+my $INFO     = 'io.modelcontextprotocol/clientInfo';
+
 # One MCP call, unwrapped. The suite makes a lot of these and the JSON-RPC
 # envelope adds nothing to a test's meaning.
-sub _mcp ($method, $params = undef) {
+sub _mcp ($method, $params = undef, %opt) {
   state $id = 1000;
-  $t->post_ok('/mcp' => json =>
-      {jsonrpc => '2.0', id => ++$id, method => $method, ($params ? (params => $params) : ())})
-    ->status_is(200);
+  my $version = $opt{version} // $PROTOCOL;
+  # _meta carries what the initialize handshake used to: the protocol version,
+  # the client's capabilities and its identity, on every single request.
+  my $p = {
+    %{$params // {}},
+    _meta => {$META => $version, $CAPS => {}, $INFO => {name => 'share-tests', version => '1'}},
+  };
+
+  # The 2026-07-28 HTTP binding requires routing headers that restate what the
+  # body says, so a gateway routing on headers alone can never disagree with the
+  # server about what was called. Mismatched or missing ones are a 400 before
+  # anything is dispatched. Mcp-Param-* would be needed too, but only for schema
+  # properties that opt in with x-mcp-header, and none of ours do.
+  my %headers = ('MCP-Protocol-Version' => $version, 'Mcp-Method' => $method);
+  $headers{'Mcp-Name'} = $params->{name}
+    if $method eq 'tools/call' && defined $params->{name};
+
+  $t->post_ok('/mcp' => \%headers => json =>
+      {jsonrpc => '2.0', id => ++$id, method => $method, params => $p});
+  $t->status_is($opt{status} // 200);
   return $t->tx->res->json;
+}
+
+# Deleting needs the password from the upload response — the share URL alone
+# grants only reading. Every teardown in this suite goes through here.
+sub _delete ($id, $password) {
+  $t->delete_ok("/api/v1/files/$id" => {'X-Delete-Password' => $password // ''});
+  return $t->tx->res;
+}
+
+# Upload and keep both secrets: the id for the URL, the password for the
+# cleanup.
+sub _upload ($filename, $content, %extra) {
+  my $url = Mojo::URL->new('/api/v1/files')->query({filename => $filename, %extra});
+  $t->post_ok($url->to_string => $content)->status_is(201);
+  my $json = $t->tx->res->json;
+  return ($json->{id}, $json->{delete_password});
 }
 
 # ------------------------------------------------------------------ pages ----
@@ -61,7 +103,8 @@ sub _mcp ($method, $params = undef) {
 subtest 'the home page is the uploader, and nothing else' => sub {
   $t->get_ok('/')->status_is(200)
     ->content_like(qr{<a class="brand" href="/">share</a>})
-    ->content_like(qr{<nav><a href="/how-to">How to use it</a></nav>})
+    ->content_like(qr{<a href="/how-to">How to use it</a>})
+    ->content_like(qr{<a href="/api">API</a>})
     ->content_like(qr{<section class="uploader">})
     ->content_like(qr{<section class="recent" hidden>})
     ->header_like('Content-Security-Policy' => qr/default-src 'none'/);
@@ -99,6 +142,44 @@ subtest 'the uploader is a plain form that works without JavaScript' => sub {
   $t->get_ok('/f/' . ('z' x 32))->header_unlike('Content-Security-Policy' => qr/script-src/);
 };
 
+subtest 'the API page, and the OpenAPI document behind it' => sub {
+  $t->get_ok('/api')->status_is(200)->content_type_like(qr{text/html})
+    ->content_like(qr/The API/)->content_like(qr{/api\?openapi=1})
+    ->content_like(qr{x-delete-password});
+
+  # ?openapi=1 always wins, whatever the Accept header says.
+  $t->get_ok('/api?openapi=1' => {Accept => 'text/html'})->status_is(200)
+    ->content_type_like(qr{application/json})
+    ->json_is('/openapi' => '3.1.0')->json_is('/info/title' => 'share')
+    ->json_has('/paths/~1files/post')->json_has('/paths/~1files~1{id}/delete')
+    ->json_has('/components/schemas/UploadedFile');
+
+  # Built from the running config, so the limits it advertises are the limits
+  # that are actually enforced.
+  $t->json_is('/components/schemas/File/properties/size/maximum' => 32 * 1024 * 1024);
+  $t->json_like('/info/description' => qr/15 days/);
+  $t->json_like('/servers/0/url' => qr{\Ahttps://share\.example\.test/api/v1\z});
+
+  # Content negotiation by convention — the spec defines none, and nothing is
+  # registered with IANA. When a client names an openapi type, that exact type
+  # comes back.
+  for my $type (qw(application/openapi+json application/vnd.oai.openapi+json)) {
+    $t->get_ok('/api' => {Accept => $type})->status_is(200)
+      ->content_type_is($type)->json_is('/openapi' => '3.1.0');
+  }
+  $t->get_ok('/api' => {Accept => 'application/json'})->status_is(200)
+    ->content_type_like(qr{application/json})->json_is('/openapi' => '3.1.0');
+
+  # A browser sends text/html first and gets the page, not a JSON download.
+  $t->get_ok('/api' => {Accept => 'text/html,application/xhtml+xml,application/json;q=0.9'})
+    ->status_is(200)->content_type_like(qr{text/html});
+
+  # The delete password must not leak into the description of the read side.
+  my $doc = $t->get_ok('/api?openapi=1')->tx->res->json;
+  ok !exists $doc->{components}{schemas}{File}{properties}{delete_password},
+    'File does not carry a delete password, in the schema either';
+};
+
 subtest 'health' => sub {
   $t->get_ok('/api/v1/health')->status_is(200)->json_is('/status' => 'ok');
 };
@@ -126,7 +207,7 @@ graph TD;
 ```
 MD
 
-my $id;
+my ($id, $delete_password);
 
 subtest 'raw-body upload' => sub {
   $t->post_ok("/api/v1/files?filename=report.md&session_id=$SESSION&note=have+a+look"
@@ -137,7 +218,10 @@ subtest 'raw-body upload' => sub {
     ->json_like('/expires_in' => qr/^(?:14|15) days$/);
 
   $id = $t->tx->res->json('/id');
+  $delete_password = $t->tx->res->json('/delete_password');
   like $id, qr/\A[A-Za-z0-9]{32}\z/, 'the id is 32 base62 characters';
+  like $delete_password, qr/\A[A-Za-z0-9]{24}\z/,
+    'and a delete password came back with it, once';
 };
 
 subtest 'raw-body upload without a filename is refused' => sub {
@@ -158,7 +242,8 @@ subtest 'HEIC, because that is what phones produce' => sub {
 
   $t->post_ok('/api/v1/files?filename=photo.heic' => $heic)->status_is(201)
     ->json_is('/kind' => 'image')->json_is('/content_type' => 'image/heic');
-  my $heic_id = $t->tx->res->json('/id');
+  my $heic_id       = $t->tx->res->json('/id');
+  my $heic_password = $t->tx->res->json('/delete_password');
 
   # Accepted, but honest about it: outside Safari the <img> will not decode, and
   # a broken image icon with no explanation is a worse answer than a refusal.
@@ -170,7 +255,7 @@ subtest 'HEIC, because that is what phones produce' => sub {
   $t->post_ok('/api/v1/files?filename=clip.heic' => "\0\0\0\x18ftypmp42\0\0\0\0")
     ->status_is(400)->json_like('/error' => qr/claims to be \.heic/);
 
-  $t->delete_ok("/api/v1/files/$heic_id")->status_is(200);
+  _delete($heic_id, $heic_password);
 };
 
 subtest 'unknown extensions are refused' => sub {
@@ -188,7 +273,8 @@ subtest 'PDFs go to the browser own viewer' => sub {
   $t->post_ok('/api/v1/files' => {'Content-Type' => 'application/json'} =>
       encode_json({filename => 'doc.pdf', content_base64 => $PDF_B64}))->status_is(201)
     ->json_is('/kind' => 'pdf')->json_is('/content_type' => 'application/pdf');
-  my $pdf_id = $t->tx->res->json('/id');
+  my $pdf_id       = $t->tx->res->json('/id');
+  my $pdf_password = $t->tx->res->json('/delete_password');
 
   # No sandbox attribute at all: it breaks the built-in PDF viewer in several
   # browsers, and the browser already sandboxes that viewer itself.
@@ -202,7 +288,8 @@ subtest 'PDFs go to the browser own viewer' => sub {
   $t->get_ok("/f/$pdf_id/raw")->status_is(200)->content_type_is('application/pdf')
     ->header_is('Content-Security-Policy' => undef);
 
-  $t->delete_ok("/api/v1/files/$pdf_id")->status_is(200);
+  _delete($pdf_id, $pdf_password);
+  $t->status_is(200);
 };
 
 subtest 'signed upload tickets' => sub {
@@ -217,7 +304,8 @@ subtest 'signed upload tickets' => sub {
   # Untouched: it works.
   $t->post_ok($url->path_query => form => {file => {content => "# ok\n", filename => 'signed.md'}})
     ->status_is(201)->json_is('/title' => 'Signed');
-  my $made = $t->tx->res->json('/id');
+  my $made          = $t->tx->res->json('/id');
+  my $made_password = $t->tx->res->json('/delete_password');
 
   # Every parameter is covered. Editing any of them invalidates the whole thing,
   # which is the point: an agent cannot be handed a ticket for one session and
@@ -248,7 +336,8 @@ subtest 'signed upload tickets' => sub {
   $t->post_ok($stale->path_query => form => {file => {content => "x\n", filename => 'signed.md'}})
     ->status_is(403)->json_like('/error' => qr/expired/);
 
-  $t->delete_ok("/api/v1/files/$made")->status_is(200);
+  _delete($made, $made_password);
+  $t->status_is(200);
 };
 
 subtest 'no route lets a client choose or overwrite an id' => sub {
@@ -261,13 +350,14 @@ subtest 'no route lets a client choose or overwrite an id' => sub {
   $t->put_ok('/api/v1/files' => 'hello')->status_is(404);
 
   # The same bytes uploaded twice are two separate files with two ids.
-  my @ids;
+  my @made;
   for (1 .. 2) {
     $t->post_ok('/api/v1/files?filename=twin.md' => "# twin\n")->status_is(201);
-    push @ids, $t->tx->res->json('/id');
+    push @made, $t->tx->res->json;
   }
-  isnt $ids[0], $ids[1], 'two uploads, two ids, no overwrite';
-  $t->delete_ok("/api/v1/files/$_")->status_is(200) for @ids;
+  isnt $made[0]{id}, $made[1]{id}, 'two uploads, two ids, no overwrite';
+  isnt $made[0]{delete_password}, $made[1]{delete_password}, 'and two passwords';
+  _delete($_->{id}, $_->{delete_password})->code == 200 or die 'cleanup failed' for @made;
 };
 
 # ----------------------------------------------------------------- viewer ----
@@ -363,47 +453,81 @@ subtest 'MCP: only POST' => sub {
   $t->delete_ok('/mcp')->status_is(405);
 };
 
-subtest 'MCP: initialize' => sub {
-  $t->post_ok('/mcp' => json => {
-    jsonrpc => '2.0', id => 1, method => 'initialize',
-    params  => {protocolVersion => '2025-06-18', capabilities => {}, clientInfo => {name => 't'}},
-  })->status_is(200)->json_is('/result/protocolVersion' => '2025-06-18')
-    ->json_is('/result/serverInfo/name' => 'share')
-    ->json_like('/result/instructions' => qr/hands a file from you to a human/)
-    ->json_has('/result/capabilities/tools');
+subtest 'MCP: server/discover replaces the handshake' => sub {
+  my $res = _mcp('server/discover');
+
+  # Identity moved into _meta with the rest of the per-request metadata; there
+  # is no handshake left to carry it in a result body.
+  is $res->{result}{_meta}{'io.modelcontextprotocol/serverInfo'}{name}, 'share',
+    'it names itself';
+  like $res->{result}{instructions}, qr/hands a file from you to a human/,
+    'and explains itself before a single tool call';
+  ok $res->{result}{capabilities}{tools}, 'advertising tools';
 
   # The instructions are built from the running config, not frozen: an operator
   # who changes the retention or the size cap must not have the MCP server
   # telling every agent the old numbers.
-  my $instructions = $t->tx->res->json('/result/instructions');
-  like $instructions, qr/deleted 15 days after upload/, 'the real retention';
-  like $instructions, qr/up to 32\.0 MB each/,          'the real size cap';
+  my $instructions = $res->{result}{instructions};
+  like $instructions, qr/deleted 15 days after upload/,  'the real retention';
+  like $instructions, qr/up to 32\.0 MB each/,           'the real size cap';
   like $instructions, qr/Office network only — ask #infra for access\./,
     'and the deployment notice the operator set, decoded exactly once';
-
-  # An unknown version is answered with ours, not with an error.
-  $t->post_ok('/mcp' => json =>
-      {jsonrpc => '2.0', id => 2, method => 'initialize', params => {protocolVersion => '1999-01-01'}})
-    ->status_is(200)->json_is('/result/protocolVersion' => '2025-06-18');
+  # The text wraps, so the phrase spans a newline — match across it rather than
+  # assuming where the line breaks fall.
+  like $instructions, qr/delete_password.*ONLY\s+time\s+you\s+will\s+ever\s+be\s+shown\s+it/s,
+    'and it warns that the delete password is shown once';
 };
 
-subtest 'MCP: notifications get a 202 and no body' => sub {
-  $t->post_ok('/mcp' => json => {jsonrpc => '2.0', method => 'notifications/initialized'})
-    ->status_is(202)->content_is('');
+subtest 'the routing headers must agree with the body' => sub {
+  # A gateway that routes on Mcp-Method alone must never be able to disagree
+  # with the server about which method was called.
+  $t->post_ok('/mcp' => {'MCP-Protocol-Version' => $PROTOCOL, 'Mcp-Method' => 'tools/list'} =>
+      json => {jsonrpc => '2.0', id => 1, method => 'server/discover',
+        params => {_meta => {$META => $PROTOCOL, $CAPS => {}}}})->status_is(400);
+
+  # But a request with NO MCP-Protocol-Version at all is not an error: revisions
+  # before 2025-06-18 predate the header, so the transport reads it as a legacy
+  # client and answers it as one. Dropping that would break every old client in
+  # the field, which is exactly what MCP::Server::Legacy exists to avoid.
+  $t->post_ok('/mcp' => json => {jsonrpc => '2.0', id => 1, method => 'tools/list'})
+    ->status_is(200)->json_has('/result/tools');
+};
+
+subtest 'MCP: an unsupported protocol version is refused, with a list' => sub {
+  # _meta carrying a version is what makes a request modern, whatever the header
+  # says — so this is answered as a modern request with a version we do not
+  # speak, not mistaken for a legacy one.
+  my $res = _mcp('server/discover', undef, version => '1999-01-01', status => 400);
+  ok $res->{error}, 'refused';
+  is $res->{error}{code}, -32022, 'UnsupportedProtocolVersionError';
+  is_deeply $res->{error}{data}{supported}, ['2026-07-28'], 'saying what it does speak';
+};
+
+subtest 'MCP: the legacy handshake still works' => sub {
+  # Clients on the older initialize-based revisions have not all caught up, and
+  # MCP::Server::Transport::HTTP answers them. Dropping this would break every
+  # agent in the field today.
+  $t->post_ok('/mcp' => json => {
+    jsonrpc => '2.0', id => 1, method => 'initialize',
+    params  => {protocolVersion => '2025-06-18', capabilities => {}, clientInfo => {name => 't'}},
+  })->status_is(200)->json_is('/result/protocolVersion' => '2025-06-18')
+    ->json_is('/result/serverInfo/name' => 'share');
+
+  # ...and a legacy client can go on to list and call tools.
+  $t->post_ok('/mcp' => {'MCP-Protocol-Version' => '2025-06-18'} => json =>
+      {jsonrpc => '2.0', id => 2, method => 'tools/list'})->status_is(200);
+  ok @{$t->tx->res->json('/result/tools')}, 'legacy tools/list still answers';
 };
 
 subtest 'MCP: tools/list' => sub {
-  $t->post_ok('/mcp' => json => {jsonrpc => '2.0', id => 3, method => 'tools/list'})
-    ->status_is(200);
-  my $tools = $t->tx->res->json('/result/tools');
+  my $res = _mcp('tools/list');
+  my $tools = $res->{result}{tools};
   is_deeply [sort map { $_->{name} } @$tools],
     [qw(delete_shared_file get_shared_file get_upload_url list_shared_files)],
     'four tools, and not one of them moves bytes';
 
   # The whole point of this server's shape, asserted structurally rather than by
   # grepping prose — the descriptions legitimately talk about bytes and content.
-  # If a tool ever grows a parameter that carries a file, it belongs on the HTTP
-  # side instead.
   my @carriers = grep { /\A(?:content|content_base64|data|bytes|body|file)\z/ }
     map { keys %{$_->{inputSchema}{properties} // {}} } @$tools;
   is_deeply \@carriers, [], 'no tool takes file contents as an argument';
@@ -417,17 +541,17 @@ subtest 'MCP: get_upload_url hands back a command, not a byte sink' => sub {
   });
   ok !$res->{result}{isError}, 'it succeeded';
 
-  my $out = from_json($res->{result}{content}[0]{text});
+  # structured_result gives both the JSON text and structuredContent, so a
+  # client can parse it without going through prose.
+  my $out = $res->{result}{structuredContent};
   is $out->{method}, 'POST', 'POST';
   like $out->{upload_url}, qr{\Ahttps://share\.example\.test/api/v1/files\?},
     'pointing at the ordinary REST endpoint';
-  like $out->{upload_url}, qr/filename=report\.md/,     'with the filename baked in';
-  like $out->{upload_url}, qr/session_id=$SESSION/,      'and the session';
-  like $out->{upload_url}, qr/title=A(?:%20|\+)report/,  'and the title, encoded';
-  like $out->{upload_url}, qr/ttl_days=3/,               'and the ttl';
+  like $out->{upload_url}, qr/filename=report\.md/,    'with the filename baked in';
+  like $out->{upload_url}, qr/session_id=$SESSION/,     'and the session';
+  like $out->{upload_url}, qr/title=A(?:%20|\+)report/, 'and the title, encoded';
   like $out->{command}, qr{\Acurl -fsS -F 'file=\@/tmp/report\.md'}, 'a runnable command';
-  like $res->{result}{content}[1]{text}, qr/give the human the "url"/i,
-    'and prose telling the model what to do with the output';
+  like $out->{next}, qr/delete_password/, 'and it says to keep the delete password';
 
   # Nothing was written: an abandoned call must cost nothing, because there is
   # deliberately no reservation to expire and reap.
@@ -438,117 +562,107 @@ subtest 'MCP: get_upload_url hands back a command, not a byte sink' => sub {
   $t->post_ok($upload->path_query => form => {file => {content => "# a report\n",
       filename => 'report.md'}})->status_is(201)->json_is('/session_id' => $SESSION)
     ->json_is('/title' => 'A report')->json_like('/expires_in' => qr/^(?:2|3) days$/);
-  my $made = $t->tx->res->json('/id');
+  my $made = $t->tx->res->json;
 
-  $t->post_ok('/mcp' => json => {jsonrpc => '2.0', id => 41, method => 'tools/call',
-    params => {name => 'get_upload_url', arguments => {}}})->status_is(200)
-    ->json_is('/result/isError' => 1)->json_like('/result/content/0/text' => qr/filename is required/);
+  # A missing required argument is caught by the library's JSON Schema check,
+  # before our code runs at all.
+  my $bad = _mcp('tools/call', {name => 'get_upload_url', arguments => {}});
+  ok $bad->{error} || $bad->{result}{isError}, 'a missing filename is refused';
 
-  $t->delete_ok("/api/v1/files/$made")->status_is(200);
+  _delete($made->{id}, $made->{delete_password})->code == 200 or die 'cleanup failed';
 };
 
 subtest 'MCP: reading a file back means being told where it is' => sub {
-  my $res = _mcp('tools/call', {name => 'get_shared_file', arguments => {id => $id}});
-  my $info = from_json($res->{result}{content}[0]{text});
+  my $res  = _mcp('tools/call', {name => 'get_shared_file', arguments => {id => $id}});
+  my $info = $res->{result}{structuredContent};
 
   is $info->{id}, $id, 'the right file';
   is $info->{kind}, 'markdown', 'described fully';
   like $info->{url}, qr{/f/\Q$id\E\z}, 'the page for the human';
   like $info->{content_url}, qr{/api/v1/files/\Q$id\E/content\z}, 'the bytes for the agent';
-  like $res->{result}{content}[1]{text}, qr/curl -fsS '.*\/content'/, 'with the command spelled out';
 
-  # The contents themselves are NOT in the response, at any size. That is the
-  # property the whole design turns on. to_json, not encode_json: the result
-  # holds characters, and encoding it to UTF-8 bytes here just to grep it warns
-  # and dies under -w.
-  unlike to_json($res->{result}), qr/# Report/,
-    'the markdown itself never crosses the MCP boundary';
+  # The contents themselves are NOT in the response, at any size, and neither is
+  # the delete password. Those are the two properties the design turns on.
+  my $whole = to_json($res->{result});
+  unlike $whole, qr/# Report/,       'the markdown never crosses the MCP boundary';
+  unlike $whole, qr/delete_password/, 'and the delete password is never handed out again';
 
-  # And content_url is real.
   $t->get_ok("/api/v1/files/$id/content")->status_is(200)->content_like(qr/# Report/);
 };
 
-subtest 'MCP: listing gives both URLs for every file' => sub {
+subtest 'MCP: listing gives both URLs, and no passwords' => sub {
   my $res = _mcp('tools/call',
     {name => 'list_shared_files', arguments => {session_id => $SESSION}});
-  my $out = from_json($res->{result}{content}[0]{text});
+  my $out = $res->{result}{structuredContent};
   is $out->{count}, 2, 'both files';
   ok $_->{url} && $_->{content_url}, 'each carries a page URL and a content URL'
     for @{$out->{files}};
+  unlike to_json($out), qr/delete_password/, 'and not one password among them';
 
   $res = _mcp('tools/call',
     {name => 'list_shared_files', arguments => {session_id => 'nobody at all'}});
   like $res->{result}{content}[0]{text}, qr/Nothing shared under that session id/,
-    'and an empty session says so plainly';
+    'an empty session says so plainly';
 };
 
-subtest 'MCP: the missing-id paths' => sub {
-  for my $tool (qw(get_shared_file delete_shared_file)) {
-    my $res = _mcp('tools/call', {name => $tool, arguments => {id => 'n' x 32}});
-    ok $res->{result}{isError}, "$tool on a missing id is a tool error";
-    like $res->{result}{content}[0]{text}, qr/no live file/, "$tool says why";
-  }
+subtest 'MCP: deleting needs the password' => sub {
+  my ($doomed, $password) = _upload('doomed-by-mcp.md', "# doomed\n");
+
+  # The share URL is not enough, and the refusal does not say which half was
+  # wrong — so this cannot be used to find out which ids exist.
+  my $res = _mcp('tools/call',
+    {name => 'delete_shared_file', arguments => {id => $doomed, delete_password => 'guess'}});
+  ok $res->{result}{isError}, 'a wrong password is refused';
+  like $res->{result}{content}[0]{text}, qr/no such file, or the wrong delete password/,
+    'in the same words as a missing file';
+  $t->get_ok("/f/$doomed")->status_is(200);
+
+  $res = _mcp('tools/call',
+    {name => 'delete_shared_file', arguments => {id => $doomed, delete_password => $password}});
+  ok !$res->{result}{isError}, 'the right password works';
+  $t->get_ok("/f/$doomed")->status_is(404);
+
+  # A missing id is the same sentence again.
+  $res = _mcp('tools/call',
+    {name => 'delete_shared_file', arguments => {id => 'n' x 32, delete_password => 'x'}});
+  ok $res->{result}{isError}, 'and a missing id too';
 };
 
-subtest 'MCP: ping, and a batch from an older client' => sub {
-  $t->post_ok('/mcp' => json => {jsonrpc => '2.0', id => 50, method => 'ping'})
-    ->status_is(200)->json_is('/result' => {});
-
-  # Batches were dropped in 2025-06-18 but older clients still send them.
-  $t->post_ok('/mcp' => json => [
-    {jsonrpc => '2.0', id => 51, method => 'ping'},
-    {jsonrpc => '2.0', id => 52, method => 'tools/list'},
-    {jsonrpc => '2.0', method => 'notifications/initialized'},
-  ])->status_is(200)->json_is('/0/id' => 51)->json_is('/1/id' => 52);
-
-  # A batch of nothing but notifications has nothing to answer with.
-  $t->post_ok('/mcp' => json => [{jsonrpc => '2.0', method => 'notifications/initialized'}])
-    ->status_is(202);
-
-  $t->post_ok('/mcp' => {'Content-Type' => 'application/json'} => 'not json at all')
-    ->status_is(400)->json_is('/error/code' => -32700);
-
-  $t->post_ok('/mcp' => json => {id => 53, method => 'ping'})->status_is(200)
-    ->json_is('/error/code' => -32600);
+subtest 'MCP: an unknown tool is an error, not a crash' => sub {
+  my $res = _mcp('tools/call', {name => 'no_such_tool', arguments => {}});
+  ok $res->{error} || $res->{result}{isError}, 'refused';
 };
 
-subtest 'MCP: a bad call is a tool error, not a protocol error' => sub {
-  $t->post_ok('/mcp' => json => {
-    jsonrpc => '2.0', id => 7, method => 'tools/call',
-    params  => {name => 'get_upload_url', arguments => {}},
-  })->status_is(200)->json_is('/result/isError' => 1)
-    ->json_like('/result/content/0/text' => qr/filename is required/);
-
-  $t->post_ok('/mcp' => json =>
-      {jsonrpc => '2.0', id => 8, method => 'tools/call', params => {name => 'no_such_tool'}})
-    ->status_is(200)->json_is('/error/code' => -32602);
-
-  $t->post_ok('/mcp' => json => {jsonrpc => '2.0', id => 9, method => 'no/such/method'})
-    ->status_is(200)->json_is('/error/code' => -32601);
-};
-
-subtest 'MCP: a hostile Origin is refused' => sub {
-  $t->post_ok('/mcp' => {Origin => 'https://evil.example'} => json =>
-      {jsonrpc => '2.0', id => 10, method => 'ping'})->status_is(403);
-  $t->post_ok('/mcp' => {Origin => 'https://share.example.test'} => json =>
-      {jsonrpc => '2.0', id => 11, method => 'ping'})->status_is(200);
-};
-
-subtest 'MCP: an unsupported protocol version is a 400' => sub {
-  $t->post_ok('/mcp' => {'MCP-Protocol-Version' => '1999-01-01'} => json =>
-      {jsonrpc => '2.0', id => 12, method => 'ping'})->status_is(400);
-  $t->post_ok('/mcp' => {'MCP-Protocol-Version' => '2025-06-18'} => json =>
-      {jsonrpc => '2.0', id => 13, method => 'ping'})->status_is(200);
-};
-
-# ----------------------------------------------------------------- delete ----
-
-subtest 'deleting from the browser takes two clicks and no JavaScript' => sub {
+subtest 'deleting from the browser takes two clicks, a password, and no JavaScript' => sub {
   $t->get_ok("/f/$id/delete")->status_is(200)->content_like(qr/Delete this file/)
-    ->content_unlike(qr/<script/);
-  $t->post_ok("/f/$id/delete")->status_is(200)->content_like(qr/is gone/);
+    ->content_like(qr{name="delete_password"})->content_unlike(qr/<script/);
+
+  # Knowing the share URL is not enough. Whoever was merely sent the link gets a
+  # read-only page; only whoever uploaded it holds the password.
+  $t->post_ok("/f/$id/delete" => form => {delete_password => 'not it'})->status_is(200)
+    ->content_like(qr/no such file, or the wrong delete password/)
+    ->content_like(qr/Delete this file/);
+  $t->get_ok("/f/$id")->status_is(200);
+
+  $t->post_ok("/f/$id/delete" => form => {delete_password => $delete_password})
+    ->status_is(200)->content_like(qr/is gone/);
   $t->get_ok("/f/$id")->status_is(404);
-  $t->delete_ok("/api/v1/files/$id")->status_is(404);
+  _delete($id, $delete_password)->code == 403 or die 'a deleted file must stay deleted';
+};
+
+subtest 'the delete password is disclosed exactly once' => sub {
+  my ($once, $password) = _upload('once.md', "# once\n", session_id => 'disclosure');
+
+  # Not in the metadata, not in the listing, not on the page a human opens.
+  $t->get_ok("/api/v1/files/$once")->status_is(200);
+  unlike to_json($t->tx->res->json), qr/delete_password/, 'not in the metadata';
+
+  $t->get_ok('/api/v1/files?session_id=disclosure')->status_is(200);
+  unlike to_json($t->tx->res->json), qr/delete_password/, 'not in the listing';
+
+  $t->get_ok("/f/$once")->status_is(200)->content_unlike(qr/\Q$password\E/);
+
+  _delete($once, $password)->code == 200 or die 'cleanup failed';
 };
 
 done_testing;

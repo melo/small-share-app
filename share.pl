@@ -26,7 +26,8 @@ use lib "$FindBin::Bin/lib";
 
 use Mojo::IOLoop  ();
 use Mojo::Util    qw(decode url_escape);
-use Share::MCP    ();
+use Share::MCP     ();
+use Share::OpenAPI qw(openapi_type);
 use Share::Render qw(render_markdown);
 use Share::Store  qw(human_size payload_bytes);
 
@@ -56,6 +57,8 @@ my %CFG = (
   # and every upload must carry a signed ticket from the MCP get_upload_url
   # tool. Only meaningful once there is something to authenticate.
   require_signed_uploads => !!$ENV{SHARE_REQUIRE_SIGNED_UPLOADS},
+
+  version => $VERSION,
 );
 
 sub _decoded ($value) {
@@ -126,6 +129,24 @@ get '/' => sub ($c) {
   $c->render('index', cfg => \%CFG);
 } => 'index';
 
+# The API, for humans and for machines, at one URL.
+#
+# ?openapi=1 always wins; otherwise Accept decides. See Share::OpenAPI for why
+# this is convention rather than specification — the OpenAPI spec says nothing
+# about how a description document should be served, and nothing is registered
+# with IANA.
+get '/api' => sub ($c) {
+  if (my $type = openapi_type($c)) {
+    $c->res->headers->content_type($type);
+    # Whoever hands this to a code generator should be able to cache it.
+    $c->res->headers->cache_control('public, max-age=300');
+    return $c->render(data => Mojo::JSON::encode_json(Share::OpenAPI->document($c)));
+  }
+
+  $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
+  $c->render('api', cfg => \%CFG, openapi => Share::OpenAPI->document($c));
+} => 'api';
+
 get '/how-to' => sub ($c) {
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
   $c->render('how_to', stats => $store->stats, cfg => \%CFG);
@@ -165,7 +186,8 @@ post '/upload' => sub ($c) {
     };
     push @results, $@
       ? {filename => $upload->filename, error => _error_text($@)}
-      : {file     => $store->public($row, $c->base_url)};
+      : {file => {%{$store->public($row, $c->base_url)},
+          delete_password => $row->{delete_password}}};
   }
 
   $c->render('uploaded', results => \@results, error => undef);
@@ -253,16 +275,20 @@ get '/f/<secret:id>/delete' => sub ($c) {
   my $row = $store->find($c->stash('secret')) or return _gone($c);
   $c->secret_headers;
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
-  $c->render('confirm_delete', file => $store->public($row, $c->base_url));
+  $c->render('confirm_delete', file => $store->public($row, $c->base_url), error => undef);
 } => 'confirm_delete';
 
 post '/f/<secret:id>/delete' => sub ($c) {
   my $row = $store->find($c->stash('secret')) or return _gone($c);
   my $filename = $row->{filename};
-  $store->remove($row->{secret});
 
   $c->secret_headers;
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
+
+  my ($ok, $why) = $store->remove($row->{secret}, scalar $c->param('delete_password'));
+  return $c->render('confirm_delete', file => $store->public($row, $c->base_url), error => $why)
+    unless $ok;
+
   $c->render('deleted', filename => $filename);
 };
 
@@ -296,7 +322,10 @@ $api->post('/files' => sub ($c) {
   my $row = eval { $store->add(%$args) };
   return _api_error($c, 400, $@) if $@;
 
-  my $info = $store->public($row, $c->base_url);
+  # The one and only time the delete password is disclosed. It is not a column
+  # anything else reads, `public` does not carry it, and no later call will
+  # return it — losing it means the file simply expires on its own.
+  my $info = {%{$store->public($row, $c->base_url)}, delete_password => $row->{delete_password}};
   $c->res->headers->location($info->{url});
   $c->render(json => $info, status => 201);
 });
@@ -321,40 +350,30 @@ $api->get('/files/<secret:id>/content' => sub ($c) {
   _serve($c, $row, 'inline');
 });
 
+# Deleting is a separate capability from reading, and the share URL grants only
+# reading. The password comes from the upload response; three places to put it,
+# because a DELETE with a body is awkward in some clients and a query string
+# ends up in logs.
 $api->delete('/files/<secret:id>' => sub ($c) {
-  return _api_error($c, 404, 'no such file') unless $store->remove($c->stash('secret'));
+  my ($ok, $why) = $store->remove($c->stash('secret'), _delete_password($c));
+  # 403, not 404: "no such file" and "wrong password" are the same sentence on
+  # purpose — see Share::Store::remove — so this cannot be used to find out
+  # which ids exist.
+  return _api_error($c, 403, $why) unless $ok;
   $c->render(json => {deleted => $c->stash('secret')});
 });
 
 # ------------------------------------------------------------------- MCP -----
+#
+# One line, because MCP::Server::Transport::HTTP owns the whole protocol now:
+# revision 2026-07-28 (stateless, `server/discover`, no handshake), the legacy
+# initialize handshake for clients that have not caught up, Origin validation,
+# 405 on GET and DELETE, and JSON Schema validation of every tool argument.
+#
+# What used to live here — 330 lines of it — is in the library's hands. See
+# lib/Share/MCP.pm for the four tools, which is all that is genuinely ours.
 
-post '/mcp' => sub ($c) {
-  if (my $err = _mcp_preflight($c)) { return $c->render(json => $err->[1], status => $err->[0]) }
-
-  my $msg = eval { $c->req->json };
-  return $c->render(
-    status => 400,
-    json   => {jsonrpc => '2.0', id => undef, error => {code => -32700, message => 'invalid JSON'}})
-    unless defined $msg;
-
-  # Batches were dropped in 2025-06-18, but older clients still send them and
-  # answering one costs nothing.
-  if (ref $msg eq 'ARRAY') {
-    my @out = grep { defined } map { Share::MCP->respond($c, $_) } @$msg;
-    return @out ? $c->render(json => \@out) : $c->rendered(202);
-  }
-
-  my $res = Share::MCP->respond($c, $msg);
-  return $c->rendered(202) unless defined $res;    # a notification: nothing to say
-  $c->render(json => $res);
-};
-
-# We hold no per-client state, so there is no server-initiated stream to open
-# and no session to delete. The transport spec's answer to both is 405.
-any [qw(GET DELETE)] => '/mcp' => sub ($c) {
-  $c->res->headers->allow('POST');
-  $c->render(status => 405, json => {error => 'this MCP endpoint only accepts POST'});
-};
+any '/mcp' => Share::MCP->server(app)->to_action;
 
 # --------------------------------------------------------------- helpers -----
 
@@ -449,6 +468,21 @@ sub _bad_ticket ($c) {
 
   my ($ok, $reason) = $store->check_signature(\%query);
   return $ok ? undef : $reason;
+}
+
+# Header first: a query string lands in access logs and a browser's history,
+# and the form field exists only for the no-JavaScript delete page.
+sub _delete_password ($c) {
+  my $header = $c->req->headers->header('X-Delete-Password');
+  return $header if defined $header && length $header;
+
+  my $json = $c->req->headers->content_type && $c->req->headers->content_type =~ m{\Aapplication/json\b}i
+    ? $c->req->json : undef;
+  return $json->{delete_password}
+    if ref $json eq 'HASH' && defined $json->{delete_password} && length $json->{delete_password};
+
+  my $param = $c->param('delete_password');
+  return defined $param && length $param ? $param : undef;
 }
 
 sub _bad ($message) { die {share_error => $message} }    ## no critic (RequireCarping)
@@ -556,7 +590,10 @@ __DATA__
     % unless (stash 'bare') {
     <header class="topbar">
       <a class="brand" href="/">share</a>
-      <nav><a href="<%= url_for 'how_to' %>">How to use it</a></nav>
+      <nav>
+        <a href="<%= url_for 'how_to' %>">How to use it</a>
+        <a href="<%= url_for 'api' %>">API</a>
+      </nav>
     </header>
     % }
 %= content
@@ -625,6 +662,84 @@ __DATA__
     <li><%= $cfg->{notice} %></li>
     % }
   </ul>
+</main>
+
+@@ api.html.ep
+% layout 'chrome', title => 'share — the API';
+<main class="prose">
+  <h1>The API</h1>
+  <p class="lede">A handful of endpoints, no authentication, and one secret that is
+  shown exactly once.</p>
+
+  <p>Base URL: <code><%= $c->base_url %>/api/v1</code>. Everything answers JSON.
+  There is a machine-readable description of all of it:</p>
+
+  <pre><code>curl '<%= $c->base_url %>/api?openapi=1' -o share-openapi.json</code></pre>
+
+  <p>Or ask for it by content type — <code>application/json</code>,
+  <code>application/openapi+json</code> or <code>application/vnd.oai.openapi+json</code>
+  all return the document rather than this page:</p>
+
+  <pre><code>curl -H 'accept: application/openapi+json' '<%= $c->base_url %>/api'</code></pre>
+
+  <p class="hint">Worth knowing, because it is easy to assume otherwise: the OpenAPI
+  Specification says nothing about how a description document should be served, and no
+  <code>openapi</code> media type is registered with IANA. The types above are a
+  convention that tooling grew. <code>?openapi=1</code> is the unambiguous way to ask.</p>
+
+  <h2>Endpoints</h2>
+  <table class="api-table">
+    <tr><th>Method</th><th>Path</th><th>What it does</th></tr>
+    % for my $path (sort keys %{$openapi->{paths}}) {
+      % my $item = $openapi->{paths}{$path};
+      % for my $method (grep { $item->{$_} && ref $item->{$_} eq 'HASH' && $item->{$_}{summary} } qw(get post delete)) {
+    <tr>
+      <td><code><%= uc $method %></code></td>
+      <td><code>/api/v1<%= $path %></code></td>
+      <td><%= $item->{$method}{summary} %></td>
+    </tr>
+      % }
+    % }
+  </table>
+
+  <h2>Uploading</h2>
+  <p>Three body shapes, in order of how pleasant they are to type:</p>
+  <pre><code>curl --data-binary @report.md \
+  '<%= $c->base_url %>/api/v1/files?filename=report.md&amp;session_id=$SESSION'
+
+curl -F file=@screenshot.png '<%= $c->base_url %>/api/v1/files'
+
+curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
+  -d '{"filename":"doc.pdf","content_base64":"'"$(base64 -w0 doc.pdf)"'"}'</code></pre>
+
+  <p>The response is <code>201</code> with the file's metadata. Three fields matter:
+  <code>url</code> is what you give a person, <code>content_url</code> is what a machine
+  fetches, and <code>delete_password</code> is the only copy you will ever get of it.</p>
+
+  <h2>Deleting</h2>
+  <p>Reading and deleting are separate capabilities. The share URL grants reading; the
+  delete password grants removal, and no other call will tell you it. Lose it and the
+  file simply expires on its own in <%= $cfg->{ttl_days} %> days.</p>
+
+  <pre><code>curl -X DELETE -H "x-delete-password: $PASSWORD" \
+  '<%= $c->base_url %>/api/v1/files/&lt;id&gt;'</code></pre>
+
+  <p class="hint">A wrong password and a file that never existed get the same answer, with
+  the same status. That is deliberate: it means this endpoint cannot be used to find out
+  which ids exist.</p>
+
+  <h2>Limits</h2>
+  <ul>
+    <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg .heic</code>)
+      and <code>.pdf</code>. The extension must match the actual bytes.</li>
+    <li>At most <%= Share::Store::human_size($cfg->{max_bytes}) %> per file.</li>
+    <li>Everything is deleted after <%= $cfg->{ttl_days} %> days.</li>
+    % if (length $cfg->{notice}) {
+    <li><%= $cfg->{notice} %></li>
+    % }
+  </ul>
+
+  <p><a href="<%= url_for 'how_to' %>">How to use it</a> covers the MCP side.</p>
 </main>
 
 @@ viewer.html.ep
@@ -700,10 +815,24 @@ __DATA__
   <%= $file->{created_at} =~ s/T/ /r =~ s/Z/ UTC/r %>.</p>
   <p>It would go on its own in <%= $file->{expires_in} %>. Deleting it now is immediate
   and cannot be undone: the URL stops working for everyone.</p>
-  <form method="POST" action="<%= url_for 'confirm_delete' %>">
-    <button class="btn danger" type="submit">Yes, delete it</button>
-    <a class="btn" href="<%= url_for 'viewer' %>">Keep it</a>
+
+  %# Deleting needs the password from the upload response — knowing the share
+  %# URL is not enough. Whoever uploaded it has the password; whoever was merely
+  %# sent the link does not, which is the point.
+  % if (defined $error) {
+  <p class="failed"><%= $error %></p>
+  % }
+  <form method="POST" action="<%= url_for 'confirm_delete' %>" class="delete-form">
+    <label for="delete-password">Delete password</label>
+    <input id="delete-password" name="delete_password" type="password" autocomplete="off"
+      autofocus required>
+    <div class="delete-actions">
+      <button class="btn danger" type="submit">Yes, delete it</button>
+      <a class="btn" href="<%= url_for 'viewer' %>">Keep it</a>
+    </div>
   </form>
+  <p class="hint">It came back in the JSON when the file was uploaded. If you do not have
+  it, the file will still go on its own in <%= $file->{expires_in} %>.</p>
 </main>
 
 @@ uploaded.html.ep
@@ -720,19 +849,24 @@ __DATA__
   % if (@ok) {
   <p>Give <%= @ok == 1 ? 'this URL' : 'these URLs' %> to the agent — paste
   <%= @ok == 1 ? 'it' : 'them' %> straight into the conversation.</p>
+  <p class="hint">The delete password below is shown <strong>once</strong>. Nothing else
+  will ever tell you it, and without it the file just expires on its own.</p>
   % }
   <ul class="results">
     % for my $r (@$results) {
       % if (my $f = $r->{file}) {
     %# data-record is what lets assets/upload.js fold a no-JavaScript upload into
     %# the same localStorage history the scripted path writes.
-    <li data-record="<%= Mojo::JSON::to_json({map { $_ => $f->{$_} } qw(id url filename kind size_human created_at expires_at)}) %>">
+    <li data-record="<%= Mojo::JSON::to_json({map { $_ => $f->{$_} } qw(id url filename kind size_human created_at expires_at delete_password)}) %>">
       <span class="result-name"><%= $f->{filename} %></span>
       <span class="result-meta"><%= $f->{kind} %>, <%= $f->{size_human} %>, expires in <%= $f->{expires_in} %></span>
       <a class="result-url" href="<%= $f->{url} %>"><%= $f->{url} %></a>
       %# Shipped hidden and woken up by assets/upload.js. With scripting off
       %# there is no dead button on the page, just the URL to select.
       <button class="btn result-copy" type="button" data-copy="<%= $f->{url} %>" hidden>Copy</button>
+      % if (defined $f->{delete_password}) {
+      <span class="result-secret">delete password: <code><%= $f->{delete_password} %></code></span>
+      % }
     </li>
       % } else {
     <li class="failed">

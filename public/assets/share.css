@@ -255,7 +255,24 @@ body.viewing .topbar { display: none; }
   word-break: break-all;
 }
 
-.result-copy { grid-column: 2; white-space: nowrap; }
+.result-copy, .result-delete { grid-column: 2; white-space: nowrap; }
+.result-delete { border-color: var(--danger); color: var(--danger); }
+
+/* The delete password, shown once on the /upload result page and nowhere else. */
+.result-secret { grid-column: 1 / -1; font-size: 0.78rem; color: var(--fg-muted); }
+.result-secret code { user-select: all; }
+
+/* The delete form on the confirm page: a password field, then the buttons. */
+.delete-form { display: block; margin-top: 1.5rem; }
+.delete-form label { display: block; font-size: 0.85rem; margin-bottom: 0.35rem; }
+.delete-form input {
+  width: 100%; padding: 0.5rem 0.7rem; font: inherit; font-size: 0.9rem;
+  color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.delete-form input:focus-visible { outline: 2px solid var(--accent); border-color: var(--accent); }
+.delete-actions { display: flex; gap: 0.5rem; margin-top: 0.9rem; }
+.hint { color: var(--fg-muted); font-size: 0.8rem; }
 .result-copy.is-done { border-color: var(--accent); color: var(--accent); }
 
 /* The progress bar spans both columns and disappears when the upload lands. */
@@ -316,3 +333,13 @@ p.failed {
   .actions { width: 100%; }
   .btn { flex: 1; text-align: center; }
 }
+
+/* ---------------------------------------------------------------- api page */
+
+.api-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin: 1rem 0 0; }
+.api-table th, .api-table td {
+  text-align: left; padding: 0.5rem 0.6rem 0.5rem 0; border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.api-table th { color: var(--fg-muted); font-weight: 600; }
+.api-table td:first-child { white-space: nowrap; }

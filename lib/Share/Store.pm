@@ -64,6 +64,19 @@ INSERT INTO meta (k, v) VALUES ('last_reap', '0');
 -- 1 down
 DROP TABLE files;
 DROP TABLE meta;
+
+-- 2 up
+-- Deleting is a separate capability from reading. The share URL grants reading;
+-- this grants removal, and it is handed back exactly once, in the response to
+-- the upload that created it. Stored as PBKDF2-HMAC-SHA256 over a per-file
+-- salt, never in the clear.
+ALTER TABLE files ADD COLUMN delete_salt TEXT;
+ALTER TABLE files ADD COLUMN delete_hash TEXT;
+
+-- 2 down
+-- SQLite before 3.35 cannot DROP COLUMN, and the columns are harmless if this
+-- is ever rolled back, so leave them.
+SELECT 1;
 SQL
 
 sub init ($self) {
@@ -123,6 +136,32 @@ sub _load_key ($self) {
 # accepted upload mints a fresh server-generated secret from /dev/urandom.
 
 use constant TICKET_TTL => 3600;
+
+# ------------------------------------------------------- delete passwords ----
+
+# PBKDF2-HMAC-SHA256, one output block, written out rather than pulled in.
+#
+# Rolling a primitive by hand deserves an argument. This one: PBKDF2 is six
+# lines, the alternative is a new XS dependency for a single call, and the
+# implementation is checked against a published RFC 6070-style vector in the
+# test suite — so it is verified rather than merely believed. If CryptX ever
+# arrives for another reason, swap this for Crypt::KeyDerivation::pbkdf2 and
+# keep the vector.
+#
+# 200k iterations: a caller-chosen password may be weak, and the only attacker
+# who can use this hash is one who already has the database — and therefore the
+# files. It is worth slowing down, not worth a second of latency.
+use constant KDF_ROUNDS => 200_000;
+
+sub _pbkdf2 ($password, $salt, $rounds = KDF_ROUNDS) {
+  my $block = Digest::SHA::hmac_sha256($salt . pack('N', 1), $password);
+  my $out   = $block;
+  for (2 .. $rounds) {
+    $block = Digest::SHA::hmac_sha256($block, $password);
+    $out ^= $block;
+  }
+  return unpack 'H*', $out;
+}
 
 sub sign_query ($self, $pairs) {
   my %query = (@$pairs, exp => time + TICKET_TTL);
@@ -252,6 +291,12 @@ sub add ($self, %args) {
   my $ttl = $self->_ttl_seconds($args{ttl_days});
   my $now = time;
 
+  # One is generated when the caller does not supply one, so that every upload
+  # comes back with a way to undo it. It is returned exactly once, on the row
+  # this method hands back, and `public` below never carries it.
+  my $password = _trim($args{delete_password}) // _token(24);
+  my $salt     = _token(16);
+
   my $secret = _token();
   my $rel    = join '/', substr($secret, 0, 2), substr($secret, 2, 2), $secret;
   my $blob   = $self->root->child('files', split m{/}, $rel);
@@ -273,6 +318,8 @@ sub add ($self, %args) {
         path         => $rel,
         created_at   => $now,
         expires_at   => $now + $ttl,
+        delete_salt  => $salt,
+        delete_hash  => _pbkdf2($password, $salt),
       }
     );
     1;
@@ -283,7 +330,11 @@ sub add ($self, %args) {
     die $err;         ## no critic (RequireCarping)
   }
 
-  return $self->find($secret);
+  my $row = $self->find($secret);
+  # The only moment the plaintext exists outside the caller's hand. Deliberately
+  # not a column, not in `public`, and not reachable from any later lookup.
+  $row->{delete_password} = $password;
+  return $row;
 }
 
 sub _ttl_seconds ($self, $days) {
@@ -341,11 +392,34 @@ sub touch ($self, $row) {
 
 # --------------------------------------------------------------- removing ----
 
-sub remove ($self, $secret) {
-  my $row = $self->sql->db->query('SELECT * FROM files WHERE secret = ?', $secret)->hash
-    or return 0;
+# Returns (1, undef) on success, or (0, reason) — never a bare boolean, because
+# "no such file" and "wrong password" must be told apart by the caller and NOT
+# by whoever is trying passwords.
+sub remove ($self, $secret, $password = undef) {
+  my $row = $self->sql->db->query('SELECT * FROM files WHERE secret = ?', $secret)->hash;
+
+  # Same answer for a file that never existed and a file whose password is
+  # wrong, so this cannot be used to enumerate ids.
+  my $refuse = "no such file, or the wrong delete password";
+
+  return (0, $refuse) unless $row;
+  return (0, $refuse) unless defined $row->{delete_hash} && length $row->{delete_hash};
+  return (0, $refuse) unless defined $password && length $password;
+
+  my $given = _pbkdf2($password, $row->{delete_salt});
+  return (0, $refuse) unless _constant_eq($given, $row->{delete_hash});
+
   $self->_purge($row);
-  return 1;
+  return (1, undef);
+}
+
+# Length-independent, difference-independent comparison. Both operands here are
+# hex of a fixed width, so the length check is belt and braces.
+sub _constant_eq ($a, $b) {
+  return 0 unless length $a == length $b;
+  my $diff = 0;
+  $diff |= ord(substr $a, $_, 1) ^ ord(substr $b, $_, 1) for 0 .. length($a) - 1;
+  return $diff == 0;
 }
 
 sub _purge ($self, $row) {

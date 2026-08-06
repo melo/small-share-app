@@ -147,8 +147,52 @@
       li.appendChild(meta);
       li.appendChild(link);
       li.appendChild(newCopyButton(r.url));
+      if (r.delete_password) li.appendChild(newDeleteButton(r));
       recentList.appendChild(li);
     });
+  }
+
+  // Only this browser has the password, so only this browser can offer the
+  // button. Someone merely sent the link gets a read-only page, which is the
+  // whole point of splitting the two capabilities.
+  function newDeleteButton(record) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn danger result-delete';
+    button.textContent = 'Delete';
+    button.addEventListener('click', function () {
+      if (button.dataset.armed !== '1') {
+        button.dataset.armed = '1';
+        button.textContent = 'Really delete?';
+        setTimeout(function () {
+          button.dataset.armed = '0';
+          button.textContent = 'Delete';
+        }, 4000);
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = 'Deleting…';
+      var xhr = new XMLHttpRequest();
+      xhr.open('DELETE', '/api/v1/files/' + record.id, true);
+      xhr.setRequestHeader('X-Delete-Password', record.delete_password);
+      xhr.addEventListener('load', function () {
+        if (xhr.status === 200 || xhr.status === 403) {
+          // 403 covers "already gone" too — the server refuses to say which.
+          writeHistory(readHistory().filter(function (r) { return r.id !== record.id; }));
+          renderHistory();
+          return;
+        }
+        button.disabled = false;
+        button.textContent = 'Delete failed';
+      });
+      xhr.addEventListener('error', function () {
+        button.disabled = false;
+        button.textContent = 'Delete failed';
+      });
+      xhr.send();
+    });
+    return button;
   }
 
   // "in 14 days" / "in 6 hours" — the same shape the server uses, so the two
@@ -333,9 +377,13 @@
     row.li.appendChild(link);
     row.li.appendChild(newCopyButton(data.url));
 
+    // The delete password comes back exactly once, in this response. Keeping it
+    // here is what makes the Delete button in "recent uploads" work at all —
+    // and it never leaves this browser.
     remember({
       id: data.id, url: data.url, filename: data.filename, kind: data.kind,
-      size_human: data.size_human, created_at: data.created_at, expires_at: data.expires_at
+      size_human: data.size_human, created_at: data.created_at, expires_at: data.expires_at,
+      delete_password: data.delete_password
     });
   }
 

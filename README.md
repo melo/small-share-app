@@ -83,8 +83,16 @@ claude mcp add --transport http share https://share.<your-tailnet>.ts.net/mcp
 
 ### MCP
 
-A Streamable HTTP MCP server at `/mcp`, stateless — no session IDs, no server
-state, so it scales to as many workers as you like.
+A Streamable HTTP MCP server at `/mcp`, built on the [CPAN `MCP`
+distribution](https://metacpan.org/dist/MCP) by the Mojolicious author. It speaks
+protocol revision **2026-07-28** — stateless, no `initialize` handshake,
+`server/discover` in its place — and answers the older handshake too, so clients
+that have not caught up keep working.
+
+Note that revision's HTTP binding requires routing headers (`Mcp-Method`, and
+`Mcp-Name` on `tools/call`) that restate what the body says, plus the protocol
+version and client capabilities in `_meta` on every request. A hand-written curl
+call needs all of them; any real client does this for you.
 
 **It never carries the file itself, in either direction.** Every tool deals in
 URLs; the agent moves the bytes with curl, straight off disk. Four tools:
@@ -94,7 +102,7 @@ URLs; the agent moves the bytes with curl, straight off disk. Four tools:
 | `get_upload_url` | a URL, and a ready-to-run curl command, for putting a file in |
 | `list_shared_files` | what this `session_id` has shared, with both URLs for each |
 | `get_shared_file` | one file: metadata, the human's `url`, and the `content_url` to fetch |
-| `delete_shared_file` | delete now, before expiry |
+| `delete_shared_file` | delete now — needs the `delete_password` from the upload |
 
 The reason is arithmetic. A tool argument or result passes through the model's
 context verbatim, and base64 inflates by a third: a 20 KB screenshot costs
@@ -142,13 +150,22 @@ curl -H content-type:application/json "$S/api/v1/files" \
 curl "$S/api/v1/files?session_id=$SESSION"   # what this session has shared
 curl "$S/api/v1/files/$ID"                   # metadata
 curl "$S/api/v1/files/$ID/content"           # the bytes
-curl -X DELETE "$S/api/v1/files/$ID"         # delete early
+curl -X DELETE -H "x-delete-password: $PW" \
+  "$S/api/v1/files/$ID"                      # delete early
 curl "$S/api/v1/health"                      # liveness, count, bytes held
 ```
 
-Upload answers `201` with JSON; the field to hand over is `url`. Optional on any
+Upload answers `201` with JSON. Three fields matter: `url` is what you give a
+person, `content_url` is what a machine fetches, and **`delete_password` is
+disclosed exactly once, here** — no other call returns it. Optional on any
 upload: `session_id`, `title`, `note`, `ttl_days` (shorter than the configured
-maximum, never longer).
+maximum, never longer), and `delete_password` if you would rather choose it.
+
+There is also `/api` — a page describing all of this, with the OpenAPI document
+behind it at `/api?openapi=1` or via `Accept: application/openapi+json`. Worth
+knowing: the OpenAPI Specification defines no media type for serving a
+description document and none is registered with IANA, so that negotiation is
+convention. `?openapi=1` is the unambiguous form.
 
 The REST API is the data plane for agents too — `get_upload_url` hands back a
 URL into exactly these endpoints. It still accepts JSON with base64, which is
@@ -263,6 +280,15 @@ anything that can reach the service can POST to the endpoint directly. What it
 buys today is that a ticket cannot be altered in transit or hoarded forever, and
 what it buys later is a place for a real credential to live. Set
 `SHARE_REQUIRE_SIGNED_UPLOADS=1` to make tickets mandatory.
+
+**Reading and deleting are separate capabilities.** The share URL grants
+reading. Deleting needs the `delete_password` returned by the upload — passed as
+`X-Delete-Password`, a JSON field, or a form field. A wrong password and a file
+that never existed get the same answer with the same status, so the endpoint
+cannot be used to discover which ids exist. Lose the password and the file
+simply expires on its own. In the browser this is invisible: the drop zone keeps
+the password in `localStorage` beside the record, which is why **Recent uploads**
+can offer a Delete button and a page you were merely *sent* cannot.
 
 **No route lets a client choose or overwrite an id.** There is no `PUT`
 anywhere, no client-supplied path, and nothing that modifies a stored file.
