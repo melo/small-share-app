@@ -35,10 +35,13 @@ $ENV{SHARE_BASE_URL} = 'https://share.example.test';
 # already-double-encoded bytes and tests the wrong thing.
 $ENV{SHARE_NOTICE} = "Office network only \xe2\x80\x94 ask #infra for access.";
 
-# Off for the bulk of the suite, which uploads far more often than any real
-# client would. The limits get their own subtest, with their own store.
-$ENV{SHARE_RATE_PER_SECOND} = 0;
-$ENV{SHARE_RATE_PER_MINUTE} = 0;
+# Configured but effectively unlimited for the bulk of the suite, which uploads
+# far more often than any real client would. NOT zero: zero means "no limit" and
+# the pages and the OpenAPI document then correctly say nothing about limits,
+# which leaves the parts of this suite that check that wording with nothing to
+# check. The limits themselves get their own subtests.
+$ENV{SHARE_RATE_PER_SECOND} = 1000;
+$ENV{SHARE_RATE_PER_MINUTE} = 1000;
 delete $ENV{SHARE_TTL_DAYS};
 
 my $t = Test::Mojo->new(curfile->dirname->sibling('share.pl'));
@@ -142,16 +145,51 @@ subtest 'the uploader is a plain form that works without JavaScript' => sub {
   $t->get_ok('/')->status_is(200)
     ->content_like(qr{<form action="/upload" method="POST" enctype="multipart/form-data">})
     ->content_like(qr{type="file" name="file" multiple})
-    ->content_like(qr{/assets/upload\.js});
+    ->content_like(qr{/assets/upload\.[0-9a-f]{12}\.js});
 
-  $t->get_ok('/')->content_like(qr{<link rel="icon" href="/assets/share-icon\.svg"});
-  $t->get_ok('/assets/share-icon.svg')->status_is(200)->content_type_like(qr{image/svg});
+  $t->get_ok('/')->content_like(qr{<link rel="icon" href="/assets/share-icon\.[0-9a-f]{12}\.svg"});
+  my ($icon) = $t->tx->res->text =~ m{href="(/assets/share-icon\.[0-9a-f]{12}\.svg)"};
+  $t->get_ok($icon)->status_is(200)->content_type_like(qr{image/svg});
 
   # The two pages holding the uploader are the only ones allowed a script
   # source, and they still deny everything they do not need.
   $t->get_ok('/')->header_like('Content-Security-Policy' => qr/script-src 'self'/)
     ->header_like('Content-Security-Policy' => qr/connect-src 'self'/);
   $t->get_ok('/f/' . ('z' x 32))->header_unlike('Content-Security-Policy' => qr/script-src/);
+};
+
+subtest 'assets are fingerprinted, and served immutable' => sub {
+  # Cloudflare cached a stylesheet from an earlier deploy for two days and there
+  # was nothing on our side that could expire it. Only a different URL can, and
+  # the only URL that is guaranteed to change with the file is one named after
+  # its contents.
+  $t->get_ok('/')->status_is(200);
+  my ($css) = $t->tx->res->text =~ m{href="(/assets/share\.[0-9a-f]{12}\.css)"};
+  ok $css, 'the stylesheet URL carries a content hash';
+
+  my ($js) = $t->tx->res->text =~ m{src="(/assets/upload\.[0-9a-f]{12}\.js)"};
+  ok $js, 'and so does the script';
+
+  $t->get_ok($css)->status_is(200)->content_type_like(qr{text/css})
+    ->header_like('Cache-Control' => qr/immutable/)
+    ->header_like('Cache-Control' => qr/max-age=31536000/)
+    ->content_like(qr/\.dropzone/);
+
+  # mermaid.min.js and github-markdown.css are fetched during the image build
+  # and copied into the RUNTIME stage only, so they are legitimately absent here
+  # — this suite runs in the builder. The helper must degrade to the plain path
+  # rather than emitting a broken URL, which is what keeps the preview page
+  # working in exactly this situation. The fingerprinted form of those two is
+  # asserted by the browser suite, which runs against the real image.
+  my $c = $t->app->build_controller;
+  is $c->asset('mermaid.min.js'), '/assets/mermaid.min.js',
+    'an asset that is not present falls back to its plain path';
+
+  # Only URLs this app minted are served. An invented hash must not pin today's
+  # bytes under a URL promised immutable for a year.
+  $t->get_ok('/assets/share.000000000000.css')->status_is(404);
+  $t->get_ok('/assets/nope.000000000000.css')->status_is(404);
+  $t->get_ok('/assets/..%2f..%2fshare.000000000000.pl')->status_is(404);
 };
 
 subtest 'the first-visit pitch' => sub {
@@ -172,7 +210,13 @@ subtest 'the first-visit pitch' => sub {
 subtest 'the API page, and the OpenAPI document behind it' => sub {
   $t->get_ok('/api')->status_is(200)->content_type_like(qr{text/html})
     ->content_like(qr/The API/)->content_like(qr{/api\?openapi=1})
-    ->content_like(qr{x-delete-password});
+    ->content_like(qr{x-delete-password})
+    # Limits a caller will actually hit belong where the limits are listed.
+    ->content_like(qr/Uploads are rate limited/)
+    ->content_like(qr/1000 per second, and 1000 per minute/)
+    # \s+ because the template wraps mid-sentence; matching a literal space
+    # here has bitten this suite twice already.
+    ->content_like(qr/holds at most\s+50\.0 GB in total/);
 
   # ?openapi=1 always wins, whatever the Accept header says.
   $t->get_ok('/api?openapi=1' => {Accept => 'text/html'})->status_is(200)
@@ -203,6 +247,14 @@ subtest 'the API page, and the OpenAPI document behind it' => sub {
 
   # The delete password must not leak into the description of the read side.
   my $doc = $t->get_ok('/api?openapi=1')->tx->res->json;
+
+  # A caller reading the document must be told about the limits it will hit,
+  # written from the running configuration rather than from a guess. These run
+  # AFTER the fetch above on purpose — the previous request in this subtest is
+  # the HTML page, and json_has against an HTML body simply fails.
+  $t->json_has('/paths/~1files/post/responses/429')
+    ->json_has('/paths/~1files/post/responses/429/headers/Retry-After')
+    ->json_like('/info/description' => qr/rate limited to 1000 per second/);
   ok !exists $doc->{components}{schemas}{File}{properties}{delete_password},
     'File does not carry a delete password, in the schema either';
 };

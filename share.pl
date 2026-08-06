@@ -24,6 +24,7 @@ use utf8;
 use FindBin ();
 use lib "$FindBin::Bin/lib";
 
+use Digest::SHA   ();
 use Mojo::IOLoop  ();
 use Mojo::Util    qw(decode url_escape);
 use Share::MCP     ();
@@ -111,6 +112,29 @@ my $store = Share::Store->new(
   rate_per_minute  => $CFG{rate_per_minute},
 )->init;
 
+# ------------------------------------------------------------- fingerprints --
+#
+# Every asset is served under a URL containing a hash of its contents, so a
+# deploy changes the URL and no cache anywhere can hand out the old file.
+#
+# This is not theoretical tidiness. share.simplicidade.org sits behind
+# Cloudflare, which caches .css and .js by default and was serving a stylesheet
+# from an earlier deploy with two days left on it. Nothing on our side could
+# expire that; only a different URL can.
+#
+# Computed once at startup: the files are baked into the image and cannot change
+# under a running container.
+my %ASSET = map {
+  my $name = $_->basename;
+  my ($stem, $ext) = $name =~ /\A(.+)\.([^.]+)\z/;
+  my $hash = substr Digest::SHA::sha256_hex($_->slurp), 0, 12;
+  ($name => "/assets/$stem.$hash.$ext");
+} grep { -f } @{app->home->child('public', 'assets')->list};
+
+# Falls back to the plain path for anything unhashed, so a missing asset is a
+# 404 for that file rather than a broken template for the whole page.
+helper asset => sub ($c, $name) { $ASSET{$name} // "/assets/$name" };
+
 helper store => sub ($c) { $store };
 
 # Every URL we hand out is built from this. Configured explicitly in production,
@@ -143,6 +167,31 @@ my $reap = sub {
 };
 Mojo::IOLoop->next_tick($reap);
 Mojo::IOLoop->recurring(600 => $reap);
+
+# Serves the fingerprinted URLs. Unhashed paths never reach here — Mojolicious
+# runs the static handler before the router, and those files exist on disk — so
+# this only ever sees a URL that carries a content hash, which is precisely the
+# case where `immutable` is safe to promise.
+get '/assets/*name' => sub ($c) {
+  my $name = $c->stash('name');
+
+  # Only URLs this app actually minted are served, matched against the map
+  # rather than parsed out of the request. That is stricter than stripping a
+  # hash-shaped suffix: an invented hash would otherwise pin today's bytes under
+  # a URL promised to be immutable for a year.
+  my ($real) = grep { $ASSET{$_} eq "/assets/$name" } keys %ASSET;
+  return $c->reply->not_found unless defined $real;
+
+  my $file = app->home->child('public', 'assets', $real);
+  return $c->reply->not_found unless -f $file;
+  $name = $real;
+
+  $c->res->headers->content_type($c->app->types->file_type($name) // 'application/octet-stream');
+  # A year, and immutable: the URL cannot outlive its contents, because the
+  # contents are what named it.
+  $c->res->headers->cache_control('public, max-age=31536000, immutable');
+  $c->reply->file($file);
+};
 
 # ------------------------------------------------------------------ pages ----
 
@@ -667,8 +716,8 @@ __DATA__
     <title><%= title %></title>
     %# The iOS share glyph. An explicit <link> also stops browsers probing
     %# /favicon.ico and filling the log with 404s.
-    <link rel="icon" href="/assets/share-icon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/share.css">
+    <link rel="icon" href="<%= asset 'share-icon.svg' %>" type="image/svg+xml">
+    <link rel="stylesheet" href="<%= asset 'share.css' %>">
   </head>
   <body class="<%= stash('body_class') // '' %>">
     %# One header, on every page including the viewer. It used to be suppressed
@@ -703,7 +752,7 @@ __DATA__
     </header>
 %= content
     % if (stash 'uploader') {
-    <script src="/assets/upload.js"></script>
+    <script src="<%= asset 'upload.js' %>"></script>
     % }
   </body>
 </html>
@@ -856,7 +905,21 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg .heic</code>)
       and <code>.pdf</code>. The extension must match the actual bytes.</li>
     <li>At most <%= Share::Store::human_size($cfg->{max_bytes}) %> per file.</li>
+    % if ($cfg->{rate_per_second} || $cfg->{rate_per_minute}) {
+    <li><strong>Uploads are rate limited</strong>:
+      <%= join ', and ',
+        ($cfg->{rate_per_second} ? "$cfg->{rate_per_second} per second" : ()),
+        ($cfg->{rate_per_minute} ? "$cfg->{rate_per_minute} per minute" : ()) %>,
+      per caller. Over it you get a <code>429</code> with a <code>Retry-After</code>
+      header saying how long to wait. Attempts count, not just the ones that
+      succeed — a rejected file still uses up a slot.</li>
+    % }
     <li>Everything is deleted after <%= $cfg->{ttl_days} %> days.</li>
+    % if ($cfg->{max_total_bytes}) {
+    <li>This instance holds at most
+      <%= Share::Store::human_size($cfg->{max_total_bytes}) %> in total. Past that the
+      oldest files are removed to make room, whatever their expiry says.</li>
+    % }
     % if (length $cfg->{notice}) {
     <li><%= $cfg->{notice} %></li>
     % }
@@ -902,14 +965,14 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" href="/assets/github-markdown.css">
-    <link rel="stylesheet" href="/assets/preview.css">
+    <link rel="stylesheet" href="<%= asset 'github-markdown.css' %>">
+    <link rel="stylesheet" href="<%= asset 'preview.css' %>">
   </head>
   <body>
     <article class="markdown-body"><%== $body_html %></article>
     % if ($mermaid) {
-    <script src="/assets/mermaid.min.js"></script>
-    <script src="/assets/mermaid-init.js"></script>
+    <script src="<%= asset 'mermaid.min.js' %>"></script>
+    <script src="<%= asset 'mermaid-init.js' %>"></script>
     % }
   </body>
 </html>
@@ -920,7 +983,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" href="/assets/preview.css">
+    <link rel="stylesheet" href="<%= asset 'preview.css' %>">
   </head>
   <body class="image">
     <img src="<%= url_for 'raw' %>" alt="<%= $file->{filename} %>">

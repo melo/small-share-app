@@ -76,6 +76,7 @@ sub document ($class, $c) {
           . 'call.',
         'Files are at most ' . human_size($max) . '. The filename extension must match '
           . 'the actual bytes or the upload is refused.',
+        _limits_prose($cfg),
         ($cfg->{notice} ? '_' . $cfg->{notice} . '_' : ()),
       ),
       license => {name => 'MIT', identifier => 'MIT'},
@@ -148,6 +149,17 @@ sub document ($class, $c) {
             },
             400 => _error('Rejected: wrong type, too large, or no file in the request.'),
             403 => _error('A signed upload ticket was altered, expired, or is required.'),
+            429 => {
+              description => 'Rate limited. ' . _limits_prose($cfg)
+                . ' Attempts are counted, not just the ones that succeed.',
+              headers => {
+                'Retry-After' => {
+                  schema      => {type => 'integer'},
+                  description => 'Seconds to wait before trying again.',
+                },
+              },
+              content => {'application/json' => {schema => {'$ref' => '#/components/schemas/Error'}}},
+            },
           },
         },
 
@@ -304,6 +316,16 @@ sub document ($class, $c) {
       },
     },
   };
+}
+
+# Written from the running configuration, so the document never advertises a
+# limit this instance does not actually enforce.
+sub _limits_prose ($cfg) {
+  my @rules;
+  push @rules, "$cfg->{rate_per_second} per second" if $cfg->{rate_per_second};
+  push @rules, "$cfg->{rate_per_minute} per minute" if $cfg->{rate_per_minute};
+  return 'Uploads are not rate limited on this instance.' unless @rules;
+  return 'Uploads are rate limited to ' . join(', and ', @rules) . ', per caller.';
 }
 
 sub _query ($name, $type, $description, $required = 0) {
