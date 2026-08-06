@@ -1,0 +1,20 @@
+# Real configuration, including the Tailscale auth key.
+.env
+
+# The workspace: SQLite database and every stored file.
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Vendored at build time, pinned by checksum in the Dockerfile. Never committed:
+# mermaid alone is 3.5 MB of minified JavaScript.
+/public/assets/mermaid.min.js
+/public/assets/github-markdown.css
+
+# Local Perl installs, if you build deps outside docker.
+/local/
+/.build/
+
+*.sw?
+.DS_Store

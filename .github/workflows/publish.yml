@@ -1,0 +1,142 @@
+# Publish multi-arch images to GHCR and, if it is configured, Docker Hub.
+#
+# Triggers:
+#   * push to main   -> :main and :edge
+#   * tag v1.2.3     -> :1.2.3, :1.2, :1 and :latest
+#   * manual         -> whatever the ref implies
+#
+# GHCR needs no secrets: the built-in GITHUB_TOKEN plus `packages: write` below
+# is enough. The first push creates the package as PRIVATE — make it public once
+# at Profile -> Packages -> small-share-app -> Package settings -> Change
+# visibility.
+#
+# Docker Hub is OPTIONAL and skipped unless you set it up. See README, "Publishing
+# your own images". You need, in the repository's Settings -> Secrets and
+# variables -> Actions:
+#
+#   Secret  DOCKERHUB_TOKEN     an access token from hub.docker.com ->
+#                               Account settings -> Personal access tokens,
+#                               with Read & Write scope. NOT your password.
+#   Secret  DOCKERHUB_USERNAME  the account that owns the token.
+#   Variable DOCKERHUB_REPO     optional; the target repository, e.g.
+#                               "myuser/small-share-app". Defaults to
+#                               <DOCKERHUB_USERNAME>/small-share-app.
+#
+# With DOCKERHUB_TOKEN unset — which is the case for every fork — the Docker Hub
+# steps are skipped and the workflow still succeeds.
+
+name: publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  # Lets the build attach a signed provenance attestation to the pushed image.
+  attestations: write
+  id-token: write
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is emulated through QEMU. It makes the build noticeably slower —
+      # DBD::SQLite is compiled from source — but a Raspberry Pi or an Apple
+      # Silicon box is exactly where a small self-hosted service like this ends
+      # up, so it is worth the minutes.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Is Docker Hub configured?
+        id: hub
+        env:
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          if [ -n "$TOKEN" ] && [ -n "$USERNAME" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "repo=${{ vars.DOCKERHUB_REPO || format('{0}/small-share-app', secrets.DOCKERHUB_USERNAME) }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DOCKERHUB_TOKEN/DOCKERHUB_USERNAME not set — publishing to GHCR only."
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.hub.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Work out tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ steps.hub.outputs.enabled == 'true' && steps.hub.outputs.repo || '' }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=small-share-app
+            org.opencontainers.image.description=Hand a file from an agent to a human, and back
+
+      # The builder stage runs t/share.t, so this cannot publish an image whose
+      # tests do not pass — the same guarantee CI gives, enforced again here in
+      # case someone pushes a tag from a branch CI never saw.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest the GHCR image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo "| registry | tags |"
+            echo "|---|---|"
+            echo "| \`${{ env.GHCR_IMAGE }}\` | \`${{ steps.meta.outputs.version }}\` |"
+            if [ "${{ steps.hub.outputs.enabled }}" = "true" ]; then
+              echo "| \`${{ steps.hub.outputs.repo }}\` | \`${{ steps.meta.outputs.version }}\` |"
+            else
+              echo "| Docker Hub | skipped, no credentials |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

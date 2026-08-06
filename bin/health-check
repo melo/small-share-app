@@ -1,0 +1,31 @@
+#!/usr/bin/env perl
+
+# Docker HEALTHCHECK. Core modules only, on purpose: Docker does not run the
+# health command through the image's ENTRYPOINT, so PERL5LIB is not set and
+# nothing from /deps (Mojolicious included) is reachable here.
+
+use strict;
+use warnings;
+
+use IO::Socket::INET ();
+
+my $port = $ENV{SHARE_PORT} || 8080;
+
+my $sock = IO::Socket::INET->new(
+  PeerAddr => '127.0.0.1',
+  PeerPort => $port,
+  Proto    => 'tcp',
+  Timeout  => 5,
+) or die "share: cannot connect to 127.0.0.1:$port: $!\n";
+
+print {$sock} "GET /api/v1/health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+my $response = do { local $/; <$sock> } // '';
+close $sock;
+
+die "share: health endpoint did not answer 200:\n$response\n"
+  unless $response =~ m{\AHTTP/1\.[01] \s+ 200 \b}x;
+die "share: health endpoint answered 200 but not ok:\n$response\n"
+  unless $response =~ m{"status"\s*:\s*"ok"};
+
+exit 0;

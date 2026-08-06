@@ -1,0 +1,10 @@
+# Keep the build context to the app itself. The runtime image is assembled from
+# /app, so anything landing here ships.
+.git
+.gitignore
+*.sw?
+*.db
+*.db-wal
+*.db-shm
+local/
+.build/

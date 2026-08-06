@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+
+# Delete everything past its expiry, right now.
+#
+# The app already does this hourly on its own; this is the manual handle behind
+# `make reap` on the box, and the thing to reach for after restoring a backup or
+# after the container has been down for a while.
+#
+# force => 1 skips the "has an hour passed" claim that keeps prefork workers
+# from all reaping at once. A human asking for it means now.
+#
+# Run it through the image entrypoint so /deps is on PERL5LIB:
+#
+#   docker compose exec -T share /usr/bin/pdi-entrypoint /app/bin/reap
+
+use strict;
+use warnings;
+
+use lib '/app/lib';
+use Share::Store ();
+
+my $store  = Share::Store->new(root => $ENV{SHARE_ROOT} || '/workspace')->init;
+my $result = $store->reap(force => 1);
+
+printf "reaped %d file(s), %s\n", $result->{files}, Share::Store::human_size($result->{bytes});
+
+my $stats = $store->stats;
+printf "still holding %d file(s), %s\n", $stats->{files}, Share::Store::human_size($stats->{bytes});

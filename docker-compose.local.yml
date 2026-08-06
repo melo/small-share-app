@@ -1,0 +1,39 @@
+# small-share-app with no Tailscale, for local development and for anyone who
+# already has a reverse proxy they would rather use.
+#
+#     docker compose -f docker-compose.local.yml up -d --build
+#     open http://127.0.0.1:8080
+#
+# Bound to loopback on purpose. This app has NO authentication — see the README
+# — so publishing it on 0.0.0.0 puts an anonymous file-drop on every interface
+# the host has. If you are fronting it with nginx/Caddy/Traefik, keep the bind
+# on 127.0.0.1 and proxy to it from there.
+
+services:
+
+  share:
+    build: .
+    image: small-share-app:local
+    user: "${SHARE_UID:-1000}:${SHARE_GID:-1000}"
+
+    environment:
+      SHARE_ROOT: /workspace
+      # Nothing terminates TLS here, so the app derives http:// URLs from the
+      # request. Set this if you are proxying and want the public URL instead.
+      SHARE_BASE_URL: ${SHARE_BASE_URL:-}
+      SHARE_TTL_DAYS: ${SHARE_TTL_DAYS:-15}
+      SHARE_MAX_BYTES: ${SHARE_MAX_BYTES:-33554432}
+      SHARE_NOTICE: ${SHARE_NOTICE:-}
+      MOJO_MODE: ${MOJO_MODE:-production}
+      # Only meaningful behind a proxy that sets X-Forwarded-*. Harmless
+      # otherwise, and wrong to trust if anything can reach the port directly.
+      MOJO_REVERSE_PROXY: ${MOJO_REVERSE_PROXY:-0}
+
+    volumes:
+      - ${SHARE_DATA:-./data}:/workspace
+
+    ports:
+      - "127.0.0.1:${SHARE_PORT:-8080}:8080"
+
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]

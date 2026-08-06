@@ -1,0 +1,117 @@
+# small-share-app behind a Tailscale sidecar.
+#
+# Two containers: the app, and a Tailscale node that fronts it with `tailscale
+# serve`. The app publishes no host ports at all — the sidecar is the only way
+# in, and the service appears on your tailnet as
+#
+#     https://<TS_HOSTNAME>.<your-tailnet>.ts.net
+#
+# with a real Let's Encrypt certificate that Tailscale obtains and renews for
+# you. Nothing about it is reachable from the public internet.
+#
+# Quick start:
+#
+#     cp .env.example .env      # then put a Tailscale auth key in it
+#     docker compose up -d
+#
+# For a plain local run with no Tailscale at all, use docker-compose.local.yml.
+
+services:
+
+  share:
+    image: ${SHARE_IMAGE:-ghcr.io/melo/small-share-app:latest}
+    # To run your own build instead of the published image:
+    #   docker compose build && docker compose up -d
+    build: .
+
+    # A distinct network alias, because the sidecar's own tailnet hostname is
+    # also "share" and Docker's embedded DNS would otherwise have two answers
+    # for the same name.
+    networks:
+      default:
+        aliases: [share-app]
+
+    # Own the data directory as a real user so the SQLite file and the stored
+    # files stay readable from the host without sudo. Defaults to the first
+    # non-root account on most systems; set SHARE_UID/SHARE_GID in .env if not.
+    user: "${SHARE_UID:-1000}:${SHARE_GID:-1000}"
+
+    environment:
+      # The one workspace directory: share.db and files/ both live under it.
+      SHARE_ROOT: /workspace
+
+      # Optional. Every URL handed to an agent is built from this. Leave it
+      # unset and the app derives it from the request, which works correctly
+      # behind `tailscale serve` — but setting it explicitly means the URL never
+      # depends on a header.
+      SHARE_BASE_URL: ${SHARE_BASE_URL:-}
+
+      # Retention, and the ceiling any single upload may ask for.
+      SHARE_TTL_DAYS: ${SHARE_TTL_DAYS:-15}
+
+      # Per-file limit, in bytes. 32 MB by default.
+      SHARE_MAX_BYTES: ${SHARE_MAX_BYTES:-33554432}
+
+      # One line of deployment truth the app cannot know: who can reach this and
+      # who to ask for access. Shown on the home page and handed to every agent
+      # in the MCP instructions.
+      SHARE_NOTICE: ${SHARE_NOTICE:-}
+
+      MOJO_MODE: production
+      # The sidecar terminates TLS and forwards X-Forwarded-*; without this the
+      # app would report every request as plain http on its own container port.
+      MOJO_REVERSE_PROXY: "1"
+
+    volumes:
+      # A plain host directory, not a named volume, so the data can be listed,
+      # backed up and grepped without going through docker.
+      - ${SHARE_DATA:-./data}:/workspace
+
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+
+  # The Tailscale node. `tailscale serve` is the standard way to put an HTTP
+  # service on a tailnet: it joins as its own node, gets its own certificate,
+  # and reverse-proxies to the app over the private compose network.
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: ${TS_HOSTNAME:-share}
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:?set TS_AUTHKEY in .env — see .env.example}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SERVE_CONFIG=/config/serve.json
+      - TS_EXTRA_ARGS=--hostname=${TS_HOSTNAME:-share}
+      # Userspace networking needs no NET_ADMIN and no /dev/net/tun, which keeps
+      # this container unprivileged. Fine for proxying HTTP; you would only want
+      # kernel networking if this node also had to route traffic.
+      - TS_USERSPACE=true
+      # Keep Docker's embedded DNS, so the "share-app" alias resolves to the app
+      # container rather than to the tailnet node that shares its name.
+      - TS_ACCEPT_DNS=false
+    volumes:
+      # Node identity — a few KB. Lose it and the node re-registers under a new
+      # identity, which means a new certificate and another approval if your
+      # tailnet has lock enabled.
+      - tailscale-state:/var/lib/tailscale
+      # The serve config is kept strictly minimal and comment-free on purpose: a
+      # malformed one takes the whole deployment down and the failure is opaque.
+      # What it says:
+      #
+      #   * terminate HTTPS on :443 with the certificate Tailscale manages
+      #   * proxy everything to the app container's "share-app" alias
+      #
+      # ${TS_CERT_DOMAIN} is substituted by this container at startup with the
+      # node's own MagicDNS name — which is why nothing in this repo has to know
+      # your tailnet, and why the file works unchanged for everybody.
+      #
+      # To publish on the PUBLIC internet instead of just your tailnet, add
+      #   "AllowFunnel": { "${TS_CERT_DOMAIN}:443": true }
+      # at the top level and enable Funnel for the node in the admin console.
+      # Read the README's security section first: with no authentication, the
+      # secret URL becomes the only thing between your files and the internet.
+      - ./tailscale-serve.json:/config/serve.json:ro
+    depends_on: [share]
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:

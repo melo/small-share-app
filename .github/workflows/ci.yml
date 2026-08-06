@@ -1,0 +1,67 @@
+# CI: build the image and run the test suite.
+#
+# There is no separate "install Perl, install deps, run prove" job, and that is
+# deliberate. The Dockerfile's builder stage already runs t/share.t against the
+# exact dependency set the runtime image ships, so building that stage IS the
+# test run. One definition of "does it work", used by CI, by a contributor's
+# `make test`, and by anyone deploying.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Stops at the builder stage, which ends with pdi-run-tests: every script
+      # in bin/ is syntax-checked and t/share.t runs in full. A failure here is
+      # a failing test, printed in the log by prove.
+      - name: Build and run the suite
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The same suite again, this time instrumented, with the floor enforced by
+      # bin/coverage so a drop fails the build instead of printing a number
+      # nobody reads. Separate step because Devel::Cover roughly triples the run
+      # and there is no reason to pay that on every local build.
+      - name: Coverage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          push: false
+          load: false
+          build-args: |
+            COVERAGE=1
+            COVERAGE_MIN=90
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Cheap and catches the most common breakage in a compose file: a typo
+      # that only shows up when someone tries to deploy.
+      - name: Validate the compose files
+        run: |
+          set -eux
+          cp .env.example .env
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.local.yml config --quiet
+          rm -f .env

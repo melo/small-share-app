@@ -1,0 +1,86 @@
+#!/usr/bin/env perl
+
+# Run the suite under Devel::Cover and fail if statement coverage drops below a
+# floor. Called by the Dockerfile's builder stage when built with
+# --build-arg COVERAGE=1, and by `make coverage`.
+#
+#     bin/coverage [minimum-percent]     default 90
+#
+# Why a script rather than a line in the workflow: the threshold belongs next to
+# the code it measures, so `make coverage` and CI enforce the same number, and so
+# a failure names the files dragging it down instead of leaving someone to read
+# a coverage table by eye.
+
+use strict;
+use warnings;
+
+use File::Path qw(remove_tree);
+
+my $min = @ARGV ? shift : 90;
+die "usage: $0 [minimum-percent]\n" unless $min =~ /\A\d+(?:\.\d+)?\z/;
+
+chdir '/app' or die "cannot chdir to /app: $!\n";
+
+my $db = '/tmp/cover_db';
+remove_tree($db) if -d $db;
+
+# Two options only. Everything else offered by the import list — +select,
+# -ignore, -coverage — produced an EMPTY database here while the tests still
+# passed: green suite, no number, no error. Narrowing happens at report time
+# instead, where a mistake shows up as a wrong number rather than as no number.
+my $switch = "-MDevel::Cover=-db,$db,-silent,1";
+
+# Each test file is run directly rather than through prove, so the process that
+# runs the tests is provably the instrumented one. Passing the switch through
+# HARNESS_PERL_SWITCHES and hoping it reaches the child is exactly the kind of
+# silent failure this script exists to catch.
+my @tests = sort glob '/app/t/*.t';
+die "no test files under /app/t\n" unless @tests;
+
+print "running the suite under Devel::Cover...\n\n";
+for my $test (@tests) {
+  print "== $test\n";
+  die "\ntests failed under coverage — fix them before worrying about the number\n"
+    if system $^X, $switch, '-I/app/lib', $test;
+}
+
+# NOTE: the database is a POSITIONAL argument to `cover`. There is no -db
+# option; passing one makes it look for a database literally named "-db" and
+# fail with a confusing "Can't open database ./-db".
+#
+# -select_re restricts the table — and so the Total row — to the application's
+# own code. The CPAN dependencies under /deps are loaded and instrumented, but
+# they are not ours to cover, and neither are the tests doing the covering.
+my @report = qx{cover $db -report text -silent -select_re '^share[.]pl\$' -select_re '^lib/' 2>&1};
+die "`cover` produced no report\n" unless @report;
+
+# The table comes first and ends at the Total row. Everything after it is the
+# per-line annotated source, which is thousands of lines of build log.
+my @table;
+for my $line (@report) {
+  push @table, $line;
+  last if $line =~ /^Total\s/;
+}
+print @table;
+
+my ($total_row) = grep { /^Total\s/ } @table;
+unless ($total_row) {
+  print @report[0 .. ($#report < 40 ? $#report : 40)];
+  die "\ncould not find a Total row in the coverage report\n";
+}
+
+# Columns are: stmt bran cond sub time total. Statement is the one worth gating
+# on — branch and condition are noisy at this size, and `total` is a weighted
+# blend that moves for reasons unrelated to test quality.
+my ($statement) = $total_row =~ /\ATotal\s+([\d.]+)/;
+die "could not parse statement coverage from: $total_row" unless defined $statement;
+
+printf "\nstatement coverage %.1f%% against a %s%% floor\n", $statement, $min;
+
+if ($statement < $min) {
+  my @below = grep { /\A(?:share\.pl|lib\S*)\s+([\d.]+)/ && $1 < $min } @table;
+  print "\nfiles below the floor:\n", @below if @below;
+  die sprintf "\nFAIL: %.1f%% is below the %s%% floor\n", $statement, $min;
+}
+
+print "OK\n";
