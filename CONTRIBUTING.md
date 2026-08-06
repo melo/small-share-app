@@ -16,6 +16,39 @@ it passes locally it passes in CI.
 
 You need Docker and nothing else — no local Perl, no CPAN.
 
+## Coverage has a floor
+
+```bash
+make coverage
+```
+
+Runs the same suite under `Devel::Cover` and **fails** below 90% statement
+coverage over `share.pl` and `lib/`. It sits above 93%. Slower than `make test`
+— Devel::Cover roughly triples the run — which is why it is a separate target,
+but CI runs it on every pull request, so a change that drops coverage will not
+merge quietly.
+
+## The browser suite
+
+```bash
+make e2e              # build, start, test, tear down
+HEADED=1 make e2e     # watch it happen
+```
+
+Playwright driving a real Chromium. Not in CI — it wants docker and a browser —
+so this is the pass you make by hand when the front end changes.
+
+Everything in `e2e/` is something HTTP alone cannot answer. If an assertion
+could be made with curl it belongs in `t/share.t` instead. What is left is the
+part that needs a real engine: mermaid actually drawing an SVG inside the
+sandboxed iframe, the drop zone taking files, `navigator.clipboard` receiving a
+URL, the `localStorage` history surviving a reload, and layout with real
+geometry.
+
+It builds a **throwaway instance** from your working tree — its own container,
+its own port, an empty volume, torn down at the end — and deletes only the ids
+it created. Never point it at anything real.
+
 ## Running it while you work
 
 ```bash
@@ -52,11 +85,4 @@ make dev-down
 
 ## Releasing
 
-Maintainers: tag it.
-
-```bash
-git tag v1.2.3 && git push --tags
-```
-
-That publishes `1.2.3`, `1.2`, `1` and `latest` to GHCR, and to Docker Hub if it
-is configured. See the README.
+See [MAINTAINING.md](MAINTAINING.md).

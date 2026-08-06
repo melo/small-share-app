@@ -103,10 +103,10 @@ protocol revision **2026-07-28** — stateless, no `initialize` handshake,
 `server/discover` in its place — and answers the older handshake too, so clients
 that have not caught up keep working.
 
-Note that revision's HTTP binding requires routing headers (`Mcp-Method`, and
-`Mcp-Name` on `tools/call`) that restate what the body says, plus the protocol
-version and client capabilities in `_meta` on every request. A hand-written curl
-call needs all of them; any real client does this for you.
+Any MCP client handles the protocol for you. If you are hand-writing calls with
+curl, note that this revision's HTTP binding also wants routing headers
+(`Mcp-Method`, and `Mcp-Name` on `tools/call`) restating the body, plus the
+protocol version and client capabilities in `_meta` on every request.
 
 **It never carries the file itself, in either direction.** Every tool deals in
 URLs; the agent moves the bytes with curl, straight off disk. Four tools:
@@ -306,11 +306,9 @@ box is, roughly how much disk is in play, and — watched for a few minutes —
 whether something a visitor uploaded is still there or has been evicted.
 
 No page carries it at any setting. The single exception is `/api/v1/health`,
-because a monitoring agent needs numbers; that is off by default and
-`SHARE_HEALTH_DETAIL=1` turns it on for a private deployment. The suite sweeps
-every page a stranger can reach for both the prose and the JSON forms, because
-this leaked twice — once on the health endpoint, and separately in a sentence on
-the how-to page.
+because a monitoring agent needs numbers; that is off by default, and
+`SHARE_HEALTH_DETAIL=1` turns it on for a deployment where only you can reach
+it. Leave it off in public.
 
 **Uploads are rate limited, per client**: one a second and ten a minute by
 default, counted in SQLite rather than in process memory — the app runs prefork,
@@ -346,78 +344,28 @@ one, rather than showing a broken image icon.
 **Chrome pages run with no script source at all.** Only the two pages carrying
 the uploader get `script-src 'self'`, and they ask for it by name.
 
-## Publishing your own images
+## What it is made of
 
-`.github/workflows/publish.yml` pushes multi-arch images (amd64 + arm64) on
-every push to `main` and on every `v*.*.*` tag.
+One Perl process (Mojolicious::Lite), one SQLite file, one directory of blobs.
+No database server, no object store, no queue, and no build step for the front
+end — the CSS and JavaScript are served as written. About 1,500 lines in total,
+which is small enough that you can read all of it before trusting it with
+anything.
 
-**GHCR needs no setup.** The built-in `GITHUB_TOKEN` is enough. The first push
-creates the package as *private* — make it public once, at **Profile →
-Packages → small-share-app → Package settings → Change visibility**.
+Everything persistent is in one directory. Back that up and you have backed up
+the service.
 
-**Docker Hub is optional** and skipped unless you configure it, so forks do not
-fail. To enable it, in **Settings → Secrets and variables → Actions**:
-
-| kind | name | value |
-|---|---|---|
-| Secret | `DOCKERHUB_USERNAME` | your Docker Hub account |
-| Secret | `DOCKERHUB_TOKEN` | an access token from **Account settings → Personal access tokens**, scope **Read & Write**. Not your password. |
-| Variable | `DOCKERHUB_REPO` | optional — e.g. `myuser/small-share-app`. Defaults to `<username>/small-share-app`. |
-
-Create the Docker Hub repository first; the token cannot create it for you.
-
-Tag a release with `git tag v1.0.0 && git push --tags` and you get `1.0.0`,
-`1.0`, `1` and `latest` in both registries.
-
-## How it is built
-
-```
-share.pl              Mojolicious::Lite: pages, REST API, MCP endpoint, templates
-lib/Share/Store.pm    sqlite + files on disk, classification, the reaper
-lib/Share/Render.pm   markdown → HTML that is safe to show a human
-lib/Share/MCP.pm      the JSON-RPC layer and the five tools
-public/assets/        CSS, the uploader, the mermaid bootstrap, the favicon
-t/share.t             the suite the image build runs
-e2e/                  the browser suite — mermaid really drawing, and friends
-bin/health-check      core-Perl HTTP probe for HEALTHCHECK
-bin/reap              the manual handle behind `make reap`
-Dockerfile            assets → build+test → runtime
-```
-
-The base image is [melo/docker-perl-alt](https://github.com/melo/docker-perl-alt):
-`/app` for the code, `/deps` for its CPAN dependencies.
-
-**mermaid and github-markdown-css are vendored at build time**, pinned by
-version and verified by SHA-256 — not loaded from a CDN at view time, because a
-service you deploy on a private network should not need the public internet to
-render a page. They are not committed either; mermaid alone is 3.5 MB of
-minified JavaScript. To bump one, change the version in the `Dockerfile`, build,
-and paste the checksum from the failure.
-
-**There is a browser suite too**, in `e2e/`, run by hand rather than in CI: it
-needs docker and a real Chromium. Everything in it is something HTTP cannot
-answer — mermaid actually drawing an SVG inside the sandboxed iframe, the drop
-zone taking files, the clipboard receiving a URL, the `localStorage` history
-surviving a reload. It builds a throwaway instance from the working tree and
-never touches a real one.
-
-**The image build runs the test suite.** The `builder` stage ends with
-`pdi-run-tests`, so an image whose tests fail cannot be produced, let alone
-published. `make test`, CI and the release workflow all go through that same
-stage.
-
-**Coverage is gated, not merely reported.** `make coverage` — and a CI step —
-runs the same suite under `Devel::Cover` and fails the build if statement
-coverage over `share.pl` and `lib/` drops below 90%. It sits at **94.9%**
-today. Devel::Cover is installed only inside that build step, so it never
-reaches the runtime image and costs nothing on an ordinary build.
-
-More on the reasoning behind each decision: [docs/DESIGN.md](docs/DESIGN.md).
+- [docs/DESIGN.md](docs/DESIGN.md) — why it is shaped this way, and what was
+  traded away for it
+- [CONTRIBUTING.md](CONTRIBUTING.md) — running the tests, and what a good
+  change looks like
+- [SECURITY.md](SECURITY.md) — what is in scope for a report, and what is a
+  documented trade
+- [MAINTAINING.md](MAINTAINING.md) — releases, and publishing images from a fork
 
 ## Contributing
 
-Issues and pull requests welcome. `make test` before you push — it is the same
-thing CI runs. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence
 
