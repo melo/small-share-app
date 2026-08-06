@@ -745,6 +745,12 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 @@ viewer.html.ep
 % layout 'chrome', title => $file->{filename}, body_class => 'viewing';
 <header class="filebar">
+  %# The viewer suppresses the top bar — it is a full-height two-pane layout and
+  %# a second bar would eat the frame. But arriving here from a link handed to
+  %# you is the COMMON case, and with no way home the service is a dead end. So
+  %# the brand comes along, same tile as the home page, set apart from the file's
+  %# own metadata so the two do not read as one heading.
+  <a class="brand filebar-brand" href="<%= url_for 'index' %>">share</a>
   <div class="facts">
     <h1><%= $file->{title} // $file->{filename} %></h1>
     % if (defined $file->{title}) {

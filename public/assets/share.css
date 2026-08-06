@@ -104,6 +104,18 @@ body.viewing { display: flex; flex-direction: column; overflow: hidden; }
   word-break: break-word;
 }
 
+/* Padding, not just a gap: the separator earns its keep by stopping "share"
+ * from reading as the first word of the filename next to it. */
+.filebar-brand {
+  flex: 0 0 auto;
+  align-self: stretch;
+  padding-right: 1.25rem;
+  margin-right: 0.25rem;
+  border-right: 1px solid var(--line);
+  font-size: 1.1rem;
+  line-height: 1.4;
+}
+
 .filebar .sub, .filebar .note {
   margin: 0.25rem 0 0;
   font-size: 0.85rem;
@@ -169,6 +181,8 @@ form { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.5rem; }
 
 .topbar nav a { font-size: 0.9rem; }
 
+/* The viewer has its own bar; a second one would eat the preview frame. The
+ * brand is carried into .filebar instead — see .filebar-brand. */
 body.viewing .topbar { display: none; }
 
 /* ---------------------------------------------------------------- uploader */
@@ -330,6 +344,14 @@ p.failed {
 
 @media (max-width: 40rem) {
   .filebar { flex-direction: column; gap: 0.75rem; }
+
+  /* Stacked, the vertical rule points nowhere. */
+  .filebar-brand {
+    align-self: flex-start;
+    padding-right: 0;
+    border-right: 0;
+    padding-bottom: 0.5rem;
+  }
   .actions { width: 100%; }
   .btn { flex: 1; text-align: center; }
 }

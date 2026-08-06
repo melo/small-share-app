@@ -364,6 +364,9 @@ subtest 'no route lets a client choose or overwrite an id' => sub {
 
 subtest 'the viewer frames the file and never leaks the secret' => sub {
   $t->get_ok("/f/$id")->status_is(200)->content_like(qr/report\.md/)
+    # Arriving from a link someone sent you is the common case; without this the
+    # service is a dead end.
+    ->content_like(qr{<a class="brand filebar-brand" href="/">share</a>})
     ->content_like(qr/have a look/)->content_like(qr/sandbox="allow-scripts"/)
     ->header_is('Referrer-Policy' => 'no-referrer')
     ->header_like('X-Robots-Tag'  => qr/noindex/)
