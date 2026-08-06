@@ -57,6 +57,27 @@ with the node's own name — so nothing in this repo has to know your tailnet, a
 > `tailscaled` resolves and serves an unsigned node's own name on its own host,
 > so `curl` there returns 200 while the name does not resolve anywhere else.
 
+### On a tailnet you already run tsdproxy on
+
+```bash
+docker compose -f docker-compose.tsdproxy.yml up -d
+```
+
+One container instead of two: [tsdproxy](https://github.com/almeidapaulopt/tsdproxy)
+watches Docker for labelled containers and gives each its own tailnet node. No
+sidecar per service and no auth key in this stack. Pick this *or* the sidecar
+above, not both.
+
+### Behind a Traefik you already run
+
+```bash
+docker compose -f docker-compose.traefik.yml up -d
+```
+
+Routed by label, TLS terminated by Traefik. Read [Security](#security) first —
+unlike the two options above, this one very possibly puts a service with no
+authentication on the open internet.
+
 ### Locally, or behind a proxy you already run
 
 ```bash
@@ -218,6 +239,7 @@ make up         # start the Tailscale stack
 make dev        # run locally on 127.0.0.1:8080, no Tailscale
 make test       # build through the test stage — the whole suite
 make coverage   # the same suite under Devel::Cover, with a 90% floor
+make e2e        # the browser suite, against a throwaway instance
 make health     # is it alive, and what is it holding
 make list       # what is currently shared, from the database
 make reap       # delete expired files now
@@ -356,6 +378,7 @@ lib/Share/Render.pm   markdown → HTML that is safe to show a human
 lib/Share/MCP.pm      the JSON-RPC layer and the five tools
 public/assets/        CSS, the uploader, the mermaid bootstrap, the favicon
 t/share.t             the suite the image build runs
+e2e/                  the browser suite — mermaid really drawing, and friends
 bin/health-check      core-Perl HTTP probe for HEALTHCHECK
 bin/reap              the manual handle behind `make reap`
 Dockerfile            assets → build+test → runtime
@@ -370,6 +393,13 @@ service you deploy on a private network should not need the public internet to
 render a page. They are not committed either; mermaid alone is 3.5 MB of
 minified JavaScript. To bump one, change the version in the `Dockerfile`, build,
 and paste the checksum from the failure.
+
+**There is a browser suite too**, in `e2e/`, run by hand rather than in CI: it
+needs docker and a real Chromium. Everything in it is something HTTP cannot
+answer — mermaid actually drawing an SVG inside the sandboxed iframe, the drop
+zone taking files, the clipboard receiving a URL, the `localStorage` history
+surviving a reload. It builds a throwaway instance from the working tree and
+never touches a real one.
 
 **The image build runs the test suite.** The `builder` stage ends with
 `pdi-run-tests`, so an image whose tests fail cannot be produced, let alone

@@ -30,6 +30,13 @@ coverage:
 	  --build-arg COVERAGE=1 --build-arg COVERAGE_MIN=$(COVERAGE_MIN) \
 	  -t small-share-app-coverage .
 
+## e2e: the browser suite, against a throwaway instance (never production)
+# Playwright and a real Chromium, checking what HTTP cannot: mermaid actually
+# drawing, the drop zone, the clipboard, the localStorage history. Not in CI —
+# it wants docker and a browser. See e2e/.
+e2e:
+	@cd e2e && ./run.sh
+
 ## dev: run locally on 127.0.0.1:8080, no Tailscale, rebuilding first
 dev:
 	$(LOCAL) up -d --build
@@ -103,4 +110,4 @@ backup:
 	  $(COMPOSE) start share; \
 	  echo "wrote backups/share-$$ts.tar.gz"; ls -lh backups/share-$$ts.tar.gz
 
-.PHONY: help test coverage dev dev-logs dev-down up down ps logs ts-status health list reap du backup
+.PHONY: help test coverage e2e dev dev-logs dev-down up down ps logs ts-status health list reap du backup

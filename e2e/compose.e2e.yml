@@ -1,0 +1,27 @@
+# A throwaway instance for the browser suite. Empty data every run, its own
+# port, torn down (with its volume) afterwards. Never point this at the
+# production workspace.
+services:
+  share:
+    build: ./app
+    image: share-e2e:local
+    environment:
+      SHARE_ROOT: /workspace
+      # Must match the tunnel the browser talks to, so that every URL the app
+      # hands out is one the browser can actually follow.
+      SHARE_BASE_URL: ${SHARE_BASE_URL:-http://127.0.0.1:8099}
+      SHARE_TTL_DAYS: "15"
+      SHARE_NOTICE: "Throwaway instance for the end-to-end suite."
+      # Off here. This suite uploads far more often than any real client would —
+      # a browser driving a drop zone a dozen times in ten seconds is exactly
+      # what the limiter exists to stop. The limiter itself, including the 429
+      # on both upload routes, is covered properly in app/t/share.t.
+      SHARE_RATE_PER_SECOND: "0"
+      SHARE_RATE_PER_MINUTE: "0"
+      MOJO_MODE: production
+    volumes:
+      - e2e-data:/workspace
+    ports:
+      - "127.0.0.1:${PORT:-8099}:8080"
+volumes:
+  e2e-data:
