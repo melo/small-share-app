@@ -34,7 +34,9 @@ body {
   margin: 0; background: var(--bg); color: var(--fg);
   font: 16px/1.65 var(--sans); -webkit-text-size-adjust: 100%;
 }
-a { color: var(--accent); }
+/* Matched to the app: navigation and inline links are muted and hover to full
+ * strength. Blue is reserved for the call to action, so it means something. */
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
 .wrap { max-width: 56rem; margin: 0 auto; padding: 0 1.5rem; }
 
 /* ------------------------------------------------------------------ topbar */
@@ -48,15 +50,22 @@ a { color: var(--accent); }
   display: flex; align-items: center; justify-content: space-between;
   gap: 1rem; padding-top: 0.85rem; padding-bottom: 0.85rem;
 }
-.brand { display: flex; align-items: center; gap: 0.55rem; font-weight: 700; letter-spacing: -0.02em; }
-.brand svg { width: 22px; height: 22px; }
-.topbar nav { display: flex; align-items: center; gap: 1.25rem; font-size: 0.9rem; }
-.gh {
-  display: inline-flex; align-items: center; gap: 0.45rem;
-  padding: 0.35rem 0.8rem; border: 1px solid var(--line); border-radius: 999px;
+/* The same wordmark the app uses: a logo, not a link. */
+.brand {
+  display: flex; align-items: center; gap: 0.5rem;
+  font-size: 1.35rem; font-weight: 700; letter-spacing: -0.025em;
   color: var(--fg); text-decoration: none;
 }
-.gh:hover { border-color: var(--fg-muted); }
+.brand svg { width: 21px; height: 21px; flex: 0 0 auto; }
+.topbar nav { display: flex; align-items: center; gap: 1.4rem; font-size: 0.9rem; }
+.topbar nav a { color: var(--fg-muted); text-decoration: none; }
+.topbar nav a:hover { color: var(--fg); }
+.gh {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.3rem 0.75rem; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--fg-muted); text-decoration: none;
+}
+.gh:hover { border-color: var(--fg-muted); color: var(--fg); }
 .gh svg { width: 16px; height: 16px; fill: currentColor; }
 
 /* -------------------------------------------------------------------- hero */
@@ -84,7 +93,9 @@ a { color: var(--accent); }
   margin: 3rem 0 0; padding: 1.5rem; overflow-x: auto;
   background: var(--bg-soft); border: 1px solid var(--line); border-radius: 12px;
 }
-.flow pre { margin: 0; font-family: var(--mono); font-size: 0.78rem; line-height: 1.5; color: var(--fg-muted); }
+/* The SVG carries its own light/dark rules — it is loaded as an <img>, so it
+ * cannot inherit anything from this page. */
+.flow img { display: block; width: 100%; max-width: 840px; height: auto; margin: 0 auto; }
 
 /* ----------------------------------------------------------------- section */
 section { padding: 3.5rem 0; border-top: 1px solid var(--line); }
@@ -127,21 +138,23 @@ pre.code code { background: none; padding: 0; }
 
 footer { padding: 2.5rem 0 4rem; border-top: 1px solid var(--line); color: var(--fg-muted); font-size: 0.85rem; }
 footer .wrap { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+footer a { color: var(--fg-muted); }
+footer a:hover { color: var(--fg); }
 </style>
 </head>
-<body>
+<body id="top">
 
 <header class="topbar">
   <div class="wrap">
-    <span class="brand">
+    <a class="brand" href="#top">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M8.5 10.5H6.5A2.5 2.5 0 0 0 4 13v6.5A2.5 2.5 0 0 0 6.5 22h11a2.5 2.5 0 0 0 2.5-2.5V13a2.5 2.5 0 0 0-2.5-2.5h-2"/>
         <path d="M12 15V3"/>
         <path d="M7.75 7.25 12 3l4.25 4.25"/>
       </svg>
-      small-share-app
-    </span>
+      <span>small-share-app</span>
+    </a>
     <nav>
       <a href="#features">Features</a>
       <a href="#install">Install</a>
@@ -168,15 +181,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 1rem; flex-wr
   </div>
 
   <div class="flow">
-<pre>  agent ──POST /api/v1/files  (or MCP get_upload_url)──►┐
-                                                         │   small-share-app
-  agent ◄──── https://share.your-net/f/&lt;32 random chars&gt; ─┤
-    │                                                    │   sqlite + files on disk
-    │ "here you go"                                      │
-    ▼                                                    │
-  human ──opens the URL in a browser────────────────────►┘
-          header: name, size, uploaded, expires in 14d, [Download] [Delete]
-          below:  the file, rendered, in its own frame</pre>
+    <img src="flow.svg" alt="An agent uploads a file and gets back one random URL. It
+      hands that URL to a human, who opens it in a browser and sees the file rendered
+      with its name, size and expiry. It works in the other direction too.">
   </div>
 </div>
 

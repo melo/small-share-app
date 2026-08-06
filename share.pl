@@ -63,6 +63,17 @@ my %CFG = (
   require_signed_uploads => !!$ENV{SHARE_REQUIRE_SIGNED_UPLOADS},
 
   version => $VERSION,
+
+  # --- protections for an instance anyone can reach ------------------------
+  #
+  # All three are off with a 0. Defaults are chosen for a public box: generous
+  # enough that a person or an agent never notices, tight enough that a loop
+  # does.
+  max_total_bytes => defined $ENV{SHARE_MAX_TOTAL_BYTES}
+  ? 0 + $ENV{SHARE_MAX_TOTAL_BYTES}
+  : 50 * 1024 * 1024 * 1024,
+  rate_per_second => defined $ENV{SHARE_RATE_PER_SECOND} ? 0 + $ENV{SHARE_RATE_PER_SECOND} : 1,
+  rate_per_minute => defined $ENV{SHARE_RATE_PER_MINUTE} ? 0 + $ENV{SHARE_RATE_PER_MINUTE} : 10,
 );
 
 sub _decoded ($value) {
@@ -88,6 +99,9 @@ my $store = Share::Store->new(
   max_bytes        => $CFG{max_bytes},
   default_ttl_days => $CFG{ttl_days},
   max_ttl_days     => $CFG{ttl_days},
+  max_total_bytes  => $CFG{max_total_bytes},
+  rate_per_second  => $CFG{rate_per_second},
+  rate_per_minute  => $CFG{rate_per_minute},
 )->init;
 
 helper store => sub ($c) { $store };
@@ -175,6 +189,12 @@ post '/upload' => sub ($c) {
         . human_size($CFG{max_bytes}) . ' per file.');
   }
 
+  if (my $wait = _rate_limited($c)) {
+    return $c->render('uploaded', results => [], status => 429,
+      error => "That was too fast — this instance allows a few uploads a minute. "
+        . "Try again in ${wait} seconds.");
+  }
+
   my @chosen = grep { length $_->filename } @{$c->req->every_upload('file')};
   return $c->render('uploaded', results => [], error => 'No file was chosen.') unless @chosen;
 
@@ -194,6 +214,7 @@ post '/upload' => sub ($c) {
           delete_password => $row->{delete_password}}};
   }
 
+  _shed_over_limit($c);
   $c->render('uploaded', results => \@results, error => undef);
 } => 'upload';
 
@@ -318,6 +339,10 @@ $api->post('/files' => sub ($c) {
   # There is deliberately no way to influence the stored id from out here: it
   # comes from /dev/urandom inside Share::Store::add, and no route in this app
   # updates an existing file. Two uploads of the same bytes are two files.
+  if (my $wait = _rate_limited($c)) {
+    return _api_error($c, 429, "too many uploads; try again in ${wait}s");
+  }
+
   if (my $reason = _bad_ticket($c)) { return _api_error($c, 403, $reason) }
 
   my $args = eval { _upload_args($c) };
@@ -330,6 +355,7 @@ $api->post('/files' => sub ($c) {
   # anything else reads, `public` does not carry it, and no later call will
   # return it — losing it means the file simply expires on its own.
   my $info = {%{$store->public($row, $c->base_url)}, delete_password => $row->{delete_password}};
+  _shed_over_limit($c);
   $c->res->headers->location($info->{url});
   $c->render(json => $info, status => 201);
 });
@@ -489,6 +515,41 @@ sub _delete_password ($c) {
   return defined $param && length $param ? $param : undef;
 }
 
+# Who is being limited.
+#
+# Behind Cloudflare the honest answer is CF-Connecting-IP; behind Traefik alone
+# it is the left-most X-Forwarded-For, which MOJO_REVERSE_PROXY already resolves
+# into remote_address. Neither is forgeable by a client that is actually behind
+# the proxy, and a deployment with nothing in front has no forwarded headers to
+# be confused by.
+sub _client ($c) {
+  my $cf = $c->req->headers->header('CF-Connecting-IP');
+  return $cf if defined $cf && length $cf;
+  return $c->tx->remote_address // 'unknown';
+}
+
+# Returns a Retry-After value when the caller must wait, undef when it may go.
+sub _rate_limited ($c) {
+  my ($ok, $wait) = $store->rate_check(_client($c));
+  return undef if $ok;
+
+  $c->res->headers->header('Retry-After' => $wait);
+  app->log->info(sprintf 'rate limited %s, retry in %ds', _client($c), $wait);
+  return $wait;
+}
+
+# Enforced by eviction after the fact rather than by refusing the upload: a
+# public box that fills its disk goes down, which is worse than losing the
+# oldest file on it.
+sub _shed_over_limit ($c) {
+  my $evicted = $store->enforce_total_limit;
+  return unless @$evicted;
+  app->log->info(sprintf 'over the %s ceiling: evicted %d oldest file(s), %s',
+    human_size($CFG{max_total_bytes}), scalar @$evicted,
+    human_size(0 + eval { my $n = 0; $n += $_->{size} for @$evicted; $n }));
+  return;
+}
+
 sub _bad ($message) { die {share_error => $message} }    ## no critic (RequireCarping)
 
 # Store failures arrive as {share_error => '…'} and are meant for whoever sent
@@ -632,6 +693,25 @@ __DATA__
 % layout 'chrome', title => 'share — hand a file over', uploader => 1;
 <main class="prose">
   <p class="lede">Hand a file to an agent, or to a person. You get one URL back.</p>
+
+  %# Shown to everyone by default and hidden by assets/upload.js once dismissed —
+  %# the other way round would mean a flash of it on every single visit, and
+  %# would hide it entirely from anyone without JavaScript. The dismiss button
+  %# itself ships hidden, same as the Copy buttons, so scripting-off visitors get
+  %# no dead control.
+  <aside class="pitch">
+    <div class="pitch-body">
+      <p class="pitch-headline">Your agent can use this from inside your chat.</p>
+      <p>It is an MCP server. Register it once and your agent can hand you a
+      rendered report, a diagram or a screenshot without either of you leaving the
+      conversation — and read back whatever you drop here.</p>
+      <pre><code>claude mcp add --transport http share <%= $c->base_url %>/mcp</code></pre>
+      <p class="pitch-more"><a href="<%= url_for 'how_to' %>">How to use it</a> ·
+      <a href="<%= url_for 'api' %>">the API</a></p>
+    </div>
+    <button class="pitch-dismiss" type="button" aria-label="Dismiss" hidden>&times;</button>
+  </aside>
+
 %= include 'uploader', cfg => $cfg
 </main>
 

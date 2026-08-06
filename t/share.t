@@ -18,6 +18,7 @@ use Mojo::File   qw(curfile);
 use Mojo::JSON   qw(encode_json from_json to_json);
 use Mojo::URL    ();
 use Mojo::Util   qw(b64_encode);
+use Share::Store ();
 use Test::Mojo   ();
 use Test::More;
 
@@ -33,6 +34,11 @@ $ENV{SHARE_BASE_URL} = 'https://share.example.test';
 # wide character to %ENV latin-1-encodes it on the way in, so that route stores
 # already-double-encoded bytes and tests the wrong thing.
 $ENV{SHARE_NOTICE} = "Office network only \xe2\x80\x94 ask #infra for access.";
+
+# Off for the bulk of the suite, which uploads far more often than any real
+# client would. The limits get their own subtest, with their own store.
+$ENV{SHARE_RATE_PER_SECOND} = 0;
+$ENV{SHARE_RATE_PER_MINUTE} = 0;
 delete $ENV{SHARE_TTL_DAYS};
 
 my $t = Test::Mojo->new(curfile->dirname->sibling('share.pl'));
@@ -113,11 +119,13 @@ subtest 'the home page is the uploader, and nothing else' => sub {
     ->content_like(qr{<section class="recent" hidden>})
     ->header_like('Content-Security-Policy' => qr/default-src 'none'/);
 
-  # The explanatory material moved to /how-to. If it creeps back onto the home
-  # page, the widget stops being the point of the page.
+  # The explanatory material lives at /how-to. The pitch panel carries the one
+  # `claude mcp add` line on purpose — that is the whole point of it — but the
+  # rules, the REST examples and the rest must stay one click away, or the drop
+  # zone stops being the point of the page.
   my $home = $t->tx->res->text;
-  unlike $home, qr/claude mcp add/, 'no setup instructions on the home page';
-  unlike $home, qr/The rules/,      'and no rules dump either';
+  unlike $home, qr/The rules/,           'no rules dump on the home page';
+  unlike $home, qr/curl --data-binary/,  'and no REST tutorial either';
 };
 
 subtest 'how-to carries what the home page used to' => sub {
@@ -144,6 +152,21 @@ subtest 'the uploader is a plain form that works without JavaScript' => sub {
   $t->get_ok('/')->header_like('Content-Security-Policy' => qr/script-src 'self'/)
     ->header_like('Content-Security-Policy' => qr/connect-src 'self'/);
   $t->get_ok('/f/' . ('z' x 32))->header_unlike('Content-Security-Policy' => qr/script-src/);
+};
+
+subtest 'the first-visit pitch' => sub {
+  # Rendered visible for everyone; assets/upload.js hides it once dismissed. The
+  # other way round would flash it on every visit and hide it forever from
+  # anyone without JavaScript.
+  $t->get_ok('/')->status_is(200)
+    ->content_like(qr{<aside class="pitch">})
+    ->content_like(qr/from inside your chat/)
+    ->content_like(qr{claude mcp add --transport http share https://share\.example\.test/mcp})
+    # Dead controls are worse than missing ones: the button waits for the script.
+    ->content_like(qr{<button class="pitch-dismiss"[^>]*hidden>});
+
+  # ...and it points at the page we were told nobody finds.
+  $t->get_ok('/')->content_like(qr{<a href="/how-to">How to use it</a>[^<]*·});
 };
 
 subtest 'the API page, and the OpenAPI document behind it' => sub {
@@ -362,6 +385,98 @@ subtest 'no route lets a client choose or overwrite an id' => sub {
   isnt $made[0]{id}, $made[1]{id}, 'two uploads, two ids, no overwrite';
   isnt $made[0]{delete_password}, $made[1]{delete_password}, 'and two passwords';
   _delete($_->{id}, $_->{delete_password})->code == 200 or die 'cleanup failed' for @made;
+};
+
+subtest 'rate limiting, and the disk ceiling' => sub {
+  # A store of its own, so the limits can be tiny without the rest of the suite
+  # tripping over them.
+  my $dir = File::Temp->newdir;
+  my $s   = Share::Store->new(root => "$dir", rate_per_second => 1, rate_per_minute => 3,
+    max_total_bytes => 300)->init;
+
+  # Counted in SQLite, not in process memory: the app runs prefork, and an
+  # in-memory counter would hand every client the limit times the worker count.
+  my ($ok, $wait) = $s->rate_check('10.0.0.1');
+  ok $ok, 'the first attempt goes through';
+
+  # The hit is planted rather than made by calling rate_check twice: two live
+  # calls can land either side of a second boundary, and then the per-second
+  # rule legitimately does not fire. That is a flaky test, not a bug.
+  $s->sql->db->query('DELETE FROM upload_hits');
+  $s->sql->db->insert('upload_hits', {client => '10.0.0.1', at => time});
+  ($ok, $wait) = $s->rate_check('10.0.0.1');
+  ok !$ok, 'a second attempt within the same second does not';
+  is $wait, 1, 'and is told to wait a second';
+
+  # Another client is unaffected — the limit is per caller, not global.
+  ok +($s->rate_check('10.0.0.2'))[0], 'a different client is not blocked';
+  $s->sql->db->query('DELETE FROM upload_hits');
+
+  # Attempts, not successes: hammering with rejects has to count too.
+  $s->sql->db->insert('upload_hits', {client => '10.0.0.3', at => time - 30}) for 1 .. 3;
+  ($ok, $wait) = $s->rate_check('10.0.0.3');
+  ok !$ok, 'the per-minute limit bites even when nothing was stored';
+  ok $wait > 1 && $wait <= 60, "and says when the window frees up ({$wait}s)";
+
+  # Turning them off is a supported state, not an accident.
+  my $unlimited = Share::Store->new(root => "$dir", rate_per_second => 0, rate_per_minute => 0);
+  $unlimited->sql($s->sql);
+  ok +($unlimited->rate_check('10.0.0.1'))[0], 'zero disables the limit';
+
+  # The ceiling sheds the OLDEST rather than refusing the newest: a public box
+  # that fills its disk goes down, which is worse than losing old files.
+  my @made;
+  for my $n (1 .. 4) {
+    my $row = $s->add(bytes => ('x' x 100), filename => "f$n.md");
+    # add() stamps created_at from time(), so nudge them apart deliberately
+    # rather than depending on the clock ticking during a fast test.
+    $s->sql->db->query('UPDATE files SET created_at = ? WHERE id = ?', time - (10 - $n), $row->{id});
+    push @made, $row;
+  }
+
+  my $evicted = $s->enforce_total_limit;
+  is scalar @$evicted, 1, 'exactly one file evicted — no more than needed';
+  is $evicted->[0]{filename}, 'f1.md', 'and it is the oldest';
+  ok !$s->find($made[0]{secret}), 'which is really gone';
+  ok $s->find($made[3]{secret}),  'while the newest survives';
+  ok $s->stats->{bytes} <= 300,   'and the total is under the ceiling';
+
+  # No ceiling means no eviction.
+  $s->max_total_bytes(0);
+  is_deeply $s->enforce_total_limit, [], 'zero disables the ceiling';
+};
+
+subtest 'a hammering client is refused, in both dialects' => sub {
+  # Turned on for this subtest only, on the running app's own store.
+  #
+  # NOT by building a second Test::Mojo: Mojolicious::Lite's app is a singleton
+  # in `main`, so loading share.pl twice re-runs its routes against a NEW store
+  # and every earlier file in this file's other subtests vanishes underneath
+  # them. That cost half an hour to work out; do not reintroduce it.
+  # Both set to 1, deliberately: with a per-minute allowance of 2 the second
+  # request is only refused if it lands in the same SECOND as the first, and two
+  # HTTP round trips straddle a second boundary often enough to make that a
+  # flaky test. One-per-minute is refused either way.
+  my $s = $t->app->store;
+  $s->rate_per_second(1);
+  $s->rate_per_minute(1);
+  $s->sql->db->query('DELETE FROM upload_hits');
+
+  $t->post_ok('/api/v1/files?filename=fast-a.md' => '# a')->status_is(201);
+  my $made = $t->tx->res->json;
+
+  $t->post_ok('/api/v1/files?filename=fast-b.md' => '# b')->status_is(429)
+    ->json_like('/error' => qr/too many uploads/)
+    ->header_like('Retry-After' => qr/\A\d+\z/);
+
+  # The browser path is limited too, and answers in words rather than JSON.
+  $t->post_ok('/upload' => form => {file => {content => '# c', filename => 'fast-c.md'}})
+    ->status_is(429)->content_like(qr/too fast/);
+
+  $s->rate_per_second(0);
+  $s->rate_per_minute(0);
+  $s->sql->db->query('DELETE FROM upload_hits');
+  _delete($made->{id}, $made->{delete_password})->code == 200 or die 'cleanup failed';
 };
 
 # ----------------------------------------------------------------- viewer ----

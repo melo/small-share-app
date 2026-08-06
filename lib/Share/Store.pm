@@ -34,6 +34,17 @@ has max_bytes        => 32 * 1024 * 1024;
 has default_ttl_days => 15;
 has max_ttl_days     => 15;
 
+# Ceiling on everything held at once. When an upload pushes the total over it,
+# the OLDEST files are evicted until it fits again — a public instance should
+# shed history rather than start refusing uploads, because a full disk takes the
+# service down and a lost two-week-old demo file does not.
+has max_total_bytes => 50 * 1024 * 1024 * 1024;
+
+# Upload attempts allowed per client. 0 disables either limit. The pair matters:
+# per-second stops a hammering loop instantly, per-minute stops a patient one.
+has rate_per_second => 1;
+has rate_per_minute => 10;
+
 # ---------------------------------------------------------------- schema -----
 
 use constant MIGRATIONS => <<'SQL';
@@ -77,6 +88,20 @@ ALTER TABLE files ADD COLUMN delete_hash TEXT;
 -- SQLite before 3.35 cannot DROP COLUMN, and the columns are harmless if this
 -- is ever rolled back, so leave them.
 SELECT 1;
+
+-- 3 up
+-- Upload attempts, for rate limiting. ATTEMPTS, not successes: a limit that
+-- only counts what got stored is no limit at all against someone hammering the
+-- endpoint with rejects.
+CREATE TABLE upload_hits (
+  id     INTEGER PRIMARY KEY,
+  client TEXT    NOT NULL,
+  at     INTEGER NOT NULL
+);
+CREATE INDEX upload_hits_idx ON upload_hits (client, at);
+
+-- 3 down
+DROP TABLE upload_hits;
 SQL
 
 sub init ($self) {
@@ -388,6 +413,74 @@ sub touch ($self, $row) {
     'UPDATE files SET downloads = downloads + 1, last_seen_at = ? WHERE id = ?',
     time, $row->{id});
   return;
+}
+
+# ---------------------------------------------------- protecting the box -----
+
+# Returns (1, undef) when the attempt may proceed, or (0, seconds-to-wait).
+#
+# Counted in SQLite rather than in process memory on purpose: the app runs
+# prefork, so an in-memory counter would be per-worker and a client would get
+# the limit multiplied by the number of workers. The table is tiny and pruned on
+# every call.
+sub rate_check ($self, $client) {
+  my ($per_second, $per_minute) = ($self->rate_per_second, $self->rate_per_minute);
+  return (1, undef) unless $per_second || $per_minute;
+
+  $client = 'unknown' unless defined $client && length $client;
+  my $now = time;
+  my $db  = $self->sql->db;
+
+  # Nothing older than the widest window can matter to anyone.
+  $db->query('DELETE FROM upload_hits WHERE at < ?', $now - 60);
+
+  if ($per_second) {
+    my $recent = $db->query('SELECT COUNT(*) FROM upload_hits WHERE client = ? AND at >= ?',
+      $client, $now)->array->[0];
+    return (0, 1) if $recent >= $per_second;
+  }
+
+  if ($per_minute) {
+    my $recent = $db->query('SELECT COUNT(*) FROM upload_hits WHERE client = ? AND at > ?',
+      $client, $now - 60)->array->[0];
+    if ($recent >= $per_minute) {
+      # Tell them when the window actually frees up rather than guessing a
+      # round number: the oldest hit in the window is when a slot returns.
+      my $oldest = $db->query(
+        'SELECT MIN(at) FROM upload_hits WHERE client = ? AND at > ?', $client, $now - 60)
+        ->array->[0] // $now;
+      return (0, ($oldest + 60) - $now || 1);
+    }
+  }
+
+  $db->insert('upload_hits', {client => $client, at => $now});
+  return (1, undef);
+}
+
+# Shed the oldest files until everything held fits under the ceiling. Called
+# after an upload lands, so the limit is enforced by eviction rather than by
+# refusal — a public instance filling its disk goes down, and that is a worse
+# outcome than losing the oldest thing on it.
+#
+# Returns the list of evicted rows, so the caller can say what it did.
+sub enforce_total_limit ($self) {
+  my $limit = $self->max_total_bytes or return [];
+
+  my $total = $self->sql->db->query('SELECT COALESCE(SUM(size), 0) FROM files')->array->[0];
+  return [] if $total <= $limit;
+
+  my @evicted;
+  # Oldest first, one at a time: each purge changes the total, and stopping the
+  # moment it fits means never evicting one file more than necessary.
+  my $rows = $self->sql->db->query('SELECT * FROM files ORDER BY created_at ASC')->hashes;
+  for my $row (@$rows) {
+    last if $total <= $limit;
+    $total -= $row->{size};
+    $self->_purge($row);
+    push @evicted, $row;
+  }
+
+  return \@evicted;
 }
 
 # --------------------------------------------------------------- removing ----

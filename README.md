@@ -13,17 +13,7 @@ screenshot or a spec to an agent and paste back the URL.
 
 That is the whole product.
 
-```
-  agent ──POST /api/v1/files (or MCP share_file)──►┐
-                                                    │  small-share-app
-  agent ◄────── https://share.your-net/f/<32 random chars> ──┤
-    │                                               │  sqlite + files on disk
-    │ "here you go"                                 │
-    ▼                                               │
-  human ──opens the URL in a browser──────────────►┘
-          header: name, size, uploaded, expires in 14d, [Download] [Delete]
-          below:  the file, rendered, in its own frame
-```
+![How it works: an agent uploads a file, gets one random URL, and hands it to a human who opens it in a browser](site/flow.svg)
 
 One Perl process (Mojolicious::Lite), one SQLite file, one directory of blobs.
 No database server, no object store, no queue, no build step for the front end.
@@ -203,6 +193,9 @@ All of it is environment variables. All of it is optional except where noted.
 | `SHARE_TTL_DAYS` | `15` | retention, and the ceiling an upload may ask for |
 | `SHARE_MAX_BYTES` | `33554432` | per-file limit |
 | `SHARE_NOTICE` | empty | one line of deployment truth, shown on `/how-to` and in the MCP instructions |
+| `SHARE_MAX_TOTAL_BYTES` | 50 GB | ceiling on everything held at once; the oldest are evicted over it |
+| `SHARE_RATE_PER_SECOND` | `1` | upload attempts per client per second; `0` disables |
+| `SHARE_RATE_PER_MINUTE` | `10` | upload attempts per client per minute; `0` disables |
 | `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
 | `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
 | `MOJO_REVERSE_PROXY` | `0` | set to `1` behind a proxy that sets `X-Forwarded-*` |
@@ -280,6 +273,17 @@ anything that can reach the service can POST to the endpoint directly. What it
 buys today is that a ticket cannot be altered in transit or hoarded forever, and
 what it buys later is a place for a real credential to live. Set
 `SHARE_REQUIRE_SIGNED_UPLOADS=1` to make tickets mandatory.
+
+**Uploads are rate limited, per client**: one a second and ten a minute by
+default, counted in SQLite rather than in process memory — the app runs prefork,
+and an in-memory counter would hand each client the limit multiplied by the
+worker count. **Attempts** are counted, not successes, so hammering the endpoint
+with rejects is limited too. Over the limit is a `429` with `Retry-After`.
+
+**A disk ceiling, enforced by eviction rather than refusal.** Past
+`SHARE_MAX_TOTAL_BYTES` (50 GB by default) the *oldest* files are removed until
+it fits. A public box that fills its disk goes down, which is a worse outcome
+than losing the oldest thing on it.
 
 **Reading and deleting are separate capabilities.** The share URL grants
 reading. Deleting needs the `delete_password` returned by the upload — passed as

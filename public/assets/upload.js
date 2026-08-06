@@ -77,6 +77,38 @@
   var buttons = document.querySelectorAll('button[data-copy]');
   for (var i = 0; i < buttons.length; i++) wireCopy(buttons[i], buttons[i].getAttribute('data-copy'));
 
+  // ----------------------------------------------------------------- pitch --
+
+  // The "this is an MCP server" panel. Server-rendered visible and hidden here
+  // once dismissed, rather than the reverse: hiding by default would flash it on
+  // every visit and would hide it forever from anyone without JavaScript.
+  //
+  // What is stored is the moment of dismissal, not the first visit. A boolean
+  // would do for hiding it, but a timestamp lets it come back after a long
+  // enough gap — someone returning months later has probably forgotten, and
+  // by then it is news again rather than nagging.
+  var PITCH_KEY = 'share.pitch-dismissed';
+  var PITCH_AGAIN_AFTER = 90 * 24 * 60 * 60 * 1000;
+
+  var pitch = document.querySelector('.pitch');
+  if (pitch) {
+    var dismissedAt = 0;
+    try { dismissedAt = parseInt(window.localStorage.getItem(PITCH_KEY), 10) || 0; }
+    catch (err) { dismissedAt = 0; }
+
+    if (dismissedAt && Date.now() - dismissedAt < PITCH_AGAIN_AFTER) pitch.hidden = true;
+
+    var dismiss = pitch.querySelector('.pitch-dismiss');
+    if (dismiss) {
+      dismiss.hidden = false;
+      dismiss.addEventListener('click', function () {
+        pitch.hidden = true;
+        try { window.localStorage.setItem(PITCH_KEY, String(Date.now())); }
+        catch (err) { /* private mode: it just comes back next time */ }
+      });
+    }
+  }
+
   // --------------------------------------------------------------- history --
 
   // This browser's own record of what it has sent. The server keeps no such

@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 330" width="840" height="330"
+     role="img" aria-labelledby="flow-title flow-desc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
+  <title id="flow-title">How small-share-app works</title>
+  <desc id="flow-desc">An agent uploads a file and gets back one random URL. It hands
+  that URL to a human, who opens it in a browser and sees the file rendered. The file
+  is deleted after fifteen days.</desc>
+
+  <!-- One file, used by the README and by the landing page. It carries its own
+       light/dark rules, because in both places it is loaded as an <img> and so
+       cannot inherit anything from the page around it. Media queries still
+       apply: the browser renders it as its own little document. -->
+  <style>
+    :root {
+      --ink: #1f2328;
+      --muted: #59636e;
+      --line: #d1d9e0;
+      --accent: #0969da;
+      --soft: #f6f8fa;
+      --paper: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e6edf3;
+        --muted: #9198a1;
+        --line: #3d444d;
+        --accent: #4493f8;
+        --soft: #151b23;
+        --paper: #0d1117;
+      }
+    }
+    .box { fill: var(--soft); stroke: var(--line); stroke-width: 1.5; }
+    .core { fill: var(--paper); stroke: var(--accent); stroke-width: 2; }
+    .name { fill: var(--ink); font-size: 17px; font-weight: 650; }
+    .sub { fill: var(--muted); font-size: 12.5px; }
+    .flow { stroke: var(--accent); stroke-width: 2; fill: none; }
+    .flow-soft { stroke: var(--muted); stroke-width: 2; fill: none; stroke-dasharray: 5 5; }
+    .label { fill: var(--muted); font-size: 12.5px; }
+    .label-strong { fill: var(--accent); font-size: 13px; font-weight: 600; }
+    .url { fill: var(--accent); font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .note { fill: var(--muted); font-size: 12.5px; }
+  </style>
+
+  <defs>
+    <marker id="tip" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+    </marker>
+    <marker id="tip-soft" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)"/>
+    </marker>
+  </defs>
+
+  <!-- ── the three actors ─────────────────────────────────────────────── -->
+
+  <g>
+    <rect class="box" x="20" y="96" width="150" height="74" rx="12"/>
+    <text class="name" x="95" y="128" text-anchor="middle">agent</text>
+    <text class="sub"  x="95" y="148" text-anchor="middle">has a file worth reading</text>
+  </g>
+
+  <g>
+    <rect class="core" x="330" y="80" width="180" height="106" rx="14"/>
+    <text class="name" x="420" y="115" text-anchor="middle">share</text>
+    <text class="sub"  x="420" y="137" text-anchor="middle">sqlite + files on disk</text>
+    <text class="sub"  x="420" y="156" text-anchor="middle">gone in 15 days</text>
+  </g>
+
+  <g>
+    <rect class="box" x="670" y="96" width="150" height="74" rx="12"/>
+    <text class="name" x="745" y="128" text-anchor="middle">human</text>
+    <text class="sub"  x="745" y="148" text-anchor="middle">opens it in a browser</text>
+  </g>
+
+  <!-- ── agent → share, and the URL back ──────────────────────────────── -->
+
+  <path class="flow" d="M 170 118 L 322 118" marker-end="url(#tip)"/>
+  <text class="label-strong" x="246" y="108" text-anchor="middle">upload</text>
+
+  <path class="flow" d="M 322 150 L 170 150" marker-end="url(#tip)"/>
+  <text class="label" x="246" y="170" text-anchor="middle">one random URL</text>
+
+  <!-- ── human → share ───────────────────────────────────────────────── -->
+
+  <path class="flow" d="M 662 133 L 518 133" marker-end="url(#tip)"/>
+  <text class="label" x="590" y="123" text-anchor="middle">opens the URL</text>
+
+  <!-- ── agent hands the URL over, around the top ─────────────────────── -->
+
+  <path class="flow-soft" d="M 95 88 L 95 44 Q 95 30 109 30 L 731 30 Q 745 30 745 44 L 745 88"
+        marker-end="url(#tip-soft)"/>
+  <text class="note" x="420" y="22" text-anchor="middle">“here you go”</text>
+  <text class="url"  x="420" y="52" text-anchor="middle">https://share.your-net/f/rK7mQ2xB9vLp3nT8wY4hD6sZ1cF5gJ0a</text>
+
+  <!-- ── what the human actually sees ─────────────────────────────────── -->
+
+  <g>
+    <rect class="box" x="595" y="214" width="225" height="96" rx="12"/>
+    <text class="sub" x="612" y="240">name · size · expires in 14 days</text>
+    <line x1="612" y1="252" x2="803" y2="252" stroke="var(--line)" stroke-width="1"/>
+    <text class="sub" x="612" y="273">markdown with real typography,</text>
+    <text class="sub" x="612" y="291">drawn diagrams, images, PDFs</text>
+  </g>
+  <path class="flow-soft" d="M 745 178 L 745 206" marker-end="url(#tip-soft)"/>
+
+  <!-- ── the other direction ─────────────────────────────────────────── -->
+
+  <path class="flow-soft"
+        d="M 420 194 L 420 250 Q 420 264 406 264 L 109 264 Q 95 264 95 250 L 95 178"
+        marker-end="url(#tip-soft)"/>
+  <text class="note" x="258" y="290" text-anchor="middle">…and back: a human drops a file in,</text>
+  <text class="note" x="258" y="308" text-anchor="middle">and the agent reads it from the same URL</text>
+</svg>
