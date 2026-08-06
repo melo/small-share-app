@@ -2,6 +2,9 @@
 
 **Hand a file from an AI agent to a human being, and back.**
 
+**[melo.github.io/small-share-app](https://melo.github.io/small-share-app/)** — what
+it is, what it does, and how to run it, on one page.
+
 An agent uploads a markdown report, an image or a PDF and gets back one random
 URL. It gives that URL to a person, who opens it in a browser and *reads* the
 thing — markdown with real typography and drawn mermaid diagrams, images shown,
