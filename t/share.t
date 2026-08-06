@@ -58,17 +58,33 @@ sub _mcp ($method, $params = undef) {
 
 # ------------------------------------------------------------------ pages ----
 
-subtest 'the home page explains itself' => sub {
-  $t->get_ok('/')->status_is(200)->content_like(qr/hand a file/i)
-    ->content_like(qr{/mcp})->header_like('Content-Security-Policy' => qr/default-src 'none'/)
+subtest 'the home page is the uploader, and nothing else' => sub {
+  $t->get_ok('/')->status_is(200)
+    ->content_like(qr{<a class="brand" href="/">share</a>})
+    ->content_like(qr{<nav><a href="/how-to">How to use it</a></nav>})
+    ->content_like(qr{<section class="uploader">})
+    ->content_like(qr{<section class="recent" hidden>})
+    ->header_like('Content-Security-Policy' => qr/default-src 'none'/);
+
+  # The explanatory material moved to /how-to. If it creeps back onto the home
+  # page, the widget stops being the point of the page.
+  my $home = $t->tx->res->text;
+  unlike $home, qr/claude mcp add/, 'no setup instructions on the home page';
+  unlike $home, qr/The rules/,      'and no rules dump either';
+};
+
+subtest 'how-to carries what the home page used to' => sub {
+  $t->get_ok('/how-to')->status_is(200)->content_like(qr/How to use it/)
+    ->content_like(qr{claude mcp add --transport http share})
+    ->content_like(qr/get_upload_url/)
     ->content_like(qr/Office network only — ask #infra for access\./)
-    ->content_unlike(qr/Ã|â€/);    # double-encoded UTF-8, which is what a bytes bug looks like
+    ->content_unlike(qr/Ã|â€/)    # double-encoded UTF-8, what a bytes bug looks like
+    # No uploader here, so no script source is granted.
+    ->header_unlike('Content-Security-Policy' => qr/script-src/);
 };
 
 subtest 'the uploader is a plain form that works without JavaScript' => sub {
   $t->get_ok('/')->status_is(200)
-    ->content_like(qr{<details class="uploader">})
-    ->content_like(qr{<summary class="btn primary">Share a file with an agent</summary>})
     ->content_like(qr{<form action="/upload" method="POST" enctype="multipart/form-data">})
     ->content_like(qr{type="file" name="file" multiple})
     ->content_like(qr{/assets/upload\.js});
@@ -189,6 +205,71 @@ subtest 'PDFs go to the browser own viewer' => sub {
   $t->delete_ok("/api/v1/files/$pdf_id")->status_is(200);
 };
 
+subtest 'signed upload tickets' => sub {
+  my $res = _mcp('tools/call', {name => 'get_upload_url',
+    arguments => {filename => 'signed.md', session_id => 'tickets', title => 'Signed'}});
+  my $url = Mojo::URL->new(from_json($res->{result}{content}[0]{text})->{upload_url});
+
+  my $q = $url->query;
+  ok $q->param('sig'), 'the URL is signed';
+  ok $q->param('exp') > time, 'and carries an expiry';
+
+  # Untouched: it works.
+  $t->post_ok($url->path_query => form => {file => {content => "# ok\n", filename => 'signed.md'}})
+    ->status_is(201)->json_is('/title' => 'Signed');
+  my $made = $t->tx->res->json('/id');
+
+  # Every parameter is covered. Editing any of them invalidates the whole thing,
+  # which is the point: an agent cannot be handed a ticket for one session and
+  # quietly spend it on another.
+  for my $tamper (
+    [title      => 'Something else'],
+    [session_id => 'someone-else'],
+    [ttl_days   => '15'],
+    [filename   => 'other.md'],
+    [exp        => time + 86_400],
+  ) {
+    my $bad = $url->clone;
+    $bad->query->param(@$tamper);
+    $t->post_ok($bad->path_query => form => {file => {content => "x\n", filename => 'signed.md'}})
+      ->status_is(403)->json_like('/error' => qr/altered since it was issued/);
+  }
+
+  # An expired ticket is refused even though its signature is perfectly valid.
+  # Signed correctly, but for a moment that has passed. `sig` must be dropped
+  # before signing: the digest covers every OTHER parameter, so leaving the old
+  # one in would produce a signature over the wrong input and the request would
+  # be refused as tampered rather than as expired.
+  my $stale = Mojo::URL->new($url);
+  $stale->query->param(exp => time - 1);
+  my %fresh = %{$stale->query->to_hash};
+  delete $fresh{sig};
+  $stale->query->param(sig => $t->app->store->_signature(\%fresh));
+  $t->post_ok($stale->path_query => form => {file => {content => "x\n", filename => 'signed.md'}})
+    ->status_is(403)->json_like('/error' => qr/expired/);
+
+  $t->delete_ok("/api/v1/files/$made")->status_is(200);
+};
+
+subtest 'no route lets a client choose or overwrite an id' => sub {
+  # The worry a signed ticket is often reaching for is "can someone PUT to an id
+  # they picked". There is no PUT at all, and no route that modifies an existing
+  # file: every accepted upload mints a fresh secret from /dev/urandom.
+  my $mine = 'a' x 32;
+  $t->put_ok("/api/v1/files/$mine" => 'hello')->status_is(404);
+  $t->put_ok("/f/$mine" => 'hello')->status_is(404);
+  $t->put_ok('/api/v1/files' => 'hello')->status_is(404);
+
+  # The same bytes uploaded twice are two separate files with two ids.
+  my @ids;
+  for (1 .. 2) {
+    $t->post_ok('/api/v1/files?filename=twin.md' => "# twin\n")->status_is(201);
+    push @ids, $t->tx->res->json('/id');
+  }
+  isnt $ids[0], $ids[1], 'two uploads, two ids, no overwrite';
+  $t->delete_ok("/api/v1/files/$_")->status_is(200) for @ids;
+};
+
 # ----------------------------------------------------------------- viewer ----
 
 subtest 'the viewer frames the file and never leaks the secret' => sub {
@@ -240,7 +321,10 @@ subtest 'the browser upload path' => sub {
     ->content_like(qr/Give this URL to the agent/)
     # One click to copy, and hidden until upload.js wakes it up so that with
     # scripting off there is no dead button on the page.
-    ->content_like(qr{<button class="btn result-copy" type="button" data-copy="https://share\.example\.test/f/[A-Za-z0-9]{32}" hidden>Copy</button>});
+    ->content_like(qr{<button class="btn result-copy" type="button" data-copy="https://share\.example\.test/f/[A-Za-z0-9]{32}" hidden>Copy</button>})
+    # ...and enough metadata for upload.js to fold a no-JavaScript upload into
+    # the same localStorage history the scripted path writes.
+    ->content_like(qr{<li data-record="[^"]*expires_at[^"]*">});
 
   # Several at once, one of them bad: the good ones still land and the bad one
   # says why, rather than the whole batch failing.

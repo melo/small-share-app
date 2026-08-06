@@ -262,12 +262,17 @@ sub _tool_get_upload_url ($class, $c, $args) {
       . 'be checked against the bytes')
     unless defined $filename && length $filename;
 
-  my $url = Mojo::URL->new($c->base_url . '/api/v1/files');
-  my %query = (filename => $filename);
+  my @pairs = (filename => $filename);
   for my $key (qw(session_id title note ttl_days)) {
-    $query{$key} = $args->{$key} if defined $args->{$key} && length $args->{$key};
+    push @pairs, $key => $args->{$key} if defined $args->{$key} && length $args->{$key};
   }
-  $url->query(\%query);
+
+  # Signed and time-limited. Not access control — with no authentication anyone
+  # can POST to the endpoint directly — but it makes the parameters an agent was
+  # handed tamper-evident, and it stops a ticket being hoarded. See the long
+  # note in Share::Store above sign_query.
+  my $url = Mojo::URL->new($c->base_url . '/api/v1/files');
+  $url->query($c->store->sign_query(\@pairs));
 
   my $path = $args->{path} // "/path/to/$filename";
   my $command = sprintf q{curl -fsS -F 'file=@%s' '%s'}, $path, $url;
@@ -279,6 +284,7 @@ sub _tool_get_upload_url ($class, $c, $args) {
       body       => 'multipart/form-data with a part named "file"; or the raw bytes as '
         . 'the request body, since the filename is already in the query string',
       max_bytes  => 0 + $c->app->config->{max_bytes},
+      expires_in => 'one hour — get a fresh URL if you wait longer than that',
       next       => 'The JSON response contains "url" — give that to the human, and '
         . '"content_url" if you need to read the file back yourself.',
     },

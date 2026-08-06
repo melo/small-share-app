@@ -147,26 +147,36 @@ body.viewing { display: flex; flex-direction: column; overflow: hidden; }
 
 form { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.5rem; }
 
+/* ------------------------------------------------------------------ topbar */
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 0;
+}
+
+.topbar .brand {
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.topbar nav a { font-size: 0.9rem; }
+
+body.viewing .topbar { display: none; }
+
 /* ---------------------------------------------------------------- uploader */
 
-/* <details> is the whole expand/collapse mechanism — no JavaScript involved,
- * which is why the button works with scripting off. */
-.uploader { margin: 2rem 0 2.5rem; }
-
-.uploader > summary {
-  display: inline-block;      /* kills the default disclosure triangle */
-  list-style: none;
-  user-select: none;
-}
-
-.uploader > summary::-webkit-details-marker { display: none; }
-.uploader > summary::after { content: " ↓"; opacity: 0.6; }
-.uploader[open] > summary::after { content: " ↑"; }
-
-.uploader form {
-  display: block;
-  margin-top: 1rem;
-}
+/* Always open: on the home page this IS the page, so there is nothing to
+ * expand. Still a plain multipart form, so it works with scripting off. */
+.uploader { margin: 1.5rem 0 2.5rem; }
+.uploader form { display: block; }
 
 .dropzone {
   border: 2px dashed var(--line);
@@ -202,6 +212,21 @@ form { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.5rem; }
 
 .dropzone-go { display: flex; align-items: center; gap: 0.75rem; margin-top: 1rem; }
 .dropzone-note { color: var(--fg-muted); font-size: 0.85rem; }
+
+/* ------------------------------------------------------------------ recent */
+
+.recent { margin: 2.5rem 0 0; }
+
+.recent-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.recent-head h2 { font-size: 1rem; margin: 0; }
+.recent-clear { font-size: 0.75rem; padding: 0.25rem 0.6rem; }
+.recent-note { margin: 0.75rem 0 0; color: var(--fg-muted); font-size: 0.75rem; }
 
 /* ----------------------------------------------------------------- results */
 

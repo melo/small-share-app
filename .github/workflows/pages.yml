@@ -1,0 +1,75 @@
+# Publish the landing page at site/ to GitHub Pages.
+#
+# One static HTML file plus the favicon — no build step, no bundler, no CDN, the
+# same ethos as the app it describes. The whole job is "upload a directory".
+#
+# ONE-TIME SETUP: Settings -> Pages -> Build and deployment -> Source: GitHub
+# Actions. Without that this workflow runs and the deploy step fails with
+# "Pages site not found"; it is not something the workflow can turn on itself.
+#
+# The site is public once Pages is enabled, even while the repository is
+# private — worth knowing before enabling it on a repo that is not ready.
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and never cancel one in flight: a half-applied Pages
+# deploy is a broken site.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cheap, and catches the one failure mode a static site actually has: a
+      # link or an asset that does not exist in the artifact.
+      - name: Check the page is well-formed and self-contained
+        run: |
+          set -eu
+          test -f site/index.html
+          test -f site/share-icon.svg
+          python3 - <<'PY'
+          import re, pathlib, sys
+          html = pathlib.Path('site/index.html').read_text()
+
+          external = re.findall(r'(?:src|href)="(https?://[^"]+)"', html)
+          allowed = ('https://github.com/melo/small-share-app',)
+          bad = [u for u in external if not u.startswith(allowed)]
+          if bad:
+              sys.exit('external references that are not the repo link: %r' % bad)
+
+          local = re.findall(r'(?:src|href)="(?!https?:|#|mailto:)([^"]+)"', html)
+          missing = [f for f in local if not (pathlib.Path('site') / f).exists()]
+          if missing:
+              sys.exit('referenced files missing from site/: %r' % missing)
+
+          print('ok: %d local asset(s), no third-party requests' % len(local))
+          PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

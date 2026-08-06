@@ -17,7 +17,7 @@ use Mojo::Base -base, -signatures;
 use utf8;
 
 use Carp         qw(croak);
-use Digest::SHA  ();
+use Digest::SHA  qw(hmac_sha256_hex);
 use Exporter     qw(import);
 use Mojo::File   qw(path);
 use Mojo::SQLite ();
@@ -25,6 +25,8 @@ use Mojo::Util   qw(b64_decode);
 use POSIX        qw(strftime);
 
 our @EXPORT_OK = qw(human_duration human_size iso8601 payload_bytes);
+
+has 'key';    # HMAC secret for signed upload URLs; see _load_key
 
 has 'root';                       # Mojo::File — the workspace directory
 has 'sql';                        # Mojo::SQLite
@@ -75,8 +77,85 @@ sub init ($self) {
   my $sql = Mojo::SQLite->new->from_filename($root->child('share.db')->to_string,
     {wal_mode => 1, sqlite_busy_timeout => 10_000});
   $sql->migrations->name('share')->from_string(MIGRATIONS)->migrate;
+  $self->sql($sql);
+  $self->key($self->_load_key);
 
-  return $self->sql($sql);
+  return $self;
+}
+
+# The HMAC key for signed upload URLs.
+#
+# Generated once into the workspace rather than demanded as configuration,
+# because an operator forgetting to set it must not silently produce
+# unverifiable signatures. It sits beside the database it protects, 0600, and
+# survives redeploys because the workspace does. SHARE_SECRET_KEY overrides it
+# for anyone who would rather manage the key themselves.
+sub _load_key ($self) {
+  return $ENV{SHARE_SECRET_KEY} if defined $ENV{SHARE_SECRET_KEY} && length $ENV{SHARE_SECRET_KEY};
+
+  my $file = $self->root->child('share.key');
+  return $file->slurp =~ s/\s+\z//r if -s $file;
+
+  my $key = _token(64);
+  $file->spew($key);
+  chmod 0600, $file;
+  return $key;
+}
+
+# --------------------------------------------------- signed upload tickets ---
+#
+# What the signature is and is not.
+#
+# It is NOT access control. With no authentication, anything that can reach the
+# service can POST to /api/v1/files directly and does not need a ticket at all.
+#
+# What it buys, today: the parameters an agent was handed — session_id, title,
+# note, ttl_days — cannot be edited in transit or after the fact, and a ticket
+# stops working after an hour instead of being hoardable forever.
+#
+# What it buys later: this is the one place a real credential would be minted,
+# and the verification below is already sitting in the upload path. Turning
+# SHARE_REQUIRE_SIGNED_UPLOADS on makes tickets mandatory in one setting.
+#
+# NOTE for anyone reading this worried about the shape of the flow: the ticket
+# is a POST to a fixed collection endpoint. There is no PUT, no client-chosen
+# path, and no route anywhere in this app that modifies an existing file. Every
+# accepted upload mints a fresh server-generated secret from /dev/urandom.
+
+use constant TICKET_TTL => 3600;
+
+sub sign_query ($self, $pairs) {
+  my %query = (@$pairs, exp => time + TICKET_TTL);
+  $query{sig} = $self->_signature(\%query);
+  return \%query;
+}
+
+sub check_signature ($self, $query) {
+  my %given = %$query;
+  my $sig   = delete $given{sig};
+  return (0, 'this upload URL is not signed') unless defined $sig && length $sig;
+
+  my $expected = $self->_signature(\%given);
+  # Constant-time-ish: compare full strings, never a prefix, and never leak
+  # which byte differed.
+  return (0, 'this upload URL has been altered since it was issued')
+    unless length $sig == length $expected && $sig eq $expected;
+
+  my $exp = $given{exp} // 0;
+  return (0, 'this upload URL expired; ask for a new one') if $exp <= time;
+
+  return (1, undef);
+}
+
+# Canonical form: every parameter except the signature itself, sorted by name,
+# joined as name=value with a separator that cannot appear in a name. Sorting is
+# what stops a reordering from producing a different digest for the same URL;
+# the length prefix on each part is what stops "a=1&b=2" and "a=1&b=2" built
+# from different splits colliding.
+sub _signature ($self, $query) {
+  my $canonical = join '', map { sprintf '%d:%s=%d:%s', length $_, $_, length($query->{$_} // ''), $query->{$_} // '' }
+    sort keys %$query;
+  return hmac_sha256_hex($canonical, $self->key);
 }
 
 # ------------------------------------------------------------ classifying ----

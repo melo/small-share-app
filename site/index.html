@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>small-share-app — hand a file from an agent to a human</title>
+<meta name="description" content="Self-hosted. An AI agent uploads a report, a screenshot or a PDF and gets back one URL. The human opens it and reads the thing properly. Fifteen days later it is gone.">
+<link rel="icon" href="share-icon.svg" type="image/svg+xml">
+<!--
+  One file, no build step, no CDN, no fonts, no analytics — the same ethos as
+  the app it describes. Published to GitHub Pages by .github/workflows/pages.yml.
+-->
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --bg-soft: #f6f8fa;
+  --fg: #1f2328;
+  --fg-muted: #59636e;
+  --line: #d1d9e0;
+  --accent: #0969da;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --bg-soft: #151b23; --fg: #e6edf3;
+    --fg-muted: #9198a1; --line: #3d444d; --accent: #4493f8;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.65 var(--sans); -webkit-text-size-adjust: 100%;
+}
+a { color: var(--accent); }
+.wrap { max-width: 56rem; margin: 0 auto; padding: 0 1.5rem; }
+
+/* ------------------------------------------------------------------ topbar */
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  backdrop-filter: blur(10px);
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  border-bottom: 1px solid var(--line);
+}
+.topbar .wrap {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; padding-top: 0.85rem; padding-bottom: 0.85rem;
+}
+.brand { display: flex; align-items: center; gap: 0.55rem; font-weight: 700; letter-spacing: -0.02em; }
+.brand svg { width: 22px; height: 22px; }
+.topbar nav { display: flex; align-items: center; gap: 1.25rem; font-size: 0.9rem; }
+.gh {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  padding: 0.35rem 0.8rem; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--fg); text-decoration: none;
+}
+.gh:hover { border-color: var(--fg-muted); }
+.gh svg { width: 16px; height: 16px; fill: currentColor; }
+
+/* -------------------------------------------------------------------- hero */
+.hero { padding: 5rem 0 3.5rem; text-align: center; }
+.hero h1 {
+  font-size: clamp(2.2rem, 6vw, 3.4rem); line-height: 1.1;
+  letter-spacing: -0.035em; margin: 0 0 1rem;
+}
+.hero .tagline {
+  font-size: clamp(1.05rem, 2.4vw, 1.3rem); color: var(--fg-muted);
+  max-width: 40rem; margin: 0 auto 2rem;
+}
+.cta { display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap; }
+.btn {
+  display: inline-block; padding: 0.65rem 1.4rem; border-radius: 8px;
+  border: 1px solid var(--line); color: var(--fg);
+  text-decoration: none; font-size: 0.95rem; font-weight: 500;
+}
+.btn:hover { border-color: var(--fg-muted); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.08); }
+
+/* ------------------------------------------------------------------ figure */
+.flow {
+  margin: 3rem 0 0; padding: 1.5rem; overflow-x: auto;
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: 12px;
+}
+.flow pre { margin: 0; font-family: var(--mono); font-size: 0.78rem; line-height: 1.5; color: var(--fg-muted); }
+
+/* ----------------------------------------------------------------- section */
+section { padding: 3.5rem 0; border-top: 1px solid var(--line); }
+section h2 { font-size: 1.6rem; letter-spacing: -0.02em; margin: 0 0 0.5rem; }
+section .sub { color: var(--fg-muted); margin: 0 0 2rem; }
+
+.features { display: grid; gap: 1.25rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }
+.feature {
+  padding: 1.35rem; background: var(--bg-soft);
+  border: 1px solid var(--line); border-radius: 12px;
+}
+.feature h3 { margin: 0 0 0.4rem; font-size: 1rem; }
+.feature p { margin: 0; font-size: 0.9rem; color: var(--fg-muted); }
+.feature .icon { font-size: 1.3rem; line-height: 1; display: block; margin-bottom: 0.6rem; }
+
+pre.code {
+  margin: 0 0 1.25rem; padding: 1rem 1.15rem; overflow-x: auto;
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px;
+  font-family: var(--mono); font-size: 0.83rem; line-height: 1.6;
+}
+pre.code .c { color: var(--fg-muted); }
+
+ol.steps { margin: 0; padding-left: 1.3rem; }
+ol.steps li { margin-bottom: 1.5rem; }
+ol.steps h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+
+table.cfg { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+table.cfg th, table.cfg td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--line); }
+table.cfg th { color: var(--fg-muted); font-weight: 600; }
+table.cfg code { font-size: 0.85em; }
+
+code { font-family: var(--mono); background: var(--bg-soft); border-radius: 4px; padding: 0.1em 0.35em; }
+pre.code code { background: none; padding: 0; }
+
+.note {
+  padding: 1rem 1.15rem; border-left: 3px solid var(--accent);
+  background: var(--bg-soft); border-radius: 0 8px 8px 0; font-size: 0.9rem;
+}
+.note strong { color: var(--fg); }
+
+footer { padding: 2.5rem 0 4rem; border-top: 1px solid var(--line); color: var(--fg-muted); font-size: 0.85rem; }
+footer .wrap { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <span class="brand">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8.5 10.5H6.5A2.5 2.5 0 0 0 4 13v6.5A2.5 2.5 0 0 0 6.5 22h11a2.5 2.5 0 0 0 2.5-2.5V13a2.5 2.5 0 0 0-2.5-2.5h-2"/>
+        <path d="M12 15V3"/>
+        <path d="M7.75 7.25 12 3l4.25 4.25"/>
+      </svg>
+      small-share-app
+    </span>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a class="gh" href="https://github.com/melo/small-share-app">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="hero">
+    <h1>Hand a file from an agent<br>to a human. And back.</h1>
+    <p class="tagline">
+      Your AI agent produces something worth <em>looking</em> at. It uploads, gets
+      one URL, and hands it over. You open it and read the thing properly.
+      Fifteen days later it is gone.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="#install">Run it in two minutes</a>
+      <a class="btn" href="https://github.com/melo/small-share-app">Read the source</a>
+    </div>
+  </div>
+
+  <div class="flow">
+<pre>  agent ──POST /api/v1/files  (or MCP get_upload_url)──►┐
+                                                         │   small-share-app
+  agent ◄──── https://share.your-net/f/&lt;32 random chars&gt; ─┤
+    │                                                    │   sqlite + files on disk
+    │ "here you go"                                      │
+    ▼                                                    │
+  human ──opens the URL in a browser────────────────────►┘
+          header: name, size, uploaded, expires in 14d, [Download] [Delete]
+          below:  the file, rendered, in its own frame</pre>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="sub">One Perl process, one SQLite file, one directory of blobs. About 1,500 lines.</p>
+
+    <div class="features">
+      <div class="feature">
+        <span class="icon">📖</span>
+        <h3>Renders, does not just store</h3>
+        <p>Markdown gets real typography and drawn mermaid diagrams. Images are
+        shown. PDFs open in the browser's own viewer. Reading it is the point.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">🔌</span>
+        <h3>MCP built in</h3>
+        <p>A stateless Streamable HTTP server at <code>/mcp</code>. One line to
+        register, and it explains itself to the agent on connect.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">🪶</span>
+        <h3>No bytes through the model</h3>
+        <p>MCP tools hand out URLs; the agent moves files with curl. A 3 MB PDF
+        has no business passing through a context window.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">↩️</span>
+        <h3>Works both ways</h3>
+        <p>A drop zone on the home page, so you can hand a screenshot or a spec
+        <em>to</em> an agent and paste back the URL.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">⏳</span>
+        <h3>Expires by itself</h3>
+        <p>Files are deleted after fifteen days and the URL dies with them. This
+        is a hand-off, not storage — nothing to clean up later.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">🛡️</span>
+        <h3>Treats uploads as hostile</h3>
+        <p>An agent can be talked into writing anything. A sanitiser allowlist, a
+        sandboxed iframe with no same-origin, and a strict CSP. Three layers,
+        none trusted alone.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">📦</span>
+        <h3>One directory is the state</h3>
+        <p>No database server, no object store, no queue. Back up one folder and
+        you have backed up the service.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">🔒</span>
+        <h3>Private by default</h3>
+        <p>Ships with a Tailscale sidecar, so it lives on your tailnet with a
+        real certificate and no ports open to anyone else.</p>
+      </div>
+      <div class="feature">
+        <span class="icon">🧪</span>
+        <h3>Tested where it counts</h3>
+        <p>The image build runs the suite, so an image whose tests fail cannot be
+        published. 90% coverage floor, plus a browser suite that checks mermaid
+        really draws.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="sub">Docker and a Tailscale auth key. That is the whole list.</p>
+
+    <ol class="steps">
+      <li>
+        <h3>Get it and configure it</h3>
+        <pre class="code"><code>git clone https://github.com/melo/small-share-app
+cd small-share-app
+cp .env.example .env      <span class="c"># put a Tailscale auth key in it</span></code></pre>
+      </li>
+      <li>
+        <h3>Start it</h3>
+        <pre class="code"><code>docker compose up -d</code></pre>
+        <p>The app publishes no host ports. A <code>tailscale serve</code> sidecar
+        joins your tailnet as its own node, gets a Let's Encrypt certificate
+        automatically, and proxies to the app. You end up with
+        <code>https://share.&lt;your-tailnet&gt;.ts.net</code>.</p>
+      </li>
+      <li>
+        <h3>Point your agent at it</h3>
+        <pre class="code"><code>claude mcp add --transport http share https://share.&lt;your-tailnet&gt;.ts.net/mcp</code></pre>
+      </li>
+    </ol>
+
+    <p class="note">
+      <strong>No local Tailscale?</strong> <code>docker compose -f
+      docker-compose.local.yml up -d --build</code> runs it on
+      <code>127.0.0.1:8080</code> for you to put behind your own reverse proxy.
+    </p>
+  </div>
+</section>
+
+<section id="config">
+  <div class="wrap">
+    <h2>Configuration</h2>
+    <p class="sub">Environment variables, all optional except the auth key.</p>
+
+    <table class="cfg">
+      <tr><th>Variable</th><th>Default</th><th>What it does</th></tr>
+      <tr><td><code>TS_AUTHKEY</code></td><td>—</td><td>Tailscale auth key. Required for the tailnet stack.</td></tr>
+      <tr><td><code>TS_HOSTNAME</code></td><td><code>share</code></td><td>The node name, and so the hostname.</td></tr>
+      <tr><td><code>SHARE_TTL_DAYS</code></td><td><code>15</code></td><td>Retention, and the ceiling any upload may ask for.</td></tr>
+      <tr><td><code>SHARE_MAX_BYTES</code></td><td><code>33554432</code></td><td>Per-file limit. 32 MB.</td></tr>
+      <tr><td><code>SHARE_NOTICE</code></td><td>empty</td><td>One line of deployment truth — who can reach this, who to ask. Shown to humans and to agents.</td></tr>
+      <tr><td><code>SHARE_BASE_URL</code></td><td>from the request</td><td>The base of every URL handed out.</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="security">
+  <div class="wrap">
+    <h2>Before you deploy it</h2>
+    <p class="sub">One thing to understand, stated plainly.</p>
+    <p class="note">
+      <strong>There is no authentication.</strong> Anything that can reach the
+      port may upload, list and delete. That is a deliberate trade: it removes
+      the token-distribution problem entirely, so an agent container needs no
+      credential, no mount and no rotation. It is the right trade on a private
+      network and the wrong one on the open internet. The share URL itself is 32
+      characters from <code>/dev/urandom</code> — about 190 bits — and every
+      response carrying it is marked <code>noindex</code>,
+      <code>no-referrer</code> and <code>no-store</code>.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>MIT licensed. Built with Perl, Mojolicious and SQLite.</span>
+    <span><a href="https://github.com/melo/small-share-app">github.com/melo/small-share-app</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

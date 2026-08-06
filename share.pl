@@ -50,6 +50,12 @@ my %CFG = (
   # Mojo::Util::decode returns undef on malformed input; keep the raw bytes then
   # rather than silently blanking what the operator configured.
   notice => _decoded($ENV{SHARE_NOTICE}),
+
+  # Off by default: the plain `curl --data-binary @f.md '…?filename=f.md'` form
+  # is the documented path and should keep working out of the box. Turn it on
+  # and every upload must carry a signed ticket from the MCP get_upload_url
+  # tool. Only meaningful once there is something to authenticate.
+  require_signed_uploads => !!$ENV{SHARE_REQUIRE_SIGNED_UPLOADS},
 );
 
 sub _decoded ($value) {
@@ -112,10 +118,18 @@ Mojo::IOLoop->recurring(600 => $reap);
 
 # ------------------------------------------------------------------ pages ----
 
+# The home page IS the uploader. Everything explanatory moved to /how-to, one
+# click away, because the common visit is "I have a file to hand over" and not
+# "tell me what this is".
 get '/' => sub ($c) {
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1));
-  $c->render('index', stats => $store->stats, cfg => \%CFG);
+  $c->render('index', cfg => \%CFG);
 } => 'index';
+
+get '/how-to' => sub ($c) {
+  $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
+  $c->render('how_to', stats => $store->stats, cfg => \%CFG);
+} => 'how_to';
 
 # The other direction: a human hands a file to an agent.
 #
@@ -266,6 +280,16 @@ $api->get('/health' => sub ($c) {
 });
 
 $api->post('/files' => sub ($c) {
+  # A signed ticket from get_upload_url is verified if present. An unsigned
+  # upload is still accepted by default — `curl --data-binary @f.md '…?filename=f.md'`
+  # is the documented path and needs no ceremony — unless the operator has set
+  # SHARE_REQUIRE_SIGNED_UPLOADS, which makes tickets mandatory.
+  #
+  # There is deliberately no way to influence the stored id from out here: it
+  # comes from /dev/urandom inside Share::Store::add, and no route in this app
+  # updates an existing file. Two uploads of the same bytes are two files.
+  if (my $reason = _bad_ticket($c)) { return _api_error($c, 403, $reason) }
+
   my $args = eval { _upload_args($c) };
   return _api_error($c, 400, $@) if $@;
 
@@ -411,6 +435,22 @@ sub _upload_args ($c) {
   return {%args, bytes => $body, filename => $c->param('filename')};
 }
 
+# Returns a reason string when the request must be refused, undef when it may
+# proceed.
+sub _bad_ticket ($c) {
+  my %query = %{$c->req->url->query->to_hash};
+  my $signed = defined $query{sig} && length $query{sig};
+
+  return 'this deployment requires a signed upload URL; ask the MCP server for one '
+    . 'with get_upload_url'
+    if !$signed && $CFG{require_signed_uploads};
+
+  return undef unless $signed;
+
+  my ($ok, $reason) = $store->check_signature(\%query);
+  return $ok ? undef : $reason;
+}
+
 sub _bad ($message) { die {share_error => $message} }    ## no critic (RequireCarping)
 
 # Store failures arrive as {share_error => '…'} and are meant for whoever sent
@@ -461,6 +501,44 @@ app->start;
 
 __DATA__
 
+@@ uploader.html.ep
+%# Always open. This is the home page's reason to exist, so it is a plain
+%# section rather than a <details> anyone has to click first. It is still an
+%# ordinary multipart form: with JavaScript off it uploads and lands on /upload.
+<section class="uploader">
+  <form action="<%= url_for 'upload' %>" method="POST" enctype="multipart/form-data">
+    <div class="dropzone">
+      <p class="dropzone-headline">Drop files here</p>
+      <p class="dropzone-or">or paste a screenshot, or</p>
+      <label class="btn" for="upload-files">Choose files</label>
+      <input id="upload-files" type="file" name="file" multiple
+        accept=".md,.markdown,.mdown,.mkd,.txt,.png,.jpg,.jpeg,.gif,.webp,.svg,.heic,.heif,.pdf">
+      <p class="dropzone-hint">
+        Markdown, images and PDFs, up to <%= Share::Store::human_size($cfg->{max_bytes}) %> each.
+        Deleted after <%= $cfg->{ttl_days} %> days.
+      </p>
+    </div>
+    <div class="dropzone-go">
+      <button class="btn primary" type="submit">Upload</button>
+      <span class="dropzone-note">You get back a URL to give the agent.</span>
+    </div>
+  </form>
+
+  <ul class="results" hidden></ul>
+</section>
+
+%# Filled in by assets/upload.js from localStorage — this browser's own record
+%# of what it has sent, nothing the server knows or keeps.
+<section class="recent" hidden>
+  <div class="recent-head">
+    <h2>Recent uploads</h2>
+    <button class="btn recent-clear" type="button">Forget these</button>
+  </div>
+  <ul class="results recent-list"></ul>
+  <p class="recent-note">Kept in this browser only, for <%= $cfg->{ttl_days} %> days.
+  Clearing it does not delete anything from the server.</p>
+</section>
+
 @@ layouts/chrome.html.ep
 <!DOCTYPE html>
 <html lang="en">
@@ -475,6 +553,12 @@ __DATA__
     <link rel="stylesheet" href="/assets/share.css">
   </head>
   <body class="<%= stash('body_class') // '' %>">
+    % unless (stash 'bare') {
+    <header class="topbar">
+      <a class="brand" href="/">share</a>
+      <nav><a href="<%= url_for 'how_to' %>">How to use it</a></nav>
+    </header>
+    % }
 %= content
     % if (stash 'uploader') {
     <script src="/assets/upload.js"></script>
@@ -482,43 +566,19 @@ __DATA__
   </body>
 </html>
 
-@@ uploader.html.ep
-%# The button IS the disclosure control: <details>/<summary> expands the box in
-%# place with no navigation and no JavaScript. assets/upload.js then upgrades the
-%# form inside it — drag-and-drop, paste, progress, inline results — without
-%# changing what happens when scripting is off.
-<details class="uploader">
-  <summary class="btn primary">Share a file with an agent</summary>
-
-  <form action="<%= url_for 'upload' %>" method="POST" enctype="multipart/form-data">
-    <div class="dropzone">
-      <p class="dropzone-headline">Drop files here</p>
-      <p class="dropzone-or">or paste a screenshot, or</p>
-      <label class="btn" for="upload-files">Choose files</label>
-      <input id="upload-files" type="file" name="file" multiple
-        accept=".md,.markdown,.mdown,.mkd,.txt,.png,.jpg,.jpeg,.gif,.webp,.svg,.pdf">
-      <p class="dropzone-hint">
-        Markdown, images and PDFs, up to <%= Share::Store::human_size($cfg->{max_bytes}) %> each.
-        Deleted after <%= $cfg->{ttl_days} %> days.
-      </p>
-    </div>
-    <div class="dropzone-go">
-      <button class="btn primary" type="submit">Upload</button>
-      <span class="dropzone-note">You get back a URL to give the agent.</span>
-    </div>
-  </form>
-
-  <ul class="results" hidden></ul>
-</details>
-
 @@ index.html.ep
-% layout 'chrome', title => 'share — hand a file to a human', uploader => 1;
+% layout 'chrome', title => 'share — hand a file over', uploader => 1;
 <main class="prose">
-  <h1>share</h1>
-  <p class="lede">An agent has something you should <em>look</em> at. This is where it puts it.
-  It works the other way round too.</p>
-
+  <p class="lede">Hand a file to an agent, or to a person. You get one URL back.</p>
 %= include 'uploader', cfg => $cfg
+</main>
+
+@@ how_to.html.ep
+% layout 'chrome', title => 'share — how to use it';
+<main class="prose">
+  <h1>How to use it</h1>
+  <p class="lede">An agent has something you should <em>look</em> at. This is where it
+  puts it — and it works the other way round too.</p>
 
   <p>An agent uploads a markdown report, an image or a PDF and gets back one
   random URL. It gives you that URL; you open it and read the thing properly —
@@ -529,10 +589,10 @@ __DATA__
   with them. This is a hand-off, not storage. Right now it is holding
   <%= $stats->{files} %> file<%= $stats->{files} == 1 ? '' : 's' %>.</p>
 
-  <h2>Sending one the other way</h2>
-  <p>Use the button above. You get a URL back; paste it into the conversation and
-  the agent can read the file with <code>get_shared_file</code>, or just fetch
-  the URL. Same rules, same expiry — it is one pipe, pointing both ways.</p>
+  <h2>Sending one to an agent</h2>
+  <p>Use the drop zone on the <a href="/">home page</a>. You get a URL back; paste
+  it into the conversation and the agent can read the file. Same rules, same
+  expiry — it is one pipe, pointing both ways.</p>
 
   <h2>For agents</h2>
   <p>The easy way is MCP. Register it once:</p>
@@ -556,7 +616,7 @@ __DATA__
 
   <h2>The rules</h2>
   <ul>
-    <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg</code>)
+    <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg .heic</code>)
       and <code>.pdf</code>. Nothing else, and the extension has to match the bytes.</li>
     <li>At most <%= Share::Store::human_size($cfg->{max_bytes}) %> per file.</li>
     <li>The URL is the only credential. It is unguessable — treat it as a secret,
@@ -664,7 +724,9 @@ __DATA__
   <ul class="results">
     % for my $r (@$results) {
       % if (my $f = $r->{file}) {
-    <li>
+    %# data-record is what lets assets/upload.js fold a no-JavaScript upload into
+    %# the same localStorage history the scripted path writes.
+    <li data-record="<%= Mojo::JSON::to_json({map { $_ => $f->{$_} } qw(id url filename kind size_human created_at expires_at)}) %>">
       <span class="result-name"><%= $f->{filename} %></span>
       <span class="result-meta"><%= $f->{kind} %>, <%= $f->{size_human} %>, expires in <%= $f->{expires_in} %></span>
       <a class="result-url" href="<%= $f->{url} %>"><%= $f->{url} %></a>

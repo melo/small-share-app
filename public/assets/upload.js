@@ -2,10 +2,10 @@
  * to copy.
  *
  * Everything here is an enhancement and nothing is load-bearing: the markup is a
- * plain multipart <form> inside a <details>, so with scripting off the button
- * still expands the box and the upload still works, landing on /upload. What
- * this adds is drag-and-drop, paste, a progress bar per file, results that
- * appear in the page instead of navigating away from it, and the Copy buttons.
+ * plain multipart <form>, so with scripting off the upload still works and
+ * lands on /upload. What this adds is drag-and-drop, paste, a progress bar per
+ * file, results that appear in the page instead of navigating away from it, the
+ * Copy buttons, and the "recent uploads" history kept in localStorage.
  *
  * Hand-written rather than a library. Dropzone.js is the obvious candidate and
  * its stable line has not moved since 2021; this is ~200 lines, has no styling
@@ -77,15 +77,120 @@
   var buttons = document.querySelectorAll('button[data-copy]');
   for (var i = 0; i < buttons.length; i++) wireCopy(buttons[i], buttons[i].getAttribute('data-copy'));
 
+  // --------------------------------------------------------------- history --
+
+  // This browser's own record of what it has sent. The server keeps no such
+  // list -- there is deliberately no "everything" endpoint -- so if it is not
+  // here it does not exist anywhere.
+  var STORE_KEY = 'share.recent';
+  var STORE_MAX = 200;
+
+  function readHistory() {
+    var raw;
+    try { raw = window.localStorage.getItem(STORE_KEY); } catch (err) { return []; }
+    if (!raw) return [];
+
+    var rows;
+    try { rows = JSON.parse(raw); } catch (err) { return []; }
+    if (!Array.isArray(rows)) return [];
+
+    // Drop anything the server has already reaped, so the list never offers a
+    // link that 404s.
+    var now = Date.now();
+    return rows.filter(function (r) {
+      return r && r.url && r.expires_at && Date.parse(r.expires_at) > now;
+    });
+  }
+
+  function writeHistory(rows) {
+    try { window.localStorage.setItem(STORE_KEY, JSON.stringify(rows.slice(0, STORE_MAX))); }
+    catch (err) { /* private mode, or full: the upload still worked */ }
+  }
+
+  function remember(record) {
+    if (!record || !record.url) return;
+    var rows = readHistory().filter(function (r) { return r.id !== record.id; });
+    rows.unshift(record);
+    writeHistory(rows);
+    renderHistory();
+  }
+
+  var recent = document.querySelector('.recent');
+  var recentList = recent && recent.querySelector('.recent-list');
+
+  function renderHistory() {
+    if (!recent || !recentList) return;
+    var rows = readHistory();
+    writeHistory(rows);                 // persist the pruning
+
+    recentList.textContent = '';
+    recent.hidden = rows.length === 0;
+
+    rows.forEach(function (r) {
+      var li = document.createElement('li');
+
+      var name = document.createElement('span');
+      name.className = 'result-name';
+      name.textContent = r.filename || r.id;
+
+      var meta = document.createElement('span');
+      meta.className = 'result-meta';
+      meta.textContent = [r.kind, r.size_human, 'expires ' + relative(r.expires_at)]
+        .filter(Boolean).join(', ');
+
+      var link = document.createElement('a');
+      link.className = 'result-url';
+      link.href = r.url;
+      link.textContent = r.url;
+
+      li.appendChild(name);
+      li.appendChild(meta);
+      li.appendChild(link);
+      li.appendChild(newCopyButton(r.url));
+      recentList.appendChild(li);
+    });
+  }
+
+  // "in 14 days" / "in 6 hours" — the same shape the server uses, so the two
+  // never read as different units for the same file.
+  function relative(when) {
+    var left = Date.parse(when) - Date.now();
+    if (!(left > 0)) return 'now';
+    var day = 86400000, hour = 3600000, minute = 60000;
+    if (left >= day) return 'in ' + plural(Math.floor(left / day), 'day');
+    if (left >= hour) return 'in ' + plural(Math.floor(left / hour), 'hour');
+    if (left >= minute) return 'in ' + plural(Math.floor(left / minute), 'minute');
+    return 'in less than a minute';
+  }
+
+  function plural(n, unit) { return n + ' ' + unit + (n === 1 ? '' : 's'); }
+
+  if (recent) {
+    var clear = recent.querySelector('.recent-clear');
+    if (clear) {
+      clear.addEventListener('click', function () {
+        writeHistory([]);
+        renderHistory();
+      });
+    }
+    renderHistory();
+  }
+
+  // Fold a no-JavaScript upload — one that landed on /upload and came back as
+  // server-rendered HTML — into the same history.
+  document.querySelectorAll('li[data-record]').forEach(function (li) {
+    try { remember(JSON.parse(li.getAttribute('data-record'))); } catch (err) { /* ignore */ }
+  });
+
   // -------------------------------------------------------------- uploader --
 
-  var details = document.querySelector('details.uploader');
-  if (!details) return;
+  var uploader = document.querySelector('.uploader');
+  if (!uploader) return;
 
-  var form = details.querySelector('form');
-  var zone = details.querySelector('.dropzone');
-  var input = details.querySelector('input[type=file]');
-  var results = details.querySelector('.results');
+  var form = uploader.querySelector('form');
+  var zone = uploader.querySelector('.dropzone');
+  var input = uploader.querySelector('input[type=file]');
+  var results = uploader.querySelector('.results');
 
   // If any of this is missing, or the browser is too old for FormData/XHR2,
   // leave the plain form alone — it works.
@@ -115,11 +220,9 @@
     if (ev.dataTransfer && ev.dataTransfer.files) enqueue(ev.dataTransfer.files);
   });
 
-  // The whole point of a share service, most days, is a screenshot. Only while
-  // the box is open, so ctrl-V elsewhere on the page still does nothing
-  // surprising.
+  // The whole point of a share service, most days, is a screenshot.
   document.addEventListener('paste', function (ev) {
-    if (!details.open || !ev.clipboardData) return;
+    if (!ev.clipboardData) return;
     var files = ev.clipboardData.files;
     if (files && files.length) {
       ev.preventDefault();
@@ -229,6 +332,11 @@
 
     row.li.appendChild(link);
     row.li.appendChild(newCopyButton(data.url));
+
+    remember({
+      id: data.id, url: data.url, filename: data.filename, kind: data.kind,
+      size_human: data.size_human, created_at: data.created_at, expires_at: data.expires_at
+    });
   }
 
   function fail(row, message) {

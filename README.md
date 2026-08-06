@@ -156,16 +156,24 @@ useful for a client that has HTTP but no shell.
 
 ### The web page
 
-The home page explains itself and carries a **Share a file with an agent**
-button. It expands a drop zone in place — drag files in, paste a screenshot, or
-pick them — and gives back each URL with a one-click **Copy** button.
+**The home page *is* the drop zone**, always open — drag files in, paste a
+screenshot, or pick them, and get back each URL with a one-click **Copy**
+button. Everything explanatory lives at `/how-to`, one link away in the top bar,
+because the common visit is "I have a file to hand over" and not "tell me what
+this is".
 
-The button is a `<details>`/`<summary>` around a plain multipart form, so it
-expands and uploads with JavaScript switched off entirely.
-`public/assets/upload.js` only upgrades that same form with drag-and-drop,
-paste, per-file progress and inline results. It is hand-written rather than
-Dropzone.js, whose stable line has not moved since 2021: ~200 lines, no styling
-opinions to fight, and no CSP exemption of its own.
+Below the drop zone, **Recent uploads** lists what this browser has sent, newest
+first, with expiry countdowns and Copy buttons. It is `localStorage` only —
+the server keeps no such list, and there is deliberately no "everything"
+endpoint — so it is pruned as files expire, and *Forget these* clears the
+browser's memory without deleting anything from the server.
+
+It is still a plain multipart form: with JavaScript off it uploads and lands on
+a result page saying the same things. `public/assets/upload.js` only upgrades
+that same form with drag-and-drop, paste, per-file progress, inline results, the
+Copy buttons and the history. Hand-written rather than Dropzone.js, whose stable
+line has not moved since 2021: ~300 lines, no styling opinions to fight, and no
+CSP exemption of its own.
 
 ## Configuration
 
@@ -177,7 +185,9 @@ All of it is environment variables. All of it is optional except where noted.
 | `SHARE_BASE_URL` | derived from the request | the base of every URL handed out |
 | `SHARE_TTL_DAYS` | `15` | retention, and the ceiling an upload may ask for |
 | `SHARE_MAX_BYTES` | `33554432` | per-file limit |
-| `SHARE_NOTICE` | empty | one line of deployment truth, shown on the home page and in the MCP instructions |
+| `SHARE_NOTICE` | empty | one line of deployment truth, shown on `/how-to` and in the MCP instructions |
+| `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
+| `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
 | `MOJO_REVERSE_PROXY` | `0` | set to `1` behind a proxy that sets `X-Forwarded-*` |
 | `TS_AUTHKEY` | — | **required** for the Tailscale stack |
 | `TS_HOSTNAME` | `share` | the node name, and therefore the hostname |
@@ -244,6 +254,20 @@ writing anything. Three independent layers, none trusted alone:
 SVGs are previewed through an `<img>` tag, which never executes script, and
 their raw bytes carry `Content-Security-Policy: sandbox` so that navigating
 straight to them cannot execute them in the app's origin either.
+
+**Upload URLs are signed.** `get_upload_url` returns a URL carrying an `exp` and
+an HMAC `sig` over every other parameter, valid for an hour. Editing the
+`session_id`, `title`, `ttl_days` or expiry invalidates it. To be clear about
+what that is and is not: with no authentication it is **not** access control —
+anything that can reach the service can POST to the endpoint directly. What it
+buys today is that a ticket cannot be altered in transit or hoarded forever, and
+what it buys later is a place for a real credential to live. Set
+`SHARE_REQUIRE_SIGNED_UPLOADS=1` to make tickets mandatory.
+
+**No route lets a client choose or overwrite an id.** There is no `PUT`
+anywhere, no client-supplied path, and nothing that modifies a stored file.
+Every accepted upload mints a fresh secret from `/dev/urandom`; the same bytes
+uploaded twice are two files.
 
 **The declared type must match the bytes.** Every upload is classified by
 extension *and* by magic bytes. A `.png` that is really a PDF is rejected rather
