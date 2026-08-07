@@ -211,6 +211,13 @@ CSP exemption of its own.
 
 All of it is environment variables. All of it is optional except where noted.
 
+Two sets of them, and it is worth knowing which is which: the first is read by
+the process, the second only by `docker compose` when it builds the stack around
+it. Setting one from the wrong table is silently ignored, which is a miserable
+thing to debug.
+
+**Read by the app:**
+
 | variable | default | what it does |
 |---|---|---|
 | `SHARE_ROOT` | `/workspace` | the one directory: `share.db` + `files/` |
@@ -218,15 +225,37 @@ All of it is environment variables. All of it is optional except where noted.
 | `SHARE_TTL_DAYS` | `15` | retention, and the ceiling an upload may ask for |
 | `SHARE_MAX_BYTES` | `33554432` | per-file limit |
 | `SHARE_NOTICE` | empty | one line of deployment truth, shown on `/how-to` and in the MCP instructions |
-| `SHARE_MAX_TOTAL_BYTES` | 50 GB | ceiling on everything held at once; the oldest are evicted over it |
+| `SHARE_MAX_TOTAL_BYTES` | `53687091200` (50 GB) | ceiling on everything held at once; the oldest are evicted over it. `0` disables |
 | `SHARE_RATE_PER_SECOND` | `1` | upload attempts per client per second; `0` disables |
 | `SHARE_RATE_PER_MINUTE` | `10` | upload attempts per client per minute; `0` disables |
 | `SHARE_HEALTH_DETAIL` | off | let `/api/v1/health` report files and bytes held. **Leave off in public.** |
 | `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
 | `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
+| `SHARE_PORT` | `8080` | the port `bin/health-check` probes inside the container |
 | `MOJO_REVERSE_PROXY` | `0` | set to `1` behind a proxy that sets `X-Forwarded-*` |
-| `TS_AUTHKEY` | — | **required** for the Tailscale stack |
-| `TS_HOSTNAME` | `share` | the node name, and therefore the hostname |
+| `MOJO_MODE` | `production` | Mojolicious run mode; the compose files all set it |
+
+**Read by the compose files only.** The app never sees these — they decide what
+is built around it.
+
+| variable | default | what it does | used by |
+|---|---|---|---|
+| `SHARE_DATA` | `./data` | host directory holding `share.db` and `files/` | all |
+| `SHARE_UID` / `SHARE_GID` | `1000` | uid/gid the container runs as, so files it writes belong to a real host account | all |
+| `SHARE_IMAGE` | `ghcr.io/melo/small-share-app:latest` | which image to run; `docker compose build` overrides it | all |
+| `SHARE_PORT` | `8080` | **host** port to publish on `127.0.0.1` | `docker-compose.local.yml` |
+| `SHARE_LOOPBACK_PORT` | `3310` | **host** port tsdproxy reaches the app on | `docker-compose.tsdproxy.yml` |
+| `SHARE_HOST` | — | **required**; the hostname Traefik routes, e.g. `share.example.com` | `docker-compose.traefik.yml` |
+| `TRAEFIK_ROUTER` | `share` | name of the Traefik router and service | `docker-compose.traefik.yml` |
+| `TRAEFIK_ENTRYPOINT` | `websecure` | Traefik entrypoint to attach to | `docker-compose.traefik.yml` |
+| `TS_AUTHKEY` | — | **required** for the Tailscale stack | `docker-compose.yml` |
+| `TS_HOSTNAME` | `share` | the node name, and therefore the hostname | `docker-compose.yml` |
+| `TS_CERT_DOMAIN` | — | substituted by the Tailscale container itself at startup; do not set it | `docker-compose.yml` |
+
+`SHARE_PORT` appears in both tables and means two different things: inside the
+container it is what the health probe knocks on, and in the local compose file
+it is the host port. They only coincide because the app always listens on 8080
+inside.
 
 `SHARE_NOTICE` is worth setting. It is the one thing the code cannot know —
 "Reachable on the office VPN only", "ask #infra for access" — and it reaches

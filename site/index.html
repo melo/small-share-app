@@ -308,7 +308,16 @@ cp .env.example .env      <span class="c"># put a Tailscale auth key in it</span
       <tr><td><code>SHARE_MAX_BYTES</code></td><td><code>33554432</code></td><td>Per-file limit. 32 MB.</td></tr>
       <tr><td><code>SHARE_NOTICE</code></td><td>empty</td><td>One line of deployment truth — who can reach this, who to ask. Shown to humans and to agents.</td></tr>
       <tr><td><code>SHARE_BASE_URL</code></td><td>from the request</td><td>The base of every URL handed out.</td></tr>
+      <tr><td><code>SHARE_MAX_TOTAL_BYTES</code></td><td><code>53687091200</code></td><td>Ceiling on everything held at once. 50 GB. Over it the oldest files are evicted — a full disk takes the service down, a lost old file does not.</td></tr>
+      <tr><td><code>SHARE_RATE_PER_SECOND</code></td><td><code>1</code></td><td>Upload attempts per caller per second. <code>0</code> disables.</td></tr>
+      <tr><td><code>SHARE_RATE_PER_MINUTE</code></td><td><code>10</code></td><td>Upload attempts per caller per minute. <code>0</code> disables.</td></tr>
+      <tr><td><code>SHARE_HEALTH_DETAIL</code></td><td>off</td><td>Let <code>/api/v1/health</code> report files and bytes held. Leave it off in public — it is inventory.</td></tr>
     </table>
+
+    <p class="sub">Those are the ones worth knowing about. The
+    <a href="https://github.com/melo/small-share-app#configuration">README</a>
+    has the rest, including the ones the compose files read rather than the
+    app.</p>
   </div>
 </section>
 
