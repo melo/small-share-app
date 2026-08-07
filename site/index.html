@@ -89,8 +89,13 @@ a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset:
 .btn.primary:hover { filter: brightness(1.08); }
 
 /* ------------------------------------------------------------------ figure */
+/* The 3.5rem below is not decoration. This card is the only block on the page
+ * that sits OUTSIDE a <section>, so it never got the 3.5rem of bottom padding
+ * every section contributes above the next one's rule — and its own bottom
+ * border landed exactly on that rule. Two coincident lines, one inset and one
+ * full-bleed, read as a broken border rather than as a separator. */
 .flow {
-  margin: 3rem 0 0; padding: 1.5rem; overflow-x: auto;
+  margin: 3rem 0 3.5rem; padding: 1.5rem; overflow-x: auto;
   background: var(--bg-soft); border: 1px solid var(--line); border-radius: 12px;
 }
 /* The SVG carries its own light/dark rules — it is loaded as an <img>, so it
