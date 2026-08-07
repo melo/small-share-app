@@ -4,7 +4,9 @@
 #
 # An agent uploads a markdown report, an image or a PDF and gets back one random
 # URL. It gives that URL to a person, who opens it in a browser and reads the
-# thing properly. Fifteen days later the file is gone and so is the URL.
+# thing properly. Office and OpenDocument files and zips are held too, and
+# handed over as a download rather than rendered — see %PREVIEWABLE below.
+# Fifteen days later the file is gone and so is the URL.
 #
 # Four faces on the same app:
 #
@@ -708,9 +710,10 @@ __DATA__
       <p class="dropzone-or">or paste a screenshot, or</p>
       <label class="btn" for="upload-files">Choose files</label>
       <input id="upload-files" type="file" name="file" multiple
-        accept=".md,.markdown,.mdown,.mkd,.txt,.png,.jpg,.jpeg,.gif,.webp,.svg,.heic,.heif,.pdf">
+        accept=".md,.markdown,.mdown,.mkd,.txt,.png,.jpg,.jpeg,.gif,.webp,.svg,.heic,.heif,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.odg,.zip">
       <p class="dropzone-hint">
-        Markdown, images and PDFs, up to <%= Share::Store::human_size($cfg->{max_bytes}) %> each.
+        Markdown, images, PDFs, Office and OpenDocument files and zips, up to
+        <%= Share::Store::human_size($cfg->{max_bytes}) %> each.
         Deleted after <%= $cfg->{ttl_days} %> days.
       </p>
     </div>
@@ -827,6 +830,10 @@ __DATA__
   markdown with real typography and drawn mermaid diagrams, images shown, PDFs
   in your browser's own viewer.</p>
 
+  <p>Office and OpenDocument files and zips are held too, but not rendered: a
+  browser cannot draw a spreadsheet and this is not a converter. Those pages
+  offer the download and say so.</p>
+
   <p><strong>Files are deleted <%= $cfg->{ttl_days} %> days after upload</strong> and the URL dies
   with them. This is a hand-off, not storage.</p>
 
@@ -858,7 +865,10 @@ __DATA__
   <h2>The rules</h2>
   <ul>
     <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg .heic</code>)
-      and <code>.pdf</code>. Nothing else, and the extension has to match the bytes.</li>
+      and <code>.pdf</code>, which are rendered here; Office and OpenDocument files
+      (<code>.doc .docx .xls .xlsx .ppt .pptx .odt .ods .odp .odg</code>) and
+      <code>.zip</code>, which are download-only. Nothing else, and the extension has
+      to match the bytes.</li>
     <li>At most <%= Share::Store::human_size($cfg->{max_bytes}) %> per file.</li>
     <li>The URL is the only credential. It is unguessable — treat it as a secret,
       because anyone holding it can read the file and delete it.</li>
@@ -934,8 +944,10 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 
   <h2>Limits</h2>
   <ul>
-    <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg .heic</code>)
-      and <code>.pdf</code>. The extension must match the actual bytes.</li>
+    <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg .heic</code>),
+      <code>.pdf</code>, Office and OpenDocument files
+      (<code>.doc .docx .xls .xlsx .ppt .pptx .odt .ods .odp .odg</code>) and
+      <code>.zip</code>. The extension must match the actual bytes.</li>
     <li>At most <%= Share::Store::human_size($cfg->{max_bytes}) %> per file.</li>
     % if ($cfg->{rate_per_second} || $cfg->{rate_per_minute}) {
     <li><strong>Uploads are rate limited</strong>:

@@ -8,8 +8,9 @@ it is, what it does, and how to run it, on one page.
 An agent uploads a markdown report, an image or a PDF and gets back one random
 URL. It gives that URL to a person, who opens it in a browser and *reads* the
 thing — markdown with real typography and drawn mermaid diagrams, images shown,
-PDFs in the browser's own viewer. Fifteen days later the file is gone and so is
-the URL.
+PDFs in the browser's own viewer. Office and OpenDocument files and zips are
+held too and handed over as a download, because a browser cannot render one and
+this is not a converter. Fifteen days later the file is gone and so is the URL.
 
 It works the other way too: the home page has a drop zone, so a human can hand a
 screenshot or a spec to an agent and paste back the URL.
@@ -343,8 +344,12 @@ than stored and served with a lying `Content-Type`. HEIC is accepted — it is
 what phones produce — but the viewer says plainly that only Safari can display
 one, rather than showing a broken image icon.
 
-**Chrome pages run with no script source at all.** Only the two pages carrying
-the uploader get `script-src 'self'`, and they ask for it by name.
+**Script is granted per route, by name.** Most chrome pages run with no script
+source at all. The two carrying the uploader ask for `script-src 'self'` and
+`connect-src 'self'` — the second only for the progress bar's XHR — and the
+viewer asks for `script-src 'self'` alone, which is what a Copy button costs.
+Nothing else gets either, and the menu and the file bar's fold are a checkbox
+and a `<label>` so they work regardless.
 
 ## What it is made of
 

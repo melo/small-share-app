@@ -89,7 +89,8 @@ delete anything.
 They open the URL in a browser and see the file's name, size and expiry at the
 top, with the file itself rendered below: markdown gets real typography and
 mermaid diagrams get drawn, images are displayed, PDFs open in the browser's own
-viewer.
+viewer. An Office document, an OpenDocument file or a zip is held and handed
+over as a download instead — there is nothing a browser can render.
 
 Use it whenever the answer is something to LOOK at rather than to read in a
 terminal: a long report, a generated diagram, a screenshot, a PDF.
@@ -100,9 +101,12 @@ not ask this server for the contents; it will only ever give you the URL.
 
 Things worth knowing:
 
-  * Only markdown (.md), images (.png .jpg .gif .webp .svg .heic) and .pdf are
-    accepted, up to %s each. The extension on the filename must match the
-    actual bytes, or the upload is refused.
+  * Markdown (.md), images (.png .jpg .gif .webp .svg .heic) and .pdf are
+    rendered on the page. Office and OpenDocument files (.doc .docx .xls .xlsx
+    .ppt .pptx .odt .ods .odp .odg) and .zip are held and handed over as a
+    download — no preview, because a browser cannot draw one. Nothing else is
+    accepted, files are at most %s each, and the extension on the filename must
+    match the actual bytes or the upload is refused.
   * Files are deleted %s days after upload and the URL dies with them. Pass
     ttl_days for something shorter. Nothing here is durable storage.
   * The share URL is unguessable, but treat it as a secret: anyone holding it
@@ -134,8 +138,10 @@ sub _tools ($server) {
       required   => ['filename'],
       properties => {
         filename => _str('The name to store it under, WITH an extension: .md, .png, '
-            . '.jpg, .gif, .webp, .svg, .heic or .pdf. The extension must match the '
-            . 'actual bytes or the upload is refused.'),
+            . '.jpg, .gif, .webp, .svg, .heic or .pdf, which get rendered on the page; '
+            . 'or .doc/.docx/.xls/.xlsx/.ppt/.pptx/.odt/.ods/.odp/.odg/.zip, which are '
+            . 'download-only. The extension must match the actual bytes or the upload '
+            . 'is refused.'),
         path => _str('Where the file is on your disk. Only used to write the example '
             . 'command for you; this server never sees it.'),
         session_id => _str('Your session id, so list_shared_files can find this later.'),

@@ -136,6 +136,9 @@ subtest 'how-to carries what the home page used to' => sub {
     ->content_like(qr{claude mcp add --transport http share})
     ->content_like(qr/get_upload_url/)
     ->content_like(qr/Office network only — ask #infra for access\./)
+    # The formats the service holds but will not render are on the page a human
+    # is sent to when they ask what this thing takes.
+    ->content_like(qr/download-only/)->content_like(qr/\.odt/)
     ->content_unlike(qr/Ã|â€/)    # double-encoded UTF-8, what a bytes bug looks like
     # No uploader here, so no script source is granted.
     ->header_unlike('Content-Security-Policy' => qr/script-src/);
@@ -780,7 +783,10 @@ subtest 'MCP: server/discover replaces the handshake' => sub {
   # telling every agent the old numbers.
   my $instructions = $res->{result}{instructions};
   like $instructions, qr/deleted 15 days after upload/,  'the real retention';
-  like $instructions, qr/up to 32\.0 MB each/,           'the real size cap';
+  # The wording wraps, so match across the break rather than guessing where it
+  # falls.
+  like $instructions, qr/at\s+most\s+32\.0 MB each/,     'the real size cap';
+  like $instructions, qr/\.docx/, 'and the document formats it will hold but not render';
   like $instructions, qr/Office network only — ask #infra for access\./,
     'and the deployment notice the operator set, decoded exactly once';
   # The text wraps, so the phrase spans a newline — match across it rather than

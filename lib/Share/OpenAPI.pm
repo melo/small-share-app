@@ -68,7 +68,8 @@ sub document ($class, $c) {
       description => join("\n\n",
         'Upload a markdown document, an image or a PDF and get back one random URL. '
           . 'Give that URL to a person; they open it in a browser and read the file '
-          . 'rendered properly. It is deleted after '
+          . 'rendered properly. Office and OpenDocument files and zips are held too, '
+          . 'and handed over as a download rather than rendered. It is deleted after '
           . $cfg->{ttl_days} . ' days and the URL dies with it.',
         '**There is no authentication.** Anything that can reach this service may '
           . 'upload and list. Deleting is the exception: it needs the `delete_password` '
@@ -287,7 +288,7 @@ sub document ($class, $c) {
             url          => {type => 'string', format => 'uri', description => 'The page for a human.'},
             content_url  => {type => 'string', format => 'uri', description => 'The bytes, for a machine.'},
             filename     => {type => 'string'},
-            kind         => {type => 'string', enum => [qw(markdown image pdf)]},
+            kind         => {type => 'string', enum => [qw(markdown image pdf document archive)]},
             content_type => {type => 'string'},
             size         => {type => 'integer', maximum => $max},
             size_human   => {type => 'string'},
