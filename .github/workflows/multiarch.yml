@@ -1,0 +1,78 @@
+# Build both architectures on any branch that is not main. Publish neither.
+#
+# This exists because releases stopped being multi-arch. The arm64 leg fails in
+# `pdi-build-deps` under QEMU, and it had been failing silently for two
+# releases — v1.1.0 and v1.2.0 were tagged and never reached GHCR, because the
+# only thing anybody watched was whether main was green, and main was amd64.
+#
+# So arm64 gets a place to be broken in the open. Push a branch, and both
+# architectures build here, through the full image — not just the `builder`
+# target — so the runtime stage is exercised too. Nothing is pushed to any
+# registry and nothing is tagged: this is a question ("does it build?"), not a
+# release.
+#
+# WHY NOT ON MAIN: it takes roughly ten times what the amd64 build does,
+# because QEMU emulates every instruction of a from-source CPAN install. Paying
+# that on every merge is what the split between ci.yml and publish.yml was for.
+# Paying it when you are deliberately working on arm64 is the point.
+#
+# WHY NOT ON PULL REQUESTS: a PR from a branch in this repository already
+# triggers this through the branch push, and running it again on the PR would
+# double the cost for one answer. A PR from a fork does not get it — which is
+# the right trade for something this expensive.
+#
+# HOW TO USE IT: branch, push, watch. When it is green, put linux/arm64 back in
+# publish.yml's `platforms` and delete the TEMPORARY note above it.
+
+name: multiarch
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+# A scratch branch gets pushed repeatedly while someone is working on it, and
+# the answer that matters is the one for the newest commit. Cancel the rest —
+# unlike a publish, an abandoned build here costs nothing and leaves nothing
+# half-applied.
+concurrency:
+  group: multiarch-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: amd64 and arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # The whole image, both platforms, pushed nowhere. The builder stage runs
+      # t/share.t on each architecture in turn, so this answers "do the
+      # dependencies build and do the tests pass on arm64", which is the actual
+      # question.
+      - name: Build both architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### linux/amd64 + linux/arm64"
+            echo
+            echo "Nothing was pushed. If this is green, \`publish.yml\` can go"
+            echo "back to building both — see the TEMPORARY note on its"
+            echo "\`platforms\` key."
+          } >> "$GITHUB_STEP_SUMMARY"
