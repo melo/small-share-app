@@ -423,6 +423,23 @@ p.failed {
   background: var(--bg);
 }
 
+/* Nothing a browser can render: an Office document, a zip. Say that, rather
+ * than framing a page whose only content is an apology. */
+.no-preview {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 2rem 1.5rem;
+  text-align: center;
+  color: var(--fg-muted);
+}
+
+.no-preview p { margin: 0; max-width: 42ch; font-size: 0.9rem; }
+.no-preview-headline { font-size: 1.05rem; font-weight: 600; color: var(--fg); }
+
 @media (max-width: 40rem) {
   .filebar { flex-direction: column; gap: 0.75rem; }
   .actions { width: 100%; }

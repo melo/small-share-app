@@ -54,7 +54,7 @@ CREATE TABLE files (
   secret       TEXT    NOT NULL UNIQUE,
   filename     TEXT    NOT NULL,
   content_type TEXT    NOT NULL,
-  kind         TEXT    NOT NULL,        -- markdown | image | pdf
+  kind         TEXT    NOT NULL,        -- markdown | image | pdf | document | archive
   size         INTEGER NOT NULL,
   sha256       TEXT    NOT NULL,
   session_id   TEXT,
@@ -225,7 +225,10 @@ sub _signature ($self, $query) {
 # ------------------------------------------------------------ classifying ----
 
 # Extension -> (kind, content type). The list is the product: markdown to read,
-# images to look at, PDFs to page through. Anything else is a different service.
+# images to look at, PDFs to page through — and the formats a colleague actually
+# attaches to mail, which arrive here for one reason only, to be handed on. Those
+# get no preview, and the viewer says so instead of framing a blank page.
+# Anything else is a different service.
 my %BY_EXT = (
   md       => ['markdown', 'text/markdown; charset=utf-8'],
   markdown => ['markdown', 'text/markdown; charset=utf-8'],
@@ -245,6 +248,36 @@ my %BY_EXT = (
   heic     => ['image',    'image/heic'],
   heif     => ['image',    'image/heif'],
   pdf      => ['pdf',      'application/pdf'],
+
+  # Office, both eras, and OpenDocument. Deliberately NOT the macro-enabled
+  # variants (.docm, .xlsm, .pptm): those exist to carry code, and a service
+  # that hands files to people who did not choose to receive them has no
+  # business being the courier.
+  doc  => ['document', 'application/msword'],
+  xls  => ['document', 'application/vnd.ms-excel'],
+  ppt  => ['document', 'application/vnd.ms-powerpoint'],
+  docx => ['document', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  xlsx => ['document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  pptx => ['document', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+  odt  => ['document', 'application/vnd.oasis.opendocument.text'],
+  ods  => ['document', 'application/vnd.oasis.opendocument.spreadsheet'],
+  odp  => ['document', 'application/vnd.oasis.opendocument.presentation'],
+  odg  => ['document', 'application/vnd.oasis.opendocument.graphics'],
+
+  zip => ['archive', 'application/zip'],
+);
+
+# Which container each of those actually is on disk. Every OOXML and
+# OpenDocument file is a zip with a particular layout inside it, everything
+# Office wrote before 2007 is an OLE2 compound document, and a .zip is a zip.
+#
+# The container is where the checking stops. Telling a .docx from a .xlsx means
+# unpacking untrusted input in order to decide whether to accept it, which is a
+# far larger thing to be doing than a hand-off service needs — and getting it
+# wrong costs nothing here, because neither one is ever rendered.
+my %DOC_MAGIC = (
+  (map { $_ => 'ole2' } qw(doc xls ppt)),
+  (map { $_ => 'zip' } qw(docx xlsx pptx odt ods odp odg zip)),
 );
 
 # What the magic bytes say, independent of what the name claims.
@@ -262,12 +295,34 @@ my %SNIFF_OK = (
   'text/markdown; charset=utf-8' => {text => 1, svg => 1},
 );
 
+$SNIFF_OK{$BY_EXT{$_}[1]} = {$DOC_MAGIC{$_} => 1} for keys %DOC_MAGIC;
+
+# What _sniff found, in words, for the one message a rejected upload gets back.
+# "its contents look like ole2" tells nobody anything.
+my %SNIFF_NAME = (
+  binary => 'arbitrary binary data',
+  text   => 'plain text',
+  zip    => 'a zip archive (which is also what a .docx or a .odt is)',
+  ole2   => 'an old-style Office document (.doc, .xls or .ppt)',
+);
+
+sub _sniff_name ($sniffed) { return $SNIFF_NAME{$sniffed} // $sniffed }
+
 sub _sniff ($bytes) {
   return 'png'  if $bytes =~ /\A\x89PNG\r\n\x1a\n/;
   return 'jpeg' if $bytes =~ /\A\xff\xd8\xff/;
   return 'gif'  if $bytes =~ /\AGIF8[79]a/;
   return 'webp' if $bytes =~ /\ARIFF.{4}WEBP/s;
   return 'pdf'  if $bytes =~ /\A%PDF-/;
+
+  # A zip: the local file header, or the end-of-central-directory record, which
+  # is the whole of an empty archive. PK\x07\x08 marks a spanned archive and is
+  # not something an office suite or a browser produces.
+  return 'zip' if $bytes =~ /\APK(?:\x03\x04|\x05\x06)/;
+
+  # The OLE2 compound document header — .doc, .xls and .ppt all start with it,
+  # and it says nothing whatever about which of the three wrote the file.
+  return 'ole2' if $bytes =~ /\A\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1/;
 
   # ISO base media: a 4-byte length, then 'ftyp', then the brand. HEIC and HEIF
   # are the brands below; the same container also carries MP4, which is why the
@@ -298,19 +353,20 @@ sub add ($self, %args) {
 
   my $filename = _clean_filename($args{filename});
   my ($ext) = lc($filename) =~ /\.([a-z0-9]+)\z/i;
-  _fail(qq{"$filename" has no file extension; name it .md, .png, .jpg, .gif, .webp, .svg or .pdf})
+  _fail(qq{"$filename" has no file extension; name it .md, .png, .jpg, .gif, .webp, .svg, }
+      . q{.pdf, an Office or OpenDocument extension, or .zip})
     unless defined $ext;
 
   my $spec = $BY_EXT{$ext}
     or _fail(qq{".$ext" is not something this service holds — only markdown (.md), }
-      . q{images (.png .jpg .gif .webp .svg) and .pdf});
+      . q{images (.png .jpg .gif .webp .svg), .pdf, documents }
+      . q{(.doc .docx .xls .xlsx .ppt .pptx .odt .ods .odp .odg) and .zip});
   my ($kind, $content_type) = @$spec;
 
   # Declared type and real type must agree. A .png that is really a PDF gets
   # rejected rather than stored and later served with a lying Content-Type.
   my $sniffed = _sniff($bytes);
-  _fail(qq{"$filename" claims to be .$ext but its contents look like }
-      . ($sniffed eq 'binary' ? 'arbitrary binary data' : "$sniffed"))
+  _fail(qq{"$filename" claims to be .$ext but its contents look like } . _sniff_name($sniffed))
     unless $SNIFF_OK{$content_type}{$sniffed};
 
   my $ttl = $self->_ttl_seconds($args{ttl_days});

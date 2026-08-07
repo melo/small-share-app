@@ -283,6 +283,12 @@ post '/upload' => sub ($c) {
   $c->render('uploaded', results => \@results, error => undef);
 } => 'upload';
 
+# What a browser can actually show inside the frame. An Office document or a
+# zip is not on the list and never will be: rendering one means a converter,
+# and this service hands files over rather than opening them. The viewer says
+# so plainly instead of framing a page whose only content is an apology.
+my %PREVIEWABLE = (markdown => 1, image => 1, pdf => 1);
+
 # The human's page: a header of facts and buttons, and the file itself in a
 # frame below — so an untrusted document cannot reach the chrome, and so the
 # facts stay put while the file scrolls.
@@ -292,7 +298,8 @@ get '/f/<secret:id>' => sub ($c) {
 
   $c->secret_headers;
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
-  $c->render('viewer', file => $store->public($row, $c->base_url), kind => $row->{kind});
+  $c->render('viewer', file => $store->public($row, $c->base_url), kind => $row->{kind},
+    previewable => $PREVIEWABLE{$row->{kind}} ? 1 : 0);
 } => 'viewer';
 
 # The framed preview. Everything about this response assumes the document is
@@ -302,6 +309,10 @@ get '/f/<secret:id>/view' => sub ($c) {
   $c->secret_headers;
 
   my $origin = $c->base_url;
+
+  # Nothing to frame. Whoever navigated straight here goes back to the page
+  # that has the Download button on it.
+  return $c->redirect_to($c->url_for('viewer')) unless $PREVIEWABLE{$row->{kind}};
 
   # Hand PDFs to the browser's own viewer. It is better than anything we would
   # build, and the browser already sandboxes it.
@@ -961,6 +972,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     <a class="btn primary" href="<%= url_for 'download' %>">Download</a>
   </nav>
 </header>
+% if ($previewable) {
 %# The preview is a separate document in a frame: it keeps an untrusted file's
 %# styles and scripts away from this page, and it keeps the header in place
 %# while the file scrolls. Markdown needs allow-scripts for mermaid; images need
@@ -968,6 +980,14 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 %# browser's built-in viewer.
 % my $sandbox = $kind eq 'pdf' ? '' : $kind eq 'markdown' ? ' sandbox="allow-scripts"' : ' sandbox=""';
 <iframe class="preview" title="<%= $file->{filename} %>" src="<%= url_for 'view' %>"<%== $sandbox %>></iframe>
+% } else {
+<section class="no-preview">
+  <p class="no-preview-headline">Nothing to show here.</p>
+  <p>A <%= $kind eq 'archive' ? 'zip archive' : 'document like this one' %> is not
+  something a browser can render, and this service does not convert one. Use
+  <strong>Download</strong> above and open it in whatever wrote it.</p>
+</section>
+% }
 
 @@ preview_markdown.html.ep
 <!DOCTYPE html>

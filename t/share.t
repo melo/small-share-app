@@ -397,6 +397,67 @@ subtest 'PDFs go to the browser own viewer' => sub {
   $t->status_is(200);
 };
 
+subtest 'office documents and archives are held, and never previewed' => sub {
+  # Both families are containers and the container is all we check: OOXML and
+  # OpenDocument are zips, pre-2007 Office is an OLE2 compound document.
+  my $zip  = "PK\x03\x04" . ("\0" x 26);
+  my $ole2 = "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" . ("\0" x 40);
+
+  my %expect = (
+    'notes.docx' => ['document', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', $zip],
+    'sums.xlsx'  => ['document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',       $zip],
+    'deck.pptx'  => ['document', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', $zip],
+    'notes.odt'  => ['document', 'application/vnd.oasis.opendocument.text',         $zip],
+    'sums.ods'   => ['document', 'application/vnd.oasis.opendocument.spreadsheet',  $zip],
+    'deck.odp'   => ['document', 'application/vnd.oasis.opendocument.presentation', $zip],
+    'plan.odg'   => ['document', 'application/vnd.oasis.opendocument.graphics',     $zip],
+    'old.doc'    => ['document', 'application/msword',                 $ole2],
+    'old.xls'    => ['document', 'application/vnd.ms-excel',           $ole2],
+    'old.ppt'    => ['document', 'application/vnd.ms-powerpoint',      $ole2],
+    'bundle.zip' => ['archive',  'application/zip',                    $zip],
+  );
+
+  for my $filename (sort keys %expect) {
+    my ($kind, $type, $bytes) = @{$expect{$filename}};
+    $t->post_ok("/api/v1/files?filename=$filename" => $bytes)->status_is(201)
+      ->json_is('/kind' => $kind)->json_is('/content_type' => $type);
+    _delete($t->tx->res->json('/id'), $t->tx->res->json('/delete_password'));
+  }
+
+  # An empty archive is nothing but the end-of-central-directory record, and it
+  # is still a valid zip.
+  $t->post_ok('/api/v1/files?filename=empty.zip' => "PK\x05\x06" . ("\0" x 18))->status_is(201);
+  my ($zip_id, $zip_password) = ($t->tx->res->json('/id'), $t->tx->res->json('/delete_password'));
+
+  # No frame at all: a browser cannot render a zip, and an iframe that would
+  # only ever say so is worse than saying it here.
+  $t->get_ok("/f/$zip_id")->status_is(200)
+    ->content_unlike(qr{<iframe})
+    ->content_like(qr{class="no-preview"})
+    ->content_like(qr{<a class="btn primary" href="/f/$zip_id/download">Download</a>});
+
+  # ...and the preview route, if anyone navigates straight to it, goes back to
+  # the page that has the download button rather than 404ing or framing bytes.
+  $t->get_ok("/f/$zip_id/view")->status_is(302)->header_like(Location => qr{/f/\Q$zip_id\E\z});
+
+  $t->get_ok("/f/$zip_id/download")->status_is(200)->content_type_is('application/zip')
+    ->header_like('Content-Disposition' => qr/attachment; filename="empty\.zip"/);
+
+  # The extension still has to match the bytes, in both directions.
+  $t->post_ok('/api/v1/files?filename=trick.docx' => "%PDF-1.4\n")->status_is(400)
+    ->json_like('/error' => qr/claims to be \.docx/);
+  $t->post_ok('/api/v1/files?filename=trick.doc' => $zip)->status_is(400)
+    ->json_like('/error' => qr/looks? like a zip archive/);
+  $t->post_ok('/api/v1/files?filename=trick.png' => $ole2)->status_is(400)
+    ->json_like('/error' => qr/old-style Office document/);
+
+  # Macro-enabled Office is deliberately not on the list.
+  $t->post_ok('/api/v1/files?filename=macros.docm' => $zip)->status_is(400)
+    ->json_like('/error' => qr/not something this service holds/);
+
+  _delete($zip_id, $zip_password);
+};
+
 subtest 'signed upload tickets' => sub {
   my $res = _mcp('tools/call', {name => 'get_upload_url',
     arguments => {filename => 'signed.md', session_id => 'tickets', title => 'Signed'}});
