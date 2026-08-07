@@ -4,9 +4,12 @@
  * being shared, which is rendered in its own frame with github-markdown-css;
  * everything here exists to stay out of its way.
  *
- * No web fonts, no JavaScript: these pages run under `default-src 'none'` with
- * no script source at all, which is why deleting is a two-page flow rather than
- * a confirm() dialog. */
+ * No web fonts, and as little JavaScript as each page can get away with: most
+ * of these run under `default-src 'none'` with no script source at all, which
+ * is why deleting is a two-page flow rather than a confirm() dialog, and why
+ * both the menu and the viewer's fold are a checkbox and a <label>. The viewer
+ * does load one small script, for the clipboard; nothing it does is
+ * load-bearing. */
 
 :root {
   color-scheme: light dark;
@@ -91,16 +94,29 @@ code {
 
 body.viewing { display: flex; flex-direction: column; overflow: hidden; }
 
+/* The bar is a hat on someone else's document, and every line it takes is a
+ * line of the document nobody can see. So: the name and the filename share a
+ * row, the description sits out to the right of them instead of under, and the
+ * facts are one more row that folds away. */
 .filebar {
   flex: 0 0 auto;
   display: flex;
-  gap: 1.5rem;
-  align-items: flex-start;
+  gap: 0.75rem 1.5rem;
+  align-items: baseline;
   justify-content: space-between;
   flex-wrap: wrap;
-  padding: 1rem 1.25rem;
+  padding: 0.6rem 1.25rem;
   background: var(--bg-soft);
   border-bottom: 1px solid var(--line);
+}
+
+.facts { flex: 1 1 20rem; min-width: 0; }
+
+.facts-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.75rem;
 }
 
 .filebar h1 {
@@ -110,18 +126,24 @@ body.viewing { display: flex; flex-direction: column; overflow: hidden; }
 }
 
 .filebar .sub, .filebar .note {
-  margin: 0.25rem 0 0;
+  margin: 0;
   font-size: 0.85rem;
   color: var(--fg-muted);
 }
 
-.filebar .note { max-width: 60ch; }
+/* Out to the right of the name, and never so long that it pushes the row into
+ * a paragraph of its own. */
+.filebar .note {
+  margin-left: auto;
+  max-width: 60ch;
+  text-align: right;
+}
 
 .filebar dl {
   display: flex;
   flex-wrap: wrap;
   gap: 0.25rem 1.5rem;
-  margin: 0.6rem 0 0;
+  margin: 0.35rem 0 0;
   font-size: 0.8rem;
 }
 
@@ -131,7 +153,70 @@ body.viewing { display: flex; flex-direction: column; overflow: hidden; }
 .filebar dd { margin: 0; }
 .filebar .expiry { font-variant-numeric: tabular-nums; }
 
-.actions { display: flex; gap: 0.5rem; flex-shrink: 0; }
+.actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
+.actions-row { display: flex; gap: 0.5rem; }
+
+/* ------------------------------------------------------------- copy links */
+
+/* Links, not buttons, because they sit under a real button and two buttons
+ * stacked reads as a choice between them. They are <button> elements all the
+ * same: they copy, they do not navigate. */
+.copy-links {
+  display: flex;
+  gap: 0.4rem;
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+}
+
+.linkish {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.linkish:hover { text-decoration-thickness: 2px; }
+.linkish.is-done { color: var(--fg-muted); text-decoration: none; }
+
+/* --------------------------------------------------------------- the fold */
+
+/* A checkbox and a <label>, the same trick as the burger in the topbar: the
+ * button works with scripting off. assets/viewer.js flips the identical
+ * checkbox when the preview reports that it has been scrolled away from the
+ * top, so the automatic fold and the manual one are one state, not two. */
+.filebar-toggle { position: absolute; opacity: 0; width: 0; height: 0; }
+
+.filebar-fold {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.filebar-toggle:focus-visible ~ .filebar .filebar-fold { outline: 2px solid var(--accent); }
+
+/* Folded: the name, the filename, the download button and the copy links. */
+.filebar-toggle:checked ~ .filebar .note,
+.filebar-toggle:checked ~ .filebar dl { display: none; }
+
+/* ...and with only one row of facts left, the actions have no reason to stack. */
+.filebar-toggle:checked ~ .filebar .actions { flex-direction: row; align-items: center; }
+
+.filebar-toggle:checked ~ .filebar .fold-open,
+.filebar-toggle:not(:checked) ~ .filebar .fold-shut { display: none; }
 
 .btn {
   display: inline-block;
@@ -206,9 +291,10 @@ form { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.5rem; }
 .topbar .gh:hover { border-color: var(--fg-muted); }
 .topbar .gh svg { width: 15px; height: 15px; fill: currentColor; }
 
-/* The burger is a checkbox and a label. No script, because the pages carrying a
- * secret run with no script source at all and a menu is not worth loosening
- * that for. Hidden on wide screens; the checkbox itself is never visible. */
+/* The burger is a checkbox and a label. No script, because most pages here have
+ * no script source at all and a menu is not worth loosening that for — and
+ * because it then works on the ones that do, whatever happens to the script.
+ * Hidden on wide screens; the checkbox itself is never visible. */
 .nav-toggle { position: absolute; opacity: 0; width: 0; height: 0; }
 
 .nav-burger {
@@ -441,9 +527,20 @@ p.failed {
 .no-preview-headline { font-size: 1.05rem; font-weight: 600; color: var(--fg); }
 
 @media (max-width: 40rem) {
-  .filebar { flex-direction: column; gap: 0.75rem; }
-  .actions { width: 100%; }
+  /* Stacked, so `flex: 1 1 20rem` on .facts would be twenty rems of HEIGHT.
+   * Everything here sizes to its content instead. */
+  .filebar { flex-direction: column; align-items: stretch; gap: 0.6rem; }
+  .facts { flex: 0 0 auto; }
+  .actions { width: 100%; align-items: stretch; }
   .btn { flex: 1; text-align: center; }
+
+  /* The description has nothing to sit beside once the bar is one column wide. */
+  .filebar .note { margin-left: 0; text-align: left; }
+  .copy-links { justify-content: center; flex-wrap: wrap; }
+
+  /* Folded, the actions stay stacked here: two buttons and two links on one
+   * 390px line is one line that runs off the screen. */
+  .filebar-toggle:checked ~ .filebar .actions { flex-direction: column; align-items: stretch; }
 }
 
 /* ---------------------------------------------------------------- api page */

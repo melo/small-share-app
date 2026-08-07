@@ -151,8 +151,9 @@ subtest 'the uploader is a plain form that works without JavaScript' => sub {
   my ($icon) = $t->tx->res->text =~ m{href="(/assets/share-icon\.[0-9a-f]{12}\.svg)"};
   $t->get_ok($icon)->status_is(200)->content_type_like(qr{image/svg});
 
-  # The two pages holding the uploader are the only ones allowed a script
-  # source, and they still deny everything they do not need.
+  # Script is granted by name, per route, and nothing is granted that is not
+  # asked for. The uploader needs connect-src too, for the progress bar's XHR;
+  # the viewer does not, and does not get it.
   $t->get_ok('/')->header_like('Content-Security-Policy' => qr/script-src 'self'/)
     ->header_like('Content-Security-Policy' => qr/connect-src 'self'/);
   $t->get_ok('/f/' . ('z' x 32))->header_unlike('Content-Security-Policy' => qr/script-src/);
@@ -644,6 +645,36 @@ subtest 'the viewer frames the file and never leaks the secret' => sub {
     ->header_is('Referrer-Policy' => 'no-referrer')
     ->header_like('X-Robots-Tag'  => qr/noindex/)
     ->header_like('Cache-Control' => qr/no-store/);
+};
+
+subtest 'the file bar folds, and hands over both URLs' => sub {
+  $t->get_ok("/f/$id")->status_is(200)
+    # A checkbox and a label, so the fold works with scripting off — the same
+    # trick as the burger in the topbar.
+    ->content_like(qr{<input class="filebar-toggle" type="checkbox" id="filebar-toggle">})
+    ->content_like(qr{<label class="btn filebar-fold" for="filebar-toggle"})
+    # The description sits beside the name rather than under it, which is a
+    # whole row of somebody else's document given back to them.
+    ->content_like(qr{<div class="facts-head">.*<h1>.*<p class="note">}s)
+
+    # Both URLs, absolute: they are for pasting somewhere else, so a path would
+    # be useless.
+    ->content_like(qr{data-copy="https://share\.example\.test/f/$id">Copy preview URL</button>})
+    ->content_like(
+      qr{data-copy="https://share\.example\.test/f/$id/download">Copy download URL</button>})
+    # ...and shipped hidden, so with scripting off there is no dead control.
+    ->content_like(qr{<p class="copy-links" hidden>});
+
+  # The one page carrying a secret that is allowed a script source, and it says
+  # what for: a clipboard, and a bar that folds itself. Still no connect-src.
+  $t->get_ok("/f/$id")->header_like('Content-Security-Policy' => qr/script-src 'self'/)
+    ->header_unlike('Content-Security-Policy' => qr/connect-src/)
+    ->content_like(qr{<script src="/assets/viewer\.[0-9a-f]{12}\.js"></script>});
+
+  # The frame reports its scroll position back to the bar; nothing else does,
+  # because nothing else can see inside it.
+  $t->get_ok("/f/$id/view")->status_is(200)
+    ->content_like(qr{<script src="/assets/preview-scroll\.[0-9a-f]{12}\.js"></script>});
 };
 
 subtest 'the preview renders markdown and drops everything dangerous' => sub {

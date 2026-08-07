@@ -203,7 +203,7 @@ get '/assets/*name' => sub ($c) {
 # click away, because the common visit is "I have a file to hand over" and not
 # "tell me what this is".
 get '/' => sub ($c) {
-  $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1));
+  $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1, connect => 1));
   $c->render('index', cfg => \%CFG);
 } => 'index';
 
@@ -242,7 +242,7 @@ get '/how-to' => sub ($c) {
 # upload works with scripting switched off entirely. assets/upload.js only
 # upgrades it in place with drag-and-drop, paste, progress and inline results.
 post '/upload' => sub ($c) {
-  $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1));
+  $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1, connect => 1));
 
   # Mojolicious stops parsing a body that blew the limit, which would otherwise
   # look exactly like "no file was chosen".
@@ -297,7 +297,7 @@ get '/f/<secret:id>' => sub ($c) {
   $store->touch($row);
 
   $c->secret_headers;
-  $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
+  $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1));
   $c->render('viewer', file => $store->public($row, $c->base_url), kind => $row->{kind},
     previewable => $PREVIEWABLE{$row->{kind}} ? 1 : 0);
 } => 'viewer';
@@ -319,9 +319,14 @@ get '/f/<secret:id>/view' => sub ($c) {
   return $c->redirect_to($c->url_for('raw')) if $row->{kind} eq 'pdf';
 
   if ($row->{kind} eq 'image') {
+    # script-src, for one script of ours: preview-scroll.js, which tells the
+    # parent page whether this frame is at the top so the file bar can fold
+    # itself away. The picture is drawn by an <img>, which never executes what
+    # it is pointed at — an uploaded SVG cannot run here whatever it contains —
+    # and this origin is the only place a script may come from.
     $c->res->headers->header('Content-Security-Policy' => join '; ',
       "default-src 'none'", "img-src $origin", "style-src $origin",
-      "frame-ancestors $origin", "base-uri 'none'");
+      "script-src $origin", "frame-ancestors $origin", "base-uri 'none'");
     return $c->render('preview_image', file => $store->public($row, $c->base_url),
       note => _preview_note($row));
   }
@@ -492,16 +497,23 @@ any '/mcp' => Share::MCP->server(app)->to_action;
 
 # --------------------------------------------------------------- helpers -----
 
-# Every page that carries a secret runs with no script source at all. The two
-# pages that hold the uploader are the exceptions, and they ask for it by name —
-# `scripts => 1` — rather than the whole app being loosened to suit two routes.
+# Nothing is granted that a page does not ask for by name, so a route that needs
+# script does not loosen the whole app.
+#
+# `scripts` is asked for by the two uploader pages and by the viewer. The viewer
+# carries a secret, which used to be reason enough to give it no script source at
+# all — but a Copy button cannot exist without one, and neither can a bar that
+# folds itself away as you scroll. What it does NOT get is `connect`: the file
+# being viewed lives in a sandboxed frame in an opaque origin and cannot reach
+# this document, and the script on this side has nothing to fetch.
 sub _chrome_csp (%opt) {
   my @csp = (
     "default-src 'none'", "style-src 'self'", "img-src 'self' data:",
     "frame-src 'self'",   "form-action 'self'", "frame-ancestors 'none'",
     "base-uri 'none'",
   );
-  push @csp, "script-src 'self'", "connect-src 'self'" if $opt{scripts};
+  push @csp, "script-src 'self'"  if $opt{scripts};
+  push @csp, "connect-src 'self'" if $opt{connect};
   return join '; ', @csp;
 }
 
@@ -771,6 +783,9 @@ __DATA__
     % if (stash 'uploader') {
     <script src="<%= asset 'upload.js' %>"></script>
     % }
+    % if (stash 'viewer') {
+    <script src="<%= asset 'viewer.js' %>"></script>
+    % }
   </body>
 </html>
 
@@ -946,16 +961,25 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 </main>
 
 @@ viewer.html.ep
-% layout 'chrome', title => $file->{filename}, body_class => 'viewing';
+% layout 'chrome', title => $file->{filename}, body_class => 'viewing', viewer => 1;
+%# The collapsed/expanded state of the bar, held in a checkbox rather than in
+%# script: the button works with scripting off, and assets/viewer.js only flips
+%# the same checkbox when the preview reports that it has been scrolled.
+<input class="filebar-toggle" type="checkbox" id="filebar-toggle">
 <header class="filebar">
   <div class="facts">
-    <h1><%= $file->{title} // $file->{filename} %></h1>
-    % if (defined $file->{title}) {
-    <p class="sub"><%= $file->{filename} %></p>
-    % }
-    % if (defined $file->{note}) {
-    <p class="note"><%= $file->{note} %></p>
-    % }
+    <div class="facts-head">
+      <h1><%= $file->{title} // $file->{filename} %></h1>
+      % if (defined $file->{title}) {
+      <p class="sub"><%= $file->{filename} %></p>
+      % }
+      % if (defined $file->{note}) {
+      %# Beside the name, not under it. The bar is a hat on someone else's
+      %# document and every line it takes is a line of the document they cannot
+      %# see.
+      <p class="note"><%= $file->{note} %></p>
+      % }
+    </div>
     <dl>
       <div><dt>Kind</dt><dd><%= $file->{kind} %></dd></div>
       <div><dt>Size</dt><dd><%= $file->{size_human} %></dd></div>
@@ -968,17 +992,31 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
   %# door they could never open. Whoever does have it either uses "recent
   %# uploads" on the home page, which keeps the password in this browser, or the
   %# link on the upload result page. /f/<id>/delete still works if you go there.
-  <nav class="actions">
-    <a class="btn primary" href="<%= url_for 'download' %>">Download</a>
-  </nav>
+  <div class="actions">
+    <nav class="actions-row">
+      <a class="btn primary" href="<%= url_for 'download' %>">Download</a>
+      <label class="btn filebar-fold" for="filebar-toggle" title="Show or hide the file details">
+        <span class="fold-open">Less</span><span class="fold-shut">More</span>
+      </label>
+    </nav>
+    %# Shipped hidden and woken up by assets/viewer.js, so that with scripting
+    %# off there is no control on the page that cannot do anything. The URLs are
+    %# in the address bar and under the Download button either way.
+    <p class="copy-links" hidden>
+      <button type="button" class="linkish" data-copy="<%= $file->{url} %>">Copy preview URL</button>
+      <span class="copy-sep" aria-hidden="true">·</span>
+      <button type="button" class="linkish" data-copy="<%= $c->base_url . $c->url_for('download') %>">Copy download URL</button>
+    </p>
+  </div>
 </header>
 % if ($previewable) {
 %# The preview is a separate document in a frame: it keeps an untrusted file's
 %# styles and scripts away from this page, and it keeps the header in place
-%# while the file scrolls. Markdown needs allow-scripts for mermaid; images need
-%# nothing at all; PDFs get no sandbox attribute, because it breaks the
-%# browser's built-in viewer.
-% my $sandbox = $kind eq 'pdf' ? '' : $kind eq 'markdown' ? ' sandbox="allow-scripts"' : ' sandbox=""';
+%# while the file scrolls. Markdown needs allow-scripts for mermaid; images get
+%# it only so the preview can report its scroll position, and an <img> never
+%# runs what it is pointed at whatever the file contains; PDFs get no sandbox
+%# attribute, because it breaks the browser's built-in viewer.
+% my $sandbox = $kind eq 'pdf' ? '' : ' sandbox="allow-scripts"';
 <iframe class="preview" title="<%= $file->{filename} %>" src="<%= url_for 'view' %>"<%== $sandbox %>></iframe>
 % } else {
 <section class="no-preview">
@@ -1004,6 +1042,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     <script src="<%= asset 'mermaid.min.js' %>"></script>
     <script src="<%= asset 'mermaid-init.js' %>"></script>
     % }
+    <script src="<%= asset 'preview-scroll.js' %>"></script>
   </body>
 </html>
 
@@ -1020,6 +1059,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     % if (defined $note) {
     <p class="preview-note"><%= $note %></p>
     % }
+    <script src="<%= asset 'preview-scroll.js' %>"></script>
   </body>
 </html>
 
