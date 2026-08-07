@@ -10,6 +10,8 @@
 //   * navigator.clipboard receiving the URL
 //   * localStorage surviving a reload
 //   * the viewer's header/iframe split rendering as two panes
+//   * the file bar folding — CSS on a checkbox, driven by a scroll that happens
+//     inside a sandboxed cross-origin frame and has to postMessage its way out
 //   * the delete password never leaving the browser that uploaded the file
 //
 // It runs against a throwaway instance (see run.sh) — never production.
@@ -259,6 +261,11 @@ test('the viewer is a header of facts over a scrolling frame', async ({ page }) 
   await expect(page.locator('.filebar .expiry')).toContainText('in 15 days');
   await expect(page.locator('.actions .btn', { hasText: 'Download' })).toBeVisible();
 
+  // The bar is two rows and no more: name and filename on one, the facts on the
+  // next. It used to be four, on a page whose whole job is to show someone
+  // else's document.
+  expect((await page.locator('.filebar').boundingBox()).height).toBeLessThan(100);
+
   // A link handed to you has to lead somewhere. The brand sits top-left, set
   // apart from the file's own metadata, and goes home.
   const brand = page.locator('.topbar .brand');
@@ -282,6 +289,88 @@ test('the viewer is a header of facts over a scrolling frame', async ({ page }) 
   await brand.click();
   await expect(page).toHaveURL(/\/$/);
   await expect(page.locator('.uploader .dropzone')).toBeVisible();
+});
+
+test('the file bar folds by hand, and again as you scroll', async ({ page }) => {
+  // Nothing here can be checked with curl: the fold is CSS on a checkbox, and
+  // the scroll that drives it happens inside a sandboxed cross-origin frame
+  // that has to postMessage its position out.
+  const long = '# Long\n\n' + 'Lorem ipsum dolor sit amet.\n\n'.repeat(200);
+  const url = await uploadViaBrowser(page, fixture('long.md', long));
+  await page.goto(url);
+
+  const bar = page.locator('.filebar');
+  const facts = page.locator('.filebar dl');
+  await expect(facts).toBeVisible();
+  const open = (await bar.boundingBox()).height;
+
+  // By hand: a <label> over a checkbox, so this works with scripting off too.
+  await page.click('.filebar-fold');
+  await expect(facts).toBeHidden();
+  const folded = (await bar.boundingBox()).height;
+  expect(folded).toBeLessThan(open);
+
+  // What survives the fold is exactly what a person still needs.
+  await expect(page.locator('.filebar h1')).toBeVisible();
+  await expect(page.locator('.actions .btn.primary')).toBeVisible();
+  await expect(page.locator('.copy-links')).toBeVisible();
+
+  await page.click('.filebar-fold');
+  await expect(facts).toBeVisible();
+
+  // And by itself. The frame reports its scroll position up to the page; the
+  // page flips the same checkbox the button does.
+  const frame = page.frameLocator('iframe.preview');
+  await frame.locator('body').evaluate(() => window.scrollTo(0, 800));
+  await expect(facts).toBeHidden();
+
+  await frame.locator('body').evaluate(() => window.scrollTo(0, 0));
+  await expect(facts).toBeVisible();
+});
+
+test('the viewer copies both URLs to the clipboard', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  const url = await uploadViaBrowser(page, fixture('copyable.md', '# copyable\n'));
+  await page.goto(url);
+
+  // Located by the URL they carry, not by their label: the label changes to
+  // "Copied" on click and back again a moment later, so a hasText filter would
+  // be racing the confirmation it is trying to observe.
+  const preview = page.locator(`.copy-links button[data-copy="${url}"]`);
+  const download = page.locator(`.copy-links button[data-copy="${url}/download"]`);
+
+  // Shipped hidden in the markup and revealed by assets/viewer.js, so that with
+  // scripting off there is no control on the page that cannot do anything.
+  await expect(preview).toBeVisible();
+  await expect(preview).toHaveText('Copy preview URL');
+
+  await preview.click();
+  await expect(preview).toHaveText('Copied');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(url);
+
+  await download.click();
+  await expect(download).toHaveText('Copied');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(url + '/download');
+
+  // And it goes back to saying what it does, rather than staying "Copied".
+  await expect(download).toHaveText('Copy download URL');
+});
+
+test('a zip is held, not framed', async ({ page }) => {
+  // An empty archive: the end-of-central-directory record and nothing else.
+  const zip = Buffer.concat([Buffer.from('PK\x05\x06', 'binary'), Buffer.alloc(18)]);
+  const url = await uploadViaBrowser(page, fixture('bundle.zip', zip));
+  await page.goto(url);
+
+  await expect(page.locator('.filebar')).toContainText('archive');
+  await expect(page.locator('iframe.preview')).toHaveCount(0);
+  await expect(page.locator('.no-preview')).toContainText('Nothing to show here');
+  await expect(page.locator('.actions .btn.primary')).toHaveText('Download');
+
+  // The panel fills the space the frame would have taken, rather than leaving
+  // the page a bar and a void.
+  const panel = await page.locator('.no-preview').boundingBox();
+  expect(panel.height).toBeGreaterThan(200);
 });
 
 test('an image previews as an image', async ({ page }) => {
@@ -355,12 +444,12 @@ test('the share URL alone cannot delete: the confirm page demands the password',
   const record = (await history(page)).find((r) => r.id === id);
   expect(record.delete_password, 'the browser was handed the password once').toBeTruthy();
 
-  // The viewer offers Download and nothing else: whoever opens a link they were
-  // sent has no password, so a Delete button there would be a door they could
-  // never open.
+  // The viewer offers Download and the fold, and nothing else: whoever opens a
+  // link they were sent has no password, so a Delete button there would be a
+  // door they could never open.
   await page.goto(url);
-  await expect(page.locator('.actions .btn')).toHaveCount(1);
-  await expect(page.locator('.actions .btn')).toHaveText('Download');
+  await expect(page.locator('.actions .btn')).toHaveText(['Download', 'LessMore']);
+  await expect(page.locator('.actions .btn.danger')).toHaveCount(0);
 
   // The page still works for whoever does have the password.
   await page.goto(url + '/delete');
