@@ -1,9 +1,20 @@
 # Publish multi-arch images to GHCR and, if it is configured, Docker Hub.
 #
-# Triggers:
-#   * push to main   -> :main and :edge
-#   * tag v1.2.3     -> :1.2.3, :1.2, :1 and :latest
-#   * manual         -> whatever the ref implies
+# RELEASES ONLY. A tag `v1.2.3` publishes :1.2.3, :1.2, :1 and :latest, for
+# linux/amd64 and linux/arm64. Nothing else publishes anything.
+#
+# A push to main used to publish :main and :edge, amd64 only. It no longer does.
+# The point of that was a way to try the newest commit without cutting a
+# release, and the cost was every merge paying for a registry push and a
+# provenance attestation — for tags whose only documented use was "try the
+# newest commit". `ci.yml` already builds and tests every push to main, which
+# is the part that was actually load-bearing; it just does not push the result
+# anywhere. Anyone who needs an unreleased build can `docker build .`.
+#
+# workflow_dispatch is kept as the handle for re-running a release whose publish
+# failed — run it from the TAG. It refuses to run from anything else, because a
+# manual publish off a branch is how :latest ends up meaning something nobody
+# can identify later.
 #
 # GHCR needs no secrets: the built-in GITHUB_TOKEN plus `packages: write` below
 # is enough.
@@ -27,16 +38,17 @@ name: publish
 
 on:
   push:
-    branches: [main]
     tags: ['v*.*.*']
   workflow_dispatch:
 
 # One publish at a time, and never cancel one in flight.
 #
-# Pushing a commit and a tag together — which is what cutting a release looks
-# like — fires two runs seconds apart. They then race for the same `type=gha`
-# cache scope and the same tags, and both take twenty minutes and fail, where
-# either alone takes two. Serialised, the second one starts warm.
+# Two runs racing for the same `type=gha` cache scope and the same registry tags
+# both take twenty minutes and fail, where either alone takes two. That used to
+# happen on every release, because pushing a commit and a tag together fired two
+# runs seconds apart; main no longer publishes, so the common case is gone. Kept
+# for the ones that remain — two tags pushed at once, or a re-run started while
+# the first is still going.
 concurrency:
   group: publish
   cancel-in-progress: false
@@ -55,25 +67,30 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      # The trigger above already restricts pushes to tags. This is for
+      # workflow_dispatch, which will happily run from any ref you pick in the
+      # UI — and a publish off a branch would mint a :latest nobody can identify
+      # later. Fail here, before anything is built or logged into.
+      - name: Refuse to publish anything that is not a tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        # Through the environment, not interpolated into the script: a ref is
+        # a name someone else chose, and `${{ }}` pastes it in as shell source.
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::$REF is not a release tag. Publishing happens from" \
+               "v*.*.* and nowhere else; re-run this workflow from the tag."
+          exit 1
+
       - uses: actions/checkout@v4
 
       # arm64 is emulated through QEMU and compiles DBD::SQLite and CryptX from
       # source, which is most of this workflow's wall-clock. A Raspberry Pi or an
-      # Apple Silicon box is exactly where a service like this ends up, so
-      # RELEASES carry it — but an ordinary push to main does not need to pay
-      # for it, so `main` and `edge` are amd64 only. See `platforms` below.
+      # Apple Silicon box is exactly where a service like this ends up, so every
+      # release carries it. This is the only workflow that pays that cost, and it
+      # only runs on a tag.
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-
-      - name: Which platforms?
-        id: platforms
-        run: |
-          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
-            echo "list=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
-          else
-            echo "list=linux/amd64" >> "$GITHUB_OUTPUT"
-            echo "::notice::Not a release — building linux/amd64 only. Tags get both."
-          fi
 
       - name: Is Docker Hub configured?
         id: hub
@@ -110,26 +127,28 @@ jobs:
           images: |
             ${{ env.GHCR_IMAGE }}
             ${{ steps.hub.outputs.enabled == 'true' && steps.hub.outputs.repo || '' }}
+          # Only ever a release. The guard above means the ref is always a
+          # v*.*.* tag by the time we get here, so there is no branch case left
+          # to describe and no `edge`.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=ref,event=branch
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest
           labels: |
             org.opencontainers.image.title=small-share-app
             org.opencontainers.image.description=Hand a file from an agent to a human, and back
 
       # The builder stage runs t/share.t, so this cannot publish an image whose
-      # tests do not pass — the same guarantee CI gives, enforced again here in
-      # case someone pushes a tag from a branch CI never saw.
+      # tests do not pass — the same guarantee ci.yml gives on every push to
+      # main, enforced again here because a tag can be cut from a commit CI
+      # never saw.
       - name: Build and push
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: ${{ steps.platforms.outputs.list }}
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,10 +1,22 @@
 # CI: build the image and run the test suite.
 #
+# This is the ONLY thing that runs on a push to main. Publishing an image and
+# deploying the landing page are both releases now, and happen on a v*.*.* tag
+# and nowhere else — so this is the whole of the feedback a merge gets, and it
+# has to be both quick and worth having.
+#
 # There is no separate "install Perl, install deps, run prove" job, and that is
 # deliberate. The Dockerfile's builder stage already runs t/share.t against the
 # exact dependency set the runtime image ships, so building that stage IS the
 # test run. One definition of "does it work", used by CI, by a contributor's
 # `make test`, and by anyone deploying.
+#
+# linux/amd64 only, and nothing here is pushed anywhere. arm64 is emulated
+# through QEMU and compiles DBD::SQLite and CryptX from source, which costs
+# roughly ten times what the native build does — that belongs on a release,
+# where the artefact is kept, and publish.yml pays it there. A cross-platform
+# break is a real risk this does not cover; it is caught at the tag, before
+# anything is published, which is early enough.
 
 name: ci
 
@@ -34,6 +46,7 @@ jobs:
         with:
           context: .
           target: builder
+          platforms: linux/amd64
           push: false
           load: false
           cache-from: type=gha
@@ -48,6 +61,7 @@ jobs:
         with:
           context: .
           target: builder
+          platforms: linux/amd64
           push: false
           load: false
           build-args: |

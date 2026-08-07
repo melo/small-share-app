@@ -13,12 +13,27 @@ git push origin v1.2.3
 ```
 
 That publishes `1.2.3`, `1.2`, `1` and `latest`, multi-arch (amd64 + arm64), to
-GHCR — and to Docker Hub if it is configured. A push to `main` publishes `main`
-and `edge` but **not** `latest`, so `latest` always means "the newest release"
-rather than "the newest commit".
+GHCR — and to Docker Hub if it is configured. It also deploys the landing page.
+
+**A tag is the only thing that publishes anything.** A push to `main` runs
+`ci.yml` and stops there: it builds the image through the `builder` stage,
+linux/amd64 only, runs the suite and the coverage floor, and pushes the result
+nowhere. There is no `:main` and no `:edge` any more. If you want an unreleased
+build, `docker build .` gives you the same thing CI just made.
+
+That means arm64 is only ever exercised at the tag. It is emulated through
+QEMU and compiles DBD::SQLite and CryptX from source, which is most of a
+release's wall-clock and roughly ten times the native build — worth paying for
+an artefact somebody keeps, not for every merge. A cross-platform break is
+therefore caught when you tag, before anything is published, rather than on the
+merge that caused it.
 
 The image is built through the `builder` stage, which runs the test suite, so a
 release whose tests fail cannot be published.
+
+`workflow_dispatch` on `publish.yml` is the handle for re-running a release
+whose publish failed. **Run it from the tag** — it refuses any other ref, so a
+manual publish cannot mint a `latest` nobody can identify later.
 
 ## Publishing from a fork
 
@@ -40,10 +55,15 @@ variables → Actions**:
 
 ## The landing page
 
-`site/` is published to GitHub Pages by `.github/workflows/pages.yml`. It needs
-one manual step, once: **Settings → Pages → Build and deployment → Source →
-GitHub Actions**. Without it the workflow runs and the deploy step fails with
-"Pages site not found".
+`site/` is published to GitHub Pages by `.github/workflows/pages.yml`, **on a
+release tag and nowhere else**. The page describes what the published software
+does, so it should describe the version people can actually run; deploying it
+from `main` meant the site could advertise something that was not in `:latest`
+yet. Tag, and the image and the page go out together.
+
+It needs one manual step, once: **Settings → Pages → Build and deployment →
+Source → GitHub Actions**. Without it the workflow runs and the deploy step
+fails with "Pages site not found".
 
 A Pages site is **public even while the repository is private** — worth knowing
 before enabling it on something not ready to be read.

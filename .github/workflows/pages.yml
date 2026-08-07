@@ -3,6 +3,15 @@
 # One static HTML file plus the favicon — no build step, no bundler, no CDN, the
 # same ethos as the app it describes. The whole job is "upload a directory".
 #
+# RELEASES ONLY, same as the image. The page describes what the published
+# software does, so it should describe the version people can actually run —
+# deploying it from main meant the site could advertise a feature that was not
+# in :latest yet. Tag a release and the two go out together.
+#
+# It no longer filters on `paths: site/**` either. That filter is meaningless on
+# a tag push, and every release should re-deploy the page regardless: the text
+# routinely goes stale because the APP changed, not because site/ did.
+#
 # ONE-TIME SETUP: Settings -> Pages -> Build and deployment -> Source: GitHub
 # Actions. Without that this workflow runs and the deploy step fails with
 # "Pages site not found"; it is not something the workflow can turn on itself.
@@ -14,10 +23,7 @@ name: pages
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'site/**'
-      - '.github/workflows/pages.yml'
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 permissions:
