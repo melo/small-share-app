@@ -1,10 +1,54 @@
-# Keep the build context to the app itself. The runtime image is assembled from
-# /app, so anything landing here ships.
+# Keep the build context to the app itself.
+#
+# READ THIS BEFORE ADDING ANYTHING TO THE DIRECTORY: the Dockerfile does
+# `COPY . /app/` in the builder and the runtime image is `COPY --from=builder
+# /app/ /app/`. A file sitting here at build time is a file inside the image,
+# and `make dev`, `make test` and `docker compose build` all build from this
+# directory with whatever an operator has left in it.
+#
+# .gitignore does NOT help. It governs git and has no bearing on a build
+# context, so the two lists have to be kept in step by hand. Everything under
+# "secrets and state" below is in .gitignore too, and was reaching the image
+# anyway.
+
 .git
 .gitignore
 *.sw?
-*.db
-*.db-wal
-*.db-shm
+.DS_Store
+
+# --- secrets and state -------------------------------------------------------
+
+# .env is the file .env.example tells people to create, and it holds TS_AUTHKEY
+# — plus whatever else an operator has put in it. It was landing at /app/.env in
+# every locally built image.
+.env
+.env.*
+!.env.example
+
+# The workspace: the SQLite database, `share.key` (the HMAC secret behind signed
+# upload URLs) and every file anybody has ever shared through this instance.
+#
+# The bare `*.db` that used to be here did not cover them. Docker matches these
+# patterns against the whole path, so `*.db` catches `share.db` at the root and
+# sails straight past `data/share.db` — which is where it actually lives.
+/data/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/share.key
+
+# --- bulk that has no business in the context --------------------------------
+
+# Fetched and checksum-verified by the assets stage, then copied in from there.
+# A stale local copy would be shadowed by the real one anyway, and mermaid alone
+# is 3.5 MB.
+/public/assets/mermaid.min.js
+/public/assets/github-markdown.css
+
+# Local Perl installs and build scratch, if you build deps outside docker.
 local/
 .build/
+
+# The browser suite's traces and screenshots. None of it runs in the image.
+/e2e/test-results/
+/e2e/node_modules/
