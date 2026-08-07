@@ -48,6 +48,36 @@ FROM melopt/perl-alt:${PERL_ALT}-build AS builder
 # cpanfile* alone first, so the dependency layer survives every change to the
 # application itself.
 COPY cpanfile* /app/
+
+# Ten minutes for any one distribution's CONFIGURE phase, against cpm's default
+# of sixty seconds.
+#
+# This is what broke arm64, and it broke it three releases in a row — v1.1.0,
+# v1.2.0 and v1.2.1 were tagged and none of them published. The failure looks
+# nothing like a timeout in the log:
+#
+#   List-MoreUtils-XS-0.430| Checking for strings.h... yes
+#   List-MoreUtils-XS-0.430| Checking for inttypes.h...
+#   List-MoreUtils-XS-0.430| Timed out (> 60s).
+#   List-MoreUtils-XS-0.430| Failed to configure distribution
+#
+# List::MoreUtils::XS probes for C headers by compiling a small program for each
+# one. Native, they are milliseconds. Under QEMU, on a shared runner already
+# compiling the amd64 leg beside it, one of them took longer than the minute
+# App::cpm allows a configure phase (App::cpm::CLI, configure_timeout => 60) and
+# cpm gave up on the distribution.
+#
+# It takes the whole build with it because List::MoreUtils *requires*
+# List::MoreUtils::XS at runtime — not recommends, so there is no pure-Perl
+# fallback to lean on — and Markdown::Perl requires List::MoreUtils. One slow
+# header check, no release.
+#
+# Being a deadline and not a defect is also why it was intermittent, and why it
+# went unnoticed for two versions: v1.0.0 won the race, the ones after it did
+# not. Raising the deadline costs a healthy build nothing at all — the timer
+# only decides when to give up, never how long anything takes.
+ENV PDI_CPM_CONFIGURE_TIMEOUT=600
+
 RUN pdi-build-deps
 
 COPY . /app/
