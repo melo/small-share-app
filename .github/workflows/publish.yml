@@ -1,12 +1,7 @@
 # Publish multi-arch images to GHCR and, if it is configured, Docker Hub.
 #
-# RELEASES ONLY. A tag `v1.2.3` publishes :1.2.3, :1.2, :1 and :latest.
-# Nothing else publishes anything.
-#
-# linux/amd64 ONLY, for now, and that is a regression being carried
-# deliberately — see the note on `platforms` in the build step. arm64 is built
-# on every non-main branch by `multiarch.yml`, which is where the fix is being
-# worked out.
+# RELEASES ONLY. A tag `v1.2.3` publishes :1.2.3, :1.2, :1 and :latest, for
+# linux/amd64 and linux/arm64. Nothing else publishes anything.
 #
 # A push to main used to publish :main and :edge, amd64 only. It no longer does.
 # The point of that was a way to try the newest commit without cutting a
@@ -89,10 +84,11 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      # TEMPORARY: amd64 only. See `platforms` on the build step below.
-      #
-      # QEMU is still set up, because restoring arm64 should be a one-line
-      # change to `platforms` and not an archaeology exercise.
+      # arm64 is emulated through QEMU and compiles the XS dependencies from
+      # source, which is most of this workflow's wall-clock — about 24 minutes
+      # against 100 seconds for amd64. A Raspberry Pi or an Apple Silicon box is
+      # exactly where a service like this ends up, so every release carries it.
+      # Only a tag pays that; `multiarch.yml` pays it on branches.
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -152,22 +148,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          # TEMPORARY, and it should be `linux/amd64,linux/arm64`.
-          #
-          # The arm64 leg fails in `pdi-build-deps` — the CPAN install — about
-          # twenty minutes in, under QEMU. It has been failing since some point
-          # after v1.0.0: v1.1.0, v1.2.0 and v1.2.1 were all tagged and none of
-          # them published, so GHCR's `latest` sat on 1.0.0 for two releases
-          # while the tags existed in git. Nobody noticed, because a push to
-          # main was still publishing :main and :edge on amd64 alone, and that
-          # was the only thing succeeding.
-          #
-          # A release that does not exist is worse than a release that runs on
-          # one architecture, so this ships amd64 and says so. `multiarch.yml`
-          # builds BOTH on any non-main branch — that is where the arm64 fix
-          # gets worked out, at no cost to anybody who is not working on it.
-          # Put the second platform back here the moment it is green there.
-          platforms: linux/amd64
+          # Both, again, as of 1.3.0. This was linux/amd64 alone for 1.2.2 and
+          # 1.2.3 because the arm64 leg died in `pdi-build-deps` — see the ENV
+          # above it in the Dockerfile for what that actually was. If it ever
+          # regresses, `multiarch.yml` reproduces it on a branch for free.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

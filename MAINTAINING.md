@@ -13,16 +13,13 @@ git push origin v1.2.3
 ```
 
 That publishes `1.2.3`, `1.2`, `1` and `latest` to GHCR — and to Docker Hub if
-it is configured. It also deploys the landing page.
+it is configured — for linux/amd64 and linux/arm64. It also deploys the landing
+page.
 
-> **linux/amd64 only, for now.** The arm64 leg fails in `pdi-build-deps` under
-> QEMU and has done since some point after v1.0.0 — v1.1.0, v1.2.0 and v1.2.1
-> were all tagged and none of them published, so `latest` sat on 1.0.0 for two
-> releases while the tags existed in git. Nobody saw it, because a push to main
-> was still publishing `:main` and `:edge` on amd64 and that was the only thing
-> succeeding. A release that does not exist is worse than a single-architecture
-> one, so releases ship amd64 and say so in the workflow. See "Working on
-> arm64" below.
+Expect a release to take around half an hour. arm64 is emulated through QEMU and
+compiles the XS dependencies from source: roughly 24 minutes against 100 seconds
+for the native build. That is the cost of the architecture people actually run
+this on, and only a tag pays it.
 
 **A tag is the only thing that publishes anything.** A push to `main` runs
 `ci.yml` and stops there: it builds the image through the `builder` stage,
@@ -40,8 +37,9 @@ manual publish cannot mint a `latest` nobody can identify later.
 ## Working on arm64
 
 `multiarch.yml` builds the full image for **both** architectures on **any
-branch that is not main**, and pushes neither. That is where the arm64 problem
-gets worked out.
+branch that is not main**, and pushes neither. Use it whenever a change could
+plausibly behave differently under emulation — a dependency bump, anything
+touching the Dockerfile.
 
 ```bash
 git switch -c arm64-deps
@@ -54,8 +52,14 @@ every instruction of a from-source CPAN install, so it costs roughly ten times
 the native build — that is worth paying when you are deliberately working on
 arm64 and not otherwise.
 
-When it goes green, put `linux/arm64` back into `publish.yml`'s `platforms` and
-delete the `TEMPORARY` note above it. Nothing else needs to change.
+The one time it earned its keep so far: v1.1.0, v1.2.0 and v1.2.1 were tagged
+and none of them published, because `List::MoreUtils::XS` probes for C headers
+by compiling a small program per header, and under QEMU one of those probes ran
+past the sixty seconds `App::cpm` allows a configure phase. cpm dropped the
+distribution; `List::MoreUtils` requires it, `Markdown::Perl` requires that, and
+the release died twenty minutes in. Being a deadline rather than a defect is why
+it was intermittent and why it went unnoticed for two versions. The fix is
+`PDI_CPM_CONFIGURE_TIMEOUT` in the Dockerfile — see the comment there.
 
 ## The `github-pages` environment
 
