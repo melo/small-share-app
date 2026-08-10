@@ -34,7 +34,7 @@ use Share::OpenAPI qw(openapi_type);
 use Share::Render qw(render_markdown);
 use Share::Store  qw(human_size payload_bytes);
 
-our $VERSION = '1.3.0';
+our $VERSION = '1.3.1';
 
 # Where this came from. Linked in the header of every page: the whole point of a
 # small self-hosted tool is that whoever lands on one can go and read it.
