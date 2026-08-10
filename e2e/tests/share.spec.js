@@ -402,6 +402,39 @@ test('a rejected file explains itself across the full row', async ({ page }) => 
     .toBe('left');
 });
 
+test('a firewall in front of the app says so, instead of a bare 403', async ({ page }) => {
+  // Cloudflare's managed WAF reads the multipart body and blocks uploads whose
+  // bytes look like an XSS or path-traversal payload — which an ordinary bug
+  // report written in Markdown regularly does. The app never receives the
+  // request, so the browser is the only place left that can explain it.
+  //
+  // Faked here: the real thing needs Cloudflare in front of the app, and this
+  // suite runs against a throwaway container with nothing in front of it. What
+  // is asserted is the shape of such a reply — 403 with a body that is not JSON.
+  await page.route('**/api/v1/files', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    await route.fulfill({
+      status: 403,
+      contentType: 'text/html; charset=UTF-8',
+      body: '<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title>'
+        + '</head><body>Sorry, you have been blocked</body></html>',
+    });
+  });
+
+  await page.goto('/');
+  await page.setInputFiles(
+    '#upload-files',
+    fixture('blocked.md', '# report\n\n<img src=x onerror=alert(1)>\n')
+  );
+
+  const meta = page.locator('.uploader .results li.failed').first().locator('.result-meta');
+  await expect(meta).toBeVisible();
+  await expect(meta).toContainText('before it reached share');
+  await expect(meta).toContainText('403');
+  // The point of the message: it must not read as the app rejecting the file.
+  await expect(meta).toContainText('Nothing is wrong with the file');
+});
+
 test('recent uploads are remembered, and survive a reload', async ({ page }) => {
   await page.goto('/');
   await page.evaluate(() => window.localStorage.clear());

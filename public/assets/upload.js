@@ -358,7 +358,7 @@
       try { data = JSON.parse(xhr.responseText); } catch (err) { /* handled below */ }
 
       if (xhr.status === 201 && data && data.url) succeed(row, data);
-      else fail(row, (data && data.error) || 'upload failed (HTTP ' + xhr.status + ')');
+      else fail(row, explainFailure(xhr, data));
       done();
     });
 
@@ -366,6 +366,26 @@
     xhr.addEventListener('abort', function () { fail(row, 'cancelled'); done(); });
 
     xhr.send(body);
+  }
+
+  // Every /api route answers JSON, so a reply the browser cannot parse did not
+  // come from this app: something in front of it spoke instead. A WAF is the
+  // usual culprit and 403 the usual verdict — Cloudflare's managed rules read
+  // the multipart body and block an upload whose bytes look like an XSS or a
+  // path-traversal payload, which is exactly what a bug report written in
+  // Markdown looks like. The app never sees the request and logs nothing, so a
+  // bare "upload failed (HTTP 403)" sends people to read logs that are empty.
+  // Say where it stopped instead.
+  function explainFailure(xhr, data) {
+    if (data && data.error) return data.error;
+
+    if (xhr.status === 403) {
+      return 'blocked before it reached share — a firewall in front of this site '
+        + 'refused the upload (HTTP 403). Its contents most likely matched a '
+        + 'security rule. Nothing is wrong with the file.';
+    }
+
+    return 'upload failed (HTTP ' + xhr.status + '), and the reply did not come from share';
   }
 
   // --------------------------------------------------------------- results --

@@ -380,6 +380,30 @@ viewer asks for `script-src 'self'` alone, which is what a Copy button costs.
 Nothing else gets either, and the menu and the file bar's fold are a checkbox
 and a `<label>` so they work regardless.
 
+**A WAF in front of this will block ordinary uploads.** Cloudflare's managed
+rules — and any WAF that pattern-matches request bodies — read the multipart
+body of an upload and treat the file's bytes as if they were a form somebody
+filled in. A Markdown bug report containing `<img src=x onerror=…>`, or a path
+like `../../etc/passwd`, is an XSS or a traversal signature to them. The upload
+comes back **403 before it reaches this app**, which logs nothing because it
+never saw the request. Plain prose uploads fine, which makes it look
+intermittent.
+
+Those rules are protecting nothing here. An uploaded file is opaque bytes this
+app never interprets, and the viewer serves it from a sandboxed opaque origin
+under `Content-Security-Policy: sandbox`. If you deploy behind Cloudflare, add a
+WAF exception that skips the managed rulesets for the upload paths only:
+
+```
+(http.host eq "share.example.com" and http.request.method eq "POST"
+  and (starts_with(http.request.uri.path, "/api/v1/files")
+       or http.request.uri.path eq "/upload"))
+```
+
+Everything else on the zone keeps its protection. The browser uploader
+recognises a reply that did not come from the app and says where the request was
+stopped; the no-script form cannot, and lands on the WAF's own error page.
+
 ## What it is made of
 
 One Perl process (Mojolicious::Lite), one SQLite file, one directory of blobs.
