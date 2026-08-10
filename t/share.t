@@ -704,6 +704,34 @@ subtest 'download is an attachment' => sub {
     ->header_like('Content-Disposition' => qr/attachment; filename="report\.md"/);
 };
 
+subtest 'a store that cannot be written to still hands the file over' => sub {
+  # The disk under SQLite filled up once, every write started answering
+  # "database or disk is full", and the only casualty that mattered was the
+  # download counter — yet /f/<id> returned 500 for a file that was intact.
+  #
+  # `PRAGMA query_only` is how that is reproduced without a full disk: reads
+  # carry on, writes raise "attempt to write a readonly database". Mojo::SQLite
+  # hands the same connection back out of its pool, so touch's UPDATE meets it.
+  #
+  # Note the handle is not held on to: keeping it would check the one pooled
+  # connection out and leave the app to open a second, writable one.
+  my $s = $t->app->store;
+  $s->sql->db->query('PRAGMA query_only = 1');
+
+  $t->get_ok("/f/$id")->status_is(200)->content_like(qr/report\.md/);
+  $t->get_ok("/f/$id/download")->status_is(200)
+    ->header_like('Content-Disposition' => qr/attachment/);
+  $t->get_ok("/f/$id/raw")->status_is(200)->content_like(qr/# Report/);
+
+  $s->sql->db->query('PRAGMA query_only = 0');
+
+  # And the counter really was the thing that failed, not something the test
+  # arranged around: writes work again, and this one lands.
+  my $before = $s->find($id)->{downloads};
+  $s->touch($s->find($id));
+  is($s->find($id)->{downloads}, $before + 1, 'the counter still counts once the store is writable');
+};
+
 subtest 'an unknown id is a 404, in both dialects' => sub {
   my $nope = 'z' x 32;
   $t->get_ok("/f/$nope")->status_is(404)->content_like(qr/Nothing here/);

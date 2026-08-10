@@ -30,6 +30,7 @@ has 'key';    # HMAC secret for signed upload URLs; see _load_key
 
 has 'root';                       # Mojo::File — the workspace directory
 has 'sql';                        # Mojo::SQLite
+has 'log';                        # the app's Mojo::Log, when there is one
 has max_bytes        => 32 * 1024 * 1024;
 has default_ttl_days => 15;
 has max_ttl_days     => 15;
@@ -464,10 +465,25 @@ sub stats ($self) {
   return {files => $r->{files}, bytes => $r->{bytes}};
 }
 
+# Bookkeeping, and bookkeeping only: a view counter and a last-seen stamp. It is
+# never a reason to fail a delivery. The one time this mattered, the disk under
+# SQLite filled up, every write started returning "database or disk is full",
+# and /f/<id> answered 500 for a file that was sitting there intact and
+# perfectly readable — the bytes were fine, the counter was not. Whoever was
+# sent that link had no way to tell the difference.
+#
+# So the failure is logged and swallowed. Readers keep reading a store that has
+# gone read-only for any reason; the log is where you find out it did.
 sub touch ($self, $row) {
-  $self->sql->db->query(
-    'UPDATE files SET downloads = downloads + 1, last_seen_at = ? WHERE id = ?',
-    time, $row->{id});
+  eval {
+    $self->sql->db->query(
+      'UPDATE files SET downloads = downloads + 1, last_seen_at = ? WHERE id = ?',
+      time, $row->{id});
+    1;
+  } or do {
+    my $err = $@ || 'unknown error';
+    $self->log->warn("touch failed for $row->{id} (serving anyway): $err") if $self->log;
+  };
   return;
 }
 

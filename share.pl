@@ -109,6 +109,7 @@ app->defaults(ttl_days => $CFG{ttl_days});
 app->routes->add_type(id => qr/[A-Za-z0-9]{8,64}/);
 
 my $store = Share::Store->new(
+  log              => app->log,
   root             => $CFG{root},
   max_bytes        => $CFG{max_bytes},
   default_ttl_days => $CFG{ttl_days},
