@@ -5,14 +5,44 @@ want to *run* it, the [README](README.md) is the whole story.
 
 ## Releasing
 
-Tag it. `.github/workflows/publish.yml` does the rest.
+One commit and one signed tag. `.github/workflows/publish.yml` does the rest.
+
+**1. Write the message first, to `v<version>.msg` at the root of the repo.** It
+is a changelog — what changed in this release, for whoever reads it later, not
+a description of the diff. Both the commit and the tag are made from that one
+file, so `git log` and `git show v1.3.1` tell the same story. Untracked, and at
+the root rather than in a temporary directory so it is reachable from outside a
+dev container.
+
+**2. Bump the version and commit with it.**
 
 ```bash
-git tag -a v1.2.3 -m "what changed"
-git push origin v1.2.3
+# our $VERSION = '1.3.1'; in share.pl
+git commit -a -F ./v1.3.1.msg
 ```
 
-That publishes `1.2.3`, `1.2`, `1` and `latest` to GHCR — and to Docker Hub if
+The version has to match the tag about to be made: it is reported by
+`/api/v1/health`, by the MCP server on connect, and as `info.version` in the
+OpenAPI document. A bump that ships without a matching tag is the failure mode
+to avoid — `v1.2.3` was signed onto the same commit as `v1.2.2`, so that image
+reports 1.2.2 for the rest of its life.
+
+**3. Tag it, signed, and push.**
+
+```bash
+git tag -s v1.3.1 -F ./v1.3.1.msg
+rm ./v1.3.1.msg
+git push origin main v1.3.1
+```
+
+Release tags are GPG-signed and made by hand, from wherever the signing key
+lives — which is why the message file goes in the repo root and why the tag is
+the one step nothing else does for you. `git tag -v v1.3.1` verifies the
+signature and prints the message back, if you want to look before pushing. Push
+`main` and the tag together, or `main` first: the tag has to name a commit the
+remote already has.
+
+That publishes `1.3.1`, `1.3`, `1` and `latest` to GHCR — and to Docker Hub if
 it is configured — for linux/amd64 and linux/arm64. It also deploys the landing
 page.
 
