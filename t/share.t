@@ -17,7 +17,7 @@ use Mojo::File   qw(curfile);
 # note happens to contain an em-dash.
 use Mojo::JSON   qw(encode_json from_json to_json);
 use Mojo::URL    ();
-use Mojo::Util   qw(b64_encode);
+use Mojo::Util   qw(b64_encode encode);
 use Share::Store ();
 use Test::Mojo   ();
 use Test::More;
@@ -508,6 +508,68 @@ subtest 'signed upload tickets' => sub {
 
   _delete($made, $made_password);
   $t->status_is(200);
+};
+
+subtest 'a ticket is signed over prose, and prose is not ASCII' => sub {
+  # This one is written from a production failure. Digest::SHA hashes bytes, and
+  # handed a character above U+00FF it does not truncate or mangle — it dies,
+  # "Wide character in subroutine entry". Titles are agent-written prose, so an
+  # em dash arrives constantly, and for a week every get_upload_url carrying one
+  # answered 500 while every ASCII title worked perfectly.
+  #
+  # Three ranges, because they fail differently: below U+0080 is plain ASCII,
+  # U+0080..U+00FF is where Perl will quietly hand over latin-1 bytes instead of
+  # UTF-8, and above U+00FF is where it dies outright.
+  my $title = 'Relatório — “versão final” 版';
+  my $note  = 'para a Ana — não é urgente';
+
+  my $res = _mcp('tools/call', {name => 'get_upload_url',
+    arguments => {filename => 'relatório.md', session_id => 'unicode', title => $title,
+      note => $note}});
+  ok !$res->{result}{isError}, 'a title full of prose is signed, not refused';
+
+  my $url = Mojo::URL->new($res->{result}{structuredContent}{upload_url});
+  ok $url->query->param('sig'), 'the ticket is signed';
+
+  # And the signature verifies: both halves have to agree on what the bytes of a
+  # title are, or every non-ASCII upload would be refused as tampered instead.
+  # The body is spelled as bytes on purpose. A real upload is a file read off
+  # disk, so it arrives as UTF-8 bytes; handing Mojo characters here would put
+  # latin-1 on the wire and the sniffer would rightly call it binary.
+  $t->post_ok($url->path_query => form =>
+      {file => {content => encode('UTF-8', "# relatório\n"), filename => 'relatório.md'}})
+    ->status_is(201)->json_is('/title' => $title)->json_is('/note' => $note);
+  my $made = $t->tx->res->json;
+
+  # Tampering is still caught when the value being tampered with is not ASCII.
+  my $bad = $url->clone;
+  $bad->query->param(title => 'Relatório — “versão final” 板');
+  $t->post_ok($bad->path_query => form =>
+      {file => {content => "x\n", filename => 'relatorio.md'}})
+    ->status_is(403)->json_like('/error' => qr/altered since it was issued/);
+
+  _delete($made->{id}, $made->{delete_password})->code == 200 or die 'cleanup failed';
+};
+
+subtest 'a delete password may be prose too' => sub {
+  # The same trap, one layer down: the PBKDF2 behind a delete password is
+  # Digest::SHA as well, and a password reaches the app decoded into characters
+  # from a JSON body or a form field. A wrong password must be answered with a
+  # refusal, never with a 500 — a crash tells whoever is guessing that this
+  # guess was different from the others.
+  my ($id, $password) = _upload('unicode-pw.md', "# pw\n");
+
+  # Two shapes, because they do not arrive the same way: a header is bytes off
+  # the wire, a form field has already been decoded into characters by the time
+  # the app sees it. Both have to reach the same hash.
+  $t->delete_ok("/api/v1/files/$id" => {'X-Delete-Password' => encode('UTF-8', 'палка — 錠')})
+    ->status_is(403)->json_like('/error' => qr/no such file, or the wrong delete password/);
+
+  $t->post_ok("/f/$id/delete" => form => {delete_password => 'chave — não'})
+    ->status_is(200)->content_like(qr/no such file, or the wrong delete password/);
+
+  # Still deletable with the real one afterwards.
+  _delete($id, $password)->code == 200 or die 'cleanup failed';
 };
 
 subtest 'no route lets a client choose or overwrite an id' => sub {

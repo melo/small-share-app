@@ -180,6 +180,14 @@ use constant TICKET_TTL => 3600;
 use constant KDF_ROUNDS => 200_000;
 
 sub _pbkdf2 ($password, $salt, $rounds = KDF_ROUNDS) {
+  # A delete password is whatever the caller sent, and it does not arrive the
+  # same way twice: JSON and form parameters reach us decoded into characters,
+  # an X-Delete-Password header reaches us as raw bytes. Both are reduced to the
+  # same UTF-8 bytes here, so a password set through one path still verifies
+  # through another — and Digest::SHA is never handed a wide character, which it
+  # answers by dying. See _bytes.
+  $password = _bytes($password);
+
   my $block = Digest::SHA::hmac_sha256($salt . pack('N', 1), $password);
   my $out   = $block;
   for (2 .. $rounds) {
@@ -217,10 +225,36 @@ sub check_signature ($self, $query) {
 # what stops a reordering from producing a different digest for the same URL;
 # the length prefix on each part is what stops "a=1&b=2" and "a=1&b=2" built
 # from different splits colliding.
+#
+# Every part is reduced to bytes before it is measured or hashed, and both
+# halves of that matter. A title is agent-written prose — em dashes, curly
+# quotes, accented names — and Digest::SHA does not hash characters: handed a
+# codepoint above 255 it dies with "Wide character in subroutine entry", which
+# is exactly how one em dash in a title turned every get_upload_url call into a
+# 500. And a length counted in characters cannot frame a value measured in
+# bytes, so the prefix only keeps its anti-collision property once both are byte
+# counts.
 sub _signature ($self, $query) {
-  my $canonical = join '', map { sprintf '%d:%s=%d:%s', length $_, $_, length($query->{$_} // ''), $query->{$_} // '' }
-    sort keys %$query;
-  return hmac_sha256_hex($canonical, $self->key);
+  my $canonical = join '', map {
+    my $name  = _bytes($_);
+    my $value = _bytes($query->{$_});
+    sprintf '%d:%s=%d:%s', length $name, $name, length $value, $value;
+  } sort keys %$query;
+
+  return hmac_sha256_hex($canonical, _bytes($self->key));
+}
+
+# The UTF-8 bytes a string stands for, whatever shape it arrived in.
+#
+# Perl strings reach this app both ways: Mojo decodes JSON bodies and query
+# parameters into characters, while headers and file contents stay as bytes. A
+# digest has to see one of those, consistently, on both the signing and the
+# checking side — so anything still carrying characters is encoded, and anything
+# already made of bytes is left exactly as it is.
+sub _bytes ($str) {
+  return '' unless defined $str;
+  utf8::encode($str) if utf8::is_utf8($str);
+  return $str;
 }
 
 # ------------------------------------------------------------ classifying ----
