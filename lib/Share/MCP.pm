@@ -54,6 +54,51 @@ sub server ($class, $app) {
 # either being smuggled through a global.
 sub _c ($tool) { $tool->context->controller }
 
+# ------------------------------------------------------- when a tool dies ----
+
+# Counts failures within one worker. Paired with the pid it makes a reference
+# that is unique across a prefork server without any shared state.
+my $FAILURES = 0;
+
+# Every tool is registered through here rather than straight onto the server,
+# and the whole reason is what a failure looks like from the far end.
+#
+# A tool body that dies becomes a bare -32603 "Internal error" and an HTTP 500.
+# That is all the caller gets: not which tool, not which argument, nothing to
+# quote. A real report — "the MCP server on beebop is giving 500 errors" — was
+# exactly that content-free, and the actual cause (an em dash in a title, see
+# Share::Store::_signature) took a log dig to find rather than a glance.
+#
+# So the failure is written down with the tool that raised it and the argument
+# names it was called with, under a short reference; and the caller is handed
+# that reference instead of an opaque 500, so a complaint and a log line can be
+# laid side by side.
+#
+# Argument NAMES only. A note or a title is the user's text and a delete
+# password is a credential; which arguments were present is what narrows a bug,
+# and their contents are not ours to copy into a log file.
+sub _tool ($server, %spec) {
+  my ($name, $code) = @spec{qw(name code)};
+
+  $spec{code} = sub ($tool, $args) {
+    my $result = eval { $code->($tool, $args) };
+    return $result unless my $err = $@;
+
+    my $ref = sprintf '%d.%d', $$, ++$FAILURES;
+    my $log = eval { _c($tool)->app->log };
+    $log->error(sprintf 'MCP tool %s failed [ref %s] with arguments (%s): %s',
+      $name, $ref, join(', ', sort keys %$args), $err)
+      if $log;
+
+    return $tool->text_result(
+      "$name failed inside the share server — this is a bug in the server, not "
+        . "something to work around. Quote reference $ref to whoever runs it; the "
+        . 'error itself is in its log under that reference.', 1);
+  };
+
+  return $server->tool(%spec);
+}
+
 # ----------------------------------------------------------------- prose -----
 
 # What an agent is told before it has made a single tool call. Anything wrong
@@ -126,7 +171,8 @@ sub _tools ($server) {
   # there is no half-finished upload to expire and reap. The URL returned is the
   # ordinary REST endpoint with the metadata already encoded into it and signed,
   # so an abandoned call costs exactly nothing.
-  $server->tool(
+  _tool(
+    $server,
     name        => 'get_upload_url',
     description => 'Hand back a URL, and a ready-to-run curl command, for putting a '
       . 'file where a human can read it. Run the command; the JSON it prints contains '
@@ -188,7 +234,8 @@ sub _tools ($server) {
     },
   );
 
-  $server->tool(
+  _tool(
+    $server,
     name        => 'list_shared_files',
     description => 'List the files still live for a session id, newest first. Each one '
       . 'carries "url" (the page to give a human) and "content_url" (the bytes, for you '
@@ -209,7 +256,8 @@ sub _tools ($server) {
     },
   );
 
-  $server->tool(
+  _tool(
+    $server,
     name        => 'get_shared_file',
     description => 'Everything known about one shared file — name, kind, size, checksum, '
       . 'expiry, view count — plus "url" for the human and "content_url" for you. To '
@@ -238,7 +286,8 @@ sub _tools ($server) {
     },
   );
 
-  $server->tool(
+  _tool(
+    $server,
     name        => 'delete_shared_file',
     description => 'Delete a shared file now, before its expiry. Needs the '
       . 'delete_password that came back from the upload — the share URL alone cannot '

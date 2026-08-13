@@ -1040,6 +1040,47 @@ subtest 'MCP: an unknown tool is an error, not a crash' => sub {
   ok $res->{error} || $res->{result}{isError}, 'refused';
 };
 
+subtest 'MCP: a tool that dies says which one, and where to look' => sub {
+  # What a bug inside a tool used to be worth, from the far end: HTTP 500 and
+  # "Internal error". Not the tool, not the arguments, nothing to quote. A real
+  # report — "the MCP server is giving 500s" — could not say more than that,
+  # because the protocol had not given the agent more than that.
+  # The level has to be pinned: bin/coverage runs at 'fatal', which would
+  # swallow the one line this subtest exists to read.
+  my $log      = $t->app->log;
+  my $restore  = $log->level;
+  $log->level('error');
+
+  my @errors;
+  my $cb = $log->on(message => sub ($self, $level, @lines) {
+    push @errors, join ' ', @lines if $level eq 'error';
+  });
+
+  my $res = do {
+    no warnings 'redefine';
+    local *Share::Store::for_session = sub { die "the store fell over\n" };
+    _mcp('tools/call',
+      {name => 'list_shared_files', arguments => {session_id => 'sinking-ship'}});
+  };
+
+  $log->unsubscribe(message => $cb)->level($restore);
+
+  # 200 with isError, not a 500: the agent is told what happened in the one
+  # channel it can actually read.
+  ok $res->{result}{isError}, 'the call is an error';
+  my $said = $res->{result}{content}[0]{text};
+  like $said, qr/list_shared_files failed inside the share server/, 'and it names the tool';
+  like $said, qr/reference (\d+\.\d+)/, 'and hands over a reference to quote';
+  my ($ref) = $said =~ qr/reference (\d+\.\d+)/;
+
+  my ($line) = grep {/list_shared_files/} @errors;
+  ok $line, 'the server wrote the failure down';
+  like $line, qr/\Qref $ref\E/,            'under the same reference the caller was given';
+  like $line, qr/the store fell over/,     'with the error itself';
+  like $line, qr/arguments \(session_id\)/, 'and the argument names it was called with';
+  unlike $line, qr/sinking-ship/, 'but never an argument value — those are the user\'s';
+};
+
 subtest 'deleting from the browser takes two clicks, a password, and no JavaScript' => sub {
   # Reached from the upload result page, or by knowing the URL — not from the
   # viewer, which no longer offers it.
