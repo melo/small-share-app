@@ -44,6 +44,14 @@ $ENV{SHARE_RATE_PER_SECOND} = 1000;
 $ENV{SHARE_RATE_PER_MINUTE} = 1000;
 delete $ENV{SHARE_TTL_DAYS};
 
+# Set, and empty. This is what a .env line with nothing after the `=` produces,
+# and what a compose file forwarding ${SHARE_MAX_TOTAL_BYTES:-} puts in the
+# environment when nobody set it — and it used to read as 0, which for this
+# setting means no ceiling at all. See the subtest below and _number in
+# share.pl. The value the suite wants here is the default either way, so this
+# costs the rest of the file nothing.
+$ENV{SHARE_MAX_TOTAL_BYTES} = '';
+
 my $t = Test::Mojo->new(curfile->dirname->sibling('share.pl'));
 
 my $SESSION = 'session-under-test';
@@ -106,6 +114,25 @@ sub _upload ($filename, $content, %extra) {
   my $json = $t->tx->res->json;
   return ($json->{id}, $json->{delete_password});
 }
+
+# ----------------------------------------------------------------- config ----
+
+subtest 'an empty setting is an unset setting, not a zero' => sub {
+  # The regression: `defined $ENV{...} ? 0 + $ENV{...} : $default` treats an
+  # empty string as a deliberate 0, and 0 means "no limit" for the disk ceiling
+  # and both rate limits. So the one thing an operator writes when they mean
+  # "leave this alone" — an empty value, or a compose file forwarding one —
+  # switched off the protections that exist for a box anyone can reach. It
+  # failed silently and in the dangerous direction, which is the pair that makes
+  # a bug expensive.
+  is $t->app->config->{max_total_bytes}, 50 * 1024 * 1024 * 1024,
+    'an empty SHARE_MAX_TOTAL_BYTES leaves the 50 GB ceiling standing';
+
+  # Turning it off is still possible; it just has to be said out loud, with a 0.
+  # That path is Share::Store's, and the disk-ceiling subtest below exercises it
+  # against a store of its own.
+  ok $t->app->config->{max_total_bytes} > 0, 'and the ceiling is a real number';
+};
 
 # ------------------------------------------------------------------ pages ----
 

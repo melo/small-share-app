@@ -72,11 +72,9 @@ my %CFG = (
   # All three are off with a 0. Defaults are chosen for a public box: generous
   # enough that a person or an agent never notices, tight enough that a loop
   # does.
-  max_total_bytes => defined $ENV{SHARE_MAX_TOTAL_BYTES}
-  ? 0 + $ENV{SHARE_MAX_TOTAL_BYTES}
-  : 50 * 1024 * 1024 * 1024,
-  rate_per_second => defined $ENV{SHARE_RATE_PER_SECOND} ? 0 + $ENV{SHARE_RATE_PER_SECOND} : 1,
-  rate_per_minute => defined $ENV{SHARE_RATE_PER_MINUTE} ? 0 + $ENV{SHARE_RATE_PER_MINUTE} : 10,
+  max_total_bytes => _number(SHARE_MAX_TOTAL_BYTES => 50 * 1024 * 1024 * 1024),
+  rate_per_second => _number(SHARE_RATE_PER_SECOND => 1),
+  rate_per_minute => _number(SHARE_RATE_PER_MINUTE => 10),
 
   # Lets /api/v1/health — and ONLY /api/v1/health — report how many files are
   # held and how many bytes. No page a human can open carries that at any
@@ -93,6 +91,25 @@ my %CFG = (
 sub _decoded ($value) {
   return '' unless defined $value && length $value;
   return decode('UTF-8', $value) // $value;
+}
+
+# A number out of the environment, or the default when nobody set one.
+#
+# `defined` alone is the wrong test, and the three settings above are the three
+# where being wrong costs something. An empty string is defined; `0 + ''` is 0;
+# and 0 means "no limit" for every one of them. So `SHARE_MAX_TOTAL_BYTES=` in
+# a .env file — or a compose file forwarding `${SHARE_MAX_TOTAL_BYTES:-}` — read
+# as *turn the disk ceiling off*, when what it looks like, and what anyone
+# writing it means, is "leave this one alone". The same shape disabled both rate
+# limits. These are the protections for an instance anyone can reach, and they
+# are exactly the ones that must not be switchable by accident.
+#
+# Empty is unset. Turning one off is still available, and still has to be
+# written out: `SHARE_MAX_TOTAL_BYTES=0`.
+sub _number ($name, $default) {
+  my $value = $ENV{$name};
+  return $default unless defined $value && length $value;
+  return 0 + $value;
 }
 
 # Reachable as $c->app->config, which is how Share::MCP builds its instructions
