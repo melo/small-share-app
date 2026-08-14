@@ -216,6 +216,12 @@ the process, the second only by `docker compose` when it builds the stack around
 it. Setting one from the wrong table is silently ignored, which is a miserable
 thing to debug.
 
+Every compose file here forwards every variable in the first table, so `.env`
+means the same thing whichever one you deploy with. That was not always true:
+until 1.3.3 only `docker-compose.tsdproxy.yml` passed `SHARE_MAX_TOTAL_BYTES`
+and `SHARE_HEALTH_DETAIL` through, so setting either one alongside any of the
+other files did nothing, and nothing said so.
+
 **Read by the app:**
 
 | variable | default | what it does |

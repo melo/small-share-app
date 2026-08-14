@@ -40,6 +40,20 @@ services:
 
       SHARE_TTL_DAYS: ${SHARE_TTL_DAYS:-15}
       SHARE_MAX_BYTES: ${SHARE_MAX_BYTES:-33554432}
+
+      # Everything held at once. Over it the OLDEST files are evicted until the
+      # total fits again, rather than uploads being refused: a full disk takes
+      # the service down, a lost two-week-old file does not. The value repeats
+      # the application's own default, so passing it changes nothing until an
+      # operator sets it — but without the line here, setting it in .env does
+      # nothing at all, silently.
+      SHARE_MAX_TOTAL_BYTES: ${SHARE_MAX_TOTAL_BYTES:-53687091200}
+
+      # Lets /api/v1/health, and only that, report how many files and bytes are
+      # held. Off unless asked for: it is inventory, and an instance a stranger
+      # can reach should not hand it over. Set SHARE_HEALTH_DETAIL=1 in .env on
+      # a private deployment whose collector needs the numbers.
+      SHARE_HEALTH_DETAIL: ${SHARE_HEALTH_DETAIL:-}
       SHARE_NOTICE: ${SHARE_NOTICE:-}
 
       MOJO_MODE: production
