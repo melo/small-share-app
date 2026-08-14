@@ -43,9 +43,11 @@ services:
       SHARE_MAX_TOTAL_BYTES: ${SHARE_MAX_TOTAL_BYTES:-53687091200}
       SHARE_NOTICE: ${SHARE_NOTICE:-}
 
-      # Lets /api/v1/health report how much is held, for a collector. Off by
-      # default in the app because that is inventory; safe on a private tailnet.
-      SHARE_HEALTH_DETAIL: ${SHARE_HEALTH_DETAIL:-1}
+      # Lets /api/v1/health, and only that, report how many files and bytes are
+      # held. Off unless asked for, on a tailnet as anywhere else: it is
+      # inventory, and "everyone on the tailnet" is not always a short list.
+      # Set SHARE_HEALTH_DETAIL=1 in .env if your collector needs the numbers.
+      SHARE_HEALTH_DETAIL: ${SHARE_HEALTH_DETAIL:-0}
 
       MOJO_MODE: production
       # tsdproxy terminates TLS and forwards X-Forwarded-*.

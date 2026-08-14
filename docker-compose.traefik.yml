@@ -53,7 +53,7 @@ services:
       # held. Off unless asked for: it is inventory, and an instance a stranger
       # can reach should not hand it over. Set SHARE_HEALTH_DETAIL=1 in .env on
       # a private deployment whose collector needs the numbers.
-      SHARE_HEALTH_DETAIL: ${SHARE_HEALTH_DETAIL:-}
+      SHARE_HEALTH_DETAIL: ${SHARE_HEALTH_DETAIL:-0}
       SHARE_NOTICE: ${SHARE_NOTICE:-}
 
       MOJO_MODE: production
