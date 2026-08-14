@@ -5,14 +5,22 @@ want to *run* it, the [README](README.md) is the whole story.
 
 ## Releasing
 
-One commit and one signed tag. `.github/workflows/publish.yml` does the rest.
+One commit and one signed tag, across two machines. The commit is made on the
+box, where the code and docker are; the tag is made on the laptop, because that
+is where the GPG key is. `.github/workflows/publish.yml` does the rest.
+
+There are two remotes and they are not interchangeable. `origin` is the forge,
+which holds the history. `github` is where the workflows live, and so it is the
+only one that publishes anything.
+
+### On the box
 
 **1. Write the message first, to `v<version>.msg` at the root of the repo.** It
 is a changelog — what changed in this release, for whoever reads it later, not
 a description of the diff. Both the commit and the tag are made from that one
 file, so `git log` and `git show v1.3.1` tell the same story. Untracked, and at
-the root rather than in a temporary directory so it is reachable from outside a
-dev container.
+the root rather than in a temporary directory so the laptop can `scp` it off
+without knowing anything about the container it was written in.
 
 **2. Bump the version and commit with it.**
 
@@ -27,20 +35,60 @@ OpenAPI document. A bump that ships without a matching tag is the failure mode
 to avoid — `v1.2.3` was signed onto the same commit as `v1.2.2`, so that image
 reports 1.2.2 for the rest of its life.
 
-**3. Tag it, signed, and push.**
+Run `make test` and `make coverage` here, before the commit leaves the box.
+Both build the image, so both want docker — which the box has and the laptop
+may not.
+
+**3. Push `main` to the forge and stop.**
+
+```bash
+git push origin main
+```
+
+Nothing is tagged yet, so nothing publishes. This push exists so that the
+laptop has the commit to tag: a tag can only name a commit the machine making
+it already has.
+
+### On the laptop
+
+**4. Fetch the commit, and the message file separately.**
+
+```bash
+j small-share-app                  # autojump to the checkout
+git pull --ff
+scp box:small-share-app/v*msg .
+ssh box rm small-share-app/v*msg
+```
+
+The message is untracked, so it does not arrive with the pull — `scp` is what
+carries it across, and that is what the "at the root of the repo" in step 1
+buys. Deleting it on the box afterwards is not tidiness: `v*msg` is a glob, and
+a leftover `v1.3.1.msg` is a release note the next release would silently pick
+up alongside its own.
+
+**5. Tag it, signed.**
 
 ```bash
 git tag -s v1.3.1 -F ./v1.3.1.msg
 rm ./v1.3.1.msg
-git push origin main v1.3.1
 ```
 
 Release tags are GPG-signed and made by hand, from wherever the signing key
-lives — which is why the message file goes in the repo root and why the tag is
-the one step nothing else does for you. `git tag -v v1.3.1` verifies the
-signature and prints the message back, if you want to look before pushing. Push
-`main` and the tag together, or `main` first: the tag has to name a commit the
-remote already has.
+lives — which is the whole reason this half runs on the laptop, and the one
+step nothing else does for you. `git tag -v v1.3.1` verifies the signature and
+prints the message back, if you want to look before pushing.
+
+**6. Push both remotes, the forge first.**
+
+```bash
+git push origin main v1.3.1        # the forge: history
+git push github main v1.3.1        # the one that matters: this is what reaches GHCR
+```
+
+The second one is the release. A tag that only ever reaches the forge builds
+nothing, publishes nothing and deploys nothing — it just sits there looking
+like a release that happened. Push `main` and the tag together, or `main`
+first: the tag has to name a commit the remote already has.
 
 That publishes `1.3.1`, `1.3`, `1` and `latest` to GHCR — and to Docker Hub if
 it is configured — for linux/amd64 and linux/arm64. It also deploys the landing
@@ -51,11 +99,12 @@ compiles the XS dependencies from source: roughly 24 minutes against 100 seconds
 for the native build. That is the cost of the architecture people actually run
 this on, and only a tag pays it.
 
-**A tag is the only thing that publishes anything.** A push to `main` runs
-`ci.yml` and stops there: it builds the image through the `builder` stage,
-linux/amd64 only, runs the suite and the coverage floor, and pushes the result
-nowhere. There is no `:main` and no `:edge` any more. If you want an unreleased
-build, `docker build .` gives you the same thing CI just made.
+**A tag is the only thing that publishes anything.** A push to the forge runs
+nothing at all. A push of `main` to `github` runs `ci.yml` and stops there: it
+builds the image through the `builder` stage, linux/amd64 only, runs the suite
+and the coverage floor, and pushes the result nowhere. There is no `:main` and
+no `:edge` any more. If you want an unreleased build, `docker build .` gives
+you the same thing CI just made.
 
 The image is built through the `builder` stage, which runs the test suite, so a
 release whose tests fail cannot be published.
@@ -74,8 +123,10 @@ touching the Dockerfile.
 ```bash
 git switch -c arm64-deps
 # change something
-git push -u origin arm64-deps      # both architectures build, nothing ships
+git push -u github arm64-deps      # both architectures build, nothing ships
 ```
+
+`github`, not the forge — the workflow only exists there.
 
 It does not run on main, on tags, or on pull requests from forks. QEMU emulates
 every instruction of a from-source CPAN install, so it costs roughly ten times
