@@ -1,0 +1,88 @@
+# share — development-only Perl dependencies.
+#
+# NOT part of the application. Installed into /deps by the `devel` stage in the
+# Dockerfile, which is the stage ccc builds this project's container from; the
+# published runtime image copies /deps from `builder` and never sees any of it.
+#
+# The rule for this file: something belongs here if it changes what can be
+# checked or debugged without leaving the container. A module that only makes a
+# human's editor nicer does not — the base image already ships a `devel` layer
+# at /deps/layers/devel for that (Perl::LanguageServer, Reply, Code::TidyAll),
+# installable with `pdi-build-deps --layer=devel` if it is ever wanted.
+
+# --- the coverage gate ------------------------------------------------------
+#
+# bin/coverage is the only thing in the repo that hard-requires a module the app
+# does not, and without it the 90% floor can only be checked by pushing and
+# waiting for CI. The Dockerfile installs it under --build-arg COVERAGE=1, which
+# is right for a release build and useless for a container you work in: ccc
+# builds with default args, so it was absent.
+#
+# Unpinned deliberately. bin/coverage drives it through the documented
+# -MDevel::Cover=-db,... switch, which has been stable for a decade, and pinning
+# a version here would only mean a stale pin nobody revisits.
+requires 'Devel::Cover';
+
+# --- assertions the suite cannot currently make -----------------------------
+#
+# t/share.t is 1145 lines against Test::More and Test::Mojo alone. That is a
+# deliberate, cheap set of dependencies for the *shipped* test run, and this
+# file does not change it — everything below is available to reach for, not
+# required by anything that exists today.
+
+# The MCP handshake and the OpenAPI document are both deeply nested JSON. When
+# is_deeply fails on a structure that size it prints both sides in full and
+# leaves you to find the difference; cmp_deeply names the path that differs, and
+# ignore()/any() let a test assert the parts it means without pinning the parts
+# it does not (timestamps, generated ids).
+#
+# Test2::V0 does the same job and is already available for free (see the bottom
+# of this file), but only to a test written against Test2. This one drops into
+# t/share.t as it stands, beside the Test::More it already uses.
+requires 'Test::Deep';
+
+# Share::Store dies on a bad ticket, an expired token and a duplicate claim.
+# Testing that today means an eval and a regex against $@; like() on an
+# exception is exactly what Test::Fatal exists to replace.
+requires 'Test::Fatal';
+
+# The suite currently prints "Wide character in print" on every run — a real
+# encoding smell in the TAP output that no test fails on, because nothing is
+# watching for warnings. This makes that assertable.
+requires 'Test::Warnings';
+
+# --- looking at things ------------------------------------------------------
+
+# Data::Dumper is core and unreadable on Mojo objects: a Mojo::DOM or a
+# Mojolicious controller dumps hundreds of lines of internals. Data::Printer
+# collapses blessed objects to their class and shows the structure, which is the
+# difference between a dump you read and one you scroll past.
+requires 'Data::Printer';
+
+# The two things in this app that could plausibly be slow are Markdown::Perl
+# rendering a large document and the SQLite reaper sweeping a full workspace.
+# Both are guesses until something measures them.
+requires 'Devel::NYTProf';
+
+# --- deliberately NOT here --------------------------------------------------
+#
+# Perl::Tidy, Perl::Critic and Code::TidyAll. There is no .perltidyrc,
+# .perlcriticrc or .tidyallrc in this repo, and installing a formatter without a
+# style file to drive it produces exactly one useful action — reformatting the
+# whole codebase to a default nobody chose. If a style is ever written down,
+# these belong here that same day.
+#
+# Test::Pod and Test::Pod::Coverage. There is no POD in lib/, share.pl or bin/,
+# so both would test that nothing is nothing.
+#
+# Test2::Suite, which was the obvious fifth entry above until it was checked.
+# It stopped being its own distribution — CPAN has no Test2-Suite release any
+# more, the modules ship inside Test-Simple, and perl 5.44 carries Test-Simple
+# 1.302219 in core. Test2::V0 and Test2::Tools::Compare already load in this
+# image with nothing installed; requiring it would have bought a 1.302219 ->
+# 1.302222 bump and read like a dependency the project had chosen.
+#
+# The SQLite command-line shell, which is the obvious missing tool for looking
+# at a workspace's .db by hand. It is an OS package (sqlite3), not CPAN, so it
+# cannot be requested from here — it belongs in the ccc image or an apt-get in
+# the devel stage.

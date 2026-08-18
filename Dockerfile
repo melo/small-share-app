@@ -103,6 +103,32 @@ RUN if [ "$COVERAGE" = "1" ]; then \
       echo "coverage: skipped (build with --build-arg COVERAGE=1)"; \
     fi
 
+# ------------------------------------------------------------------- devel ---
+# The stage a development container is built from — `ccc` targets this one, and
+# `docker build --target devel` gets the same thing by hand.
+#
+# It is off the critical path by construction: runtime copies /deps and /app
+# from `builder`, never from here, and no stage depends on this one, so a plain
+# `docker build .` never builds it and the published image cannot grow by a byte
+# because of anything below.
+#
+# The dependencies go into /deps/local alongside the app's own, which is the
+# only place pdi-entrypoint puts on PERL5LIB — a layer under /deps/layers would
+# install cleanly and then be invisible to everything.
+
+FROM builder AS devel
+
+# pdi-build-deps records whichever cpanfile it was given at /deps/cpanfile, and
+# drops /deps/cpanfile.snapshot when that cpanfile has no snapshot beside it.
+# Harmless to the install, but it would leave the image claiming its /deps was
+# built from the devel list, so the app's record is put back afterwards.
+RUN set -eux; \
+    cp /deps/cpanfile /tmp/cpanfile.app; \
+    cp /deps/cpanfile.snapshot /tmp/cpanfile.app.snapshot 2>/dev/null || true; \
+    pdi-build-deps /app/cpanfile.devel; \
+    mv /tmp/cpanfile.app /deps/cpanfile; \
+    if [ -f /tmp/cpanfile.app.snapshot ]; then mv /tmp/cpanfile.app.snapshot /deps/cpanfile.snapshot; fi
+
 # ----------------------------------------------------------------- runtime ---
 
 FROM melopt/perl-alt:${PERL_ALT}-runtime
