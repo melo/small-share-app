@@ -129,6 +129,15 @@ RUN set -eux; \
     mv /tmp/cpanfile.app /deps/cpanfile; \
     if [ -f /tmp/cpanfile.app.snapshot ]; then mv /tmp/cpanfile.app.snapshot /deps/cpanfile.snapshot; fi
 
+# Every stage above reaches the dependencies by invoking pdi-entrypoint
+# explicitly, because a RUN step does not go through an ENTRYPOINT. Nothing
+# reaches an interactive shell that way: without this, a shell in this image
+# has /deps on disk and nothing on PERL5LIB, and cannot load a single module
+# the stage just installed. pdi-entrypoint builds PERL5LIB from /app/lib and
+# /deps and then execs what it was given, or a shell when it was given nothing.
+WORKDIR /app
+ENTRYPOINT ["/usr/bin/pdi-entrypoint"]
+
 # ----------------------------------------------------------------- runtime ---
 
 FROM melopt/perl-alt:${PERL_ALT}-runtime
