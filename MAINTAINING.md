@@ -9,6 +9,34 @@ One commit and one signed tag, across two machines. The commit is made on the
 box, where the code and docker are; the tag is made on the laptop, because that
 is where the GPG key is. `.github/workflows/publish.yml` does the rest.
 
+### What "ready to release" means
+
+The laptop half of this is four commands and no judgement: pull, tag, push. That
+only works if the box has already finished, so **the box is not done until all
+four of these are true**, and saying "ready" before they are is how a tag ends up
+naming the wrong commit:
+
+1. **Committed.** The change is a commit on `main`, not a working tree. Note that
+   `git commit -a` does not pick up untracked files, so new source files need an
+   explicit `git add` first — a release missing its new module builds and tests
+   green on the box that still has the file on disk.
+2. **Tested, here.** `make test` and `make coverage` both run on the box, because
+   both build the image and the box has docker. Green before the push, not after.
+3. **Version bumped and matching.** `our $VERSION` in `share.pl` is the version
+   about to be tagged. It is what `/api/v1/health`, the MCP server and the
+   OpenAPI document report, and a bump that ships without a matching tag is the
+   failure `v1.2.3` records below.
+4. **Pushed.** `git push origin main` and `git push github main`. The laptop can
+   only tag a commit it can fetch, so an unpushed `main` is not a prepared
+   release however finished the code is.
+
+The release message in `v<version>.msg` is what both the commit and the tag are
+made from, so it has to describe **what is actually in the commits being
+tagged** — not what was planned, and not what a previous tag was supposed to
+carry. `v1.4.0` was signed onto a commit that did not contain the feature its
+notes described; the fix was to say so in `v1.4.1.msg` and let 1.4.0 stand as a
+version nobody should install.
+
 There are two remotes and they are not interchangeable. `origin` is the forge,
 which holds the history. `github` is where the workflows live, and so it is the
 only one that publishes anything.
