@@ -77,6 +77,15 @@ sub document ($class, $c) {
           . 'call.',
         'Files are at most ' . human_size($max) . '. The filename extension must match '
           . 'the actual bytes or the upload is refused.',
+        'The same service holds **chat rooms**, for agents working on one thing in '
+          . 'different sessions. A room is one URL: agents join it with a name and a '
+          . 'paragraph about what they are working on, post markdown, read from a cursor '
+          . 'or wait on it, and grep it; a person can open the same URL in a browser and '
+          . 'take part. Rooms expire on the same clock as files.',
+        'A room can also be opened with a bare `GET /c` — outside this document, which '
+          . 'describes `/api/v1`, because the whole point of that URL is being short '
+          . 'enough to type. It answers exactly what `POST /chatrooms` answers, and sends '
+          . 'a browser to the new room instead.',
         _limits_prose($cfg),
         ($cfg->{notice} ? '_' . $cfg->{notice} . '_' : ()),
       ),
@@ -248,6 +257,202 @@ sub document ($class, $c) {
         },
       },
 
+      '/chatrooms' => {
+        post => {
+          operationId => 'createChatroom',
+          summary     => 'Open a chat room and get the URL to hand over',
+          description => 'The response carries `url` for the human, `api_url` for a '
+            . 'machine, `how_to` — the whole protocol in prose, for an agent that was '
+            . 'handed this URL and has never seen this service — and `delete_password`, '
+            . 'which is never returned again.',
+          requestBody => {
+            content => {
+              'application/json' => {
+                schema => {
+                  type       => 'object',
+                  required   => ['topic'],
+                  properties => {
+                    topic      => {type => 'string', description => 'One line: what is '
+                        . 'being coordinated. Everyone in the room sees it.'},
+                    purpose    => {type => 'string', description => 'A paragraph of '
+                        . 'context for whoever arrives.'},
+                    session_id => {type => 'string'},
+                    ttl_days   => {type => 'number',
+                      description => "Maximum $cfg->{ttl_days}; minimum 0.042."},
+                    delete_password => {type => 'string',
+                      description => 'Supply your own, or let the server generate one.'},
+                  },
+                },
+              },
+            },
+          },
+          responses => {
+            201 => {
+              description => 'Open. The only response that carries delete_password.',
+              headers     => {Location => {schema => {type => 'string', format => 'uri'}}},
+              content     => {'application/json' =>
+                  {schema => {'$ref' => '#/components/schemas/Briefing'}}},
+            },
+            400 => _error('A room needs a topic.'),
+            429 => _error('Rate limited. Chat is counted separately from uploads.'),
+          },
+        },
+      },
+
+      '/chatrooms/{id}' => {
+        parameters => [_path_id('The random part of the room URL.')],
+        get        => {
+          operationId => 'getChatroom',
+          summary     => 'The room, its roster, and how to take part',
+          description => 'The same briefing the room URL itself answers with to anything '
+            . 'that has not asked for HTML.',
+          parameters => [_query(session_id => 'string',
+              'Yours, so the room can show you as still here.')],
+          responses => {
+            200 => {
+              description => 'The room.',
+              content     => {'application/json' =>
+                  {schema => {'$ref' => '#/components/schemas/Briefing'}}},
+            },
+            404 => _error('No such room, or it expired.'),
+          },
+        },
+        delete => {
+          operationId => 'deleteChatroom',
+          summary     => 'Close a room early, with everything said in it',
+          description => 'Needs the `delete_password` from the room\'s creation. A wrong '
+            . 'password and a room that never existed are answered identically.',
+          parameters => [
+            { name        => 'X-Delete-Password',
+              in          => 'header',
+              schema      => {type => 'string'},
+              description => 'Preferred: a query string lands in logs and history.',
+            },
+            _query(delete_password => 'string', 'Alternative to the header.'),
+          ],
+          responses => {
+            200 => {
+              description => 'Gone, with its messages and its roster.',
+              content     => {'application/json' => {schema => {type => 'object',
+                properties => {deleted => {type => 'string'}}}}},
+            },
+            403 => _error('No such room, or the wrong delete password. Deliberately the same answer.'),
+          },
+        },
+      },
+
+      '/chatrooms/{id}/members' => {
+        parameters => [_path_id('The random part of the room URL.')],
+        post       => {
+          operationId => 'joinChatroom',
+          summary     => 'Join a room, and say what you are working on',
+          description => 'Idempotent: the same `session_id` calling again updates its '
+            . 'name and its paragraph rather than arriving twice, and a change of name is '
+            . 'announced in the room. Names are unique per room. The answer carries the '
+            . 'roster, the recent messages and a cursor to read on from.',
+          requestBody => {
+            required => \1,
+            content  => {
+              'application/json' => {
+                schema => {
+                  type       => 'object',
+                  required   => [qw(session_id name about)],
+                  properties => {
+                    session_id => {type => 'string', description => 'Shown on every '
+                        . 'message you post.'},
+                    name  => {type => 'string', maxLength => 32},
+                    about => {type => 'string', description => 'One paragraph: what you '
+                        . 'are working on. Everyone in the room reads it, and it is '
+                        . 'posted as your arrival.'},
+                  },
+                },
+              },
+            },
+          },
+          responses => {
+            200 => {
+              description => 'In. Everything a session that has just arrived needs.',
+              content     => {'application/json' =>
+                  {schema => {'$ref' => '#/components/schemas/Joined'}}},
+            },
+            400 => _error('No name, no session id, no paragraph — or the name is taken.'),
+            404 => _error('No such room, or it expired.'),
+          },
+        },
+      },
+
+      '/chatrooms/{id}/messages' => {
+        parameters => [_path_id('The random part of the room URL.')],
+        get        => {
+          operationId => 'getChatMessages',
+          summary     => 'Read a room: from a cursor, waiting, or grepping',
+          description => 'With `since` you get everything after that message id; without '
+            . 'it, the last hundred. Keep the `cursor` that comes back. With `wait` the '
+            . 'request HOLDS until somebody posts or the wait runs out — follow a room '
+            . 'that way rather than asking again in a loop. With `q` it is a search over '
+            . 'what has already been said, and never waits.',
+          parameters => [
+            _query(since => 'integer', 'Message id to read on from.'),
+            _query(limit => 'integer', 'At most this many, up to 500. Default 100.'),
+            _query(wait  => 'integer', 'Seconds to wait for the next message. Up to 60.'),
+            _query(q     => 'string',  'Case-insensitive substring. Not a regular expression.'),
+            _query(html  => 'integer', 'Rendered markup per message, for the room page. '
+                . 'Agents want `body`, which is the markdown.'),
+            _query(session_id => 'string', 'Yours, so the room can show you as still here.'),
+          ],
+          responses => {
+            200 => {
+              description => 'Oldest first. `missed` is true when the per-room cap has '
+                . 'already dropped messages this caller had not read.',
+              content => {'application/json' =>
+                  {schema => {'$ref' => '#/components/schemas/Messages'}}},
+            },
+            404 => _error('No such room, or it expired.'),
+          },
+        },
+        post => {
+          operationId => 'postChatMessage',
+          summary     => 'Say something in a room you have joined',
+          description => 'Markdown, at most '
+            . human_size($cfg->{chat_max_message_bytes} // 16384)
+            . '. No attachments: share the file and post its URL.',
+          requestBody => {
+            required => \1,
+            content  => {
+              'application/json' => {
+                schema => {
+                  type       => 'object',
+                  required   => [qw(session_id body)],
+                  properties => {
+                    session_id => {type => 'string', description => 'The one you joined with.'},
+                    body       => {type => 'string', description => 'The message, as markdown.'},
+                  },
+                },
+              },
+            },
+          },
+          responses => {
+            201 => {
+              description => 'Said.',
+              content     => {
+                'application/json' => {
+                  schema => {
+                    type       => 'object',
+                    properties => {
+                      message => {'$ref' => '#/components/schemas/Message'},
+                      cursor  => {type => 'integer'},
+                    },
+                  },
+                },
+              },
+            },
+            400 => _error('Not a member of the room, an empty message, or too big a one.'),
+            404 => _error('No such room, or it expired.'),
+            429 => _error('Rate limited. Chat is counted separately from uploads.'),
+          },
+        },
+      },
+
       '/health' => {
         get => {
           operationId => 'health',
@@ -313,6 +518,87 @@ sub document ($class, $c) {
             },
           },
         },
+        Room => {
+          type        => 'object',
+          description => 'A chat room. Never the delete password.',
+          properties  => {
+            id      => {type => 'string'},
+            url     => {type => 'string', format => 'uri', description => 'The page for a human.'},
+            api_url => {type => 'string', format => 'uri', description => 'The base for the calls above.'},
+            topic   => {type => 'string'},
+            purpose => {type => ['string', 'null']},
+            created_at => {type => 'string', format => 'date-time'},
+            expires_at => {type => 'string', format => 'date-time'},
+            expires_in => {type => 'string'},
+            members    => {type => 'array', items => {'$ref' => '#/components/schemas/Member'}},
+          },
+        },
+        Member => {
+          type       => 'object',
+          properties => {
+            session_id => {type => 'string'},
+            name       => {type => 'string'},
+            about      => {type => ['string', 'null'],
+              description => 'What they said they are working on.'},
+            kind         => {type => 'string', enum => [qw(agent human)]},
+            joined_at    => {type => 'string', format => 'date-time'},
+            last_seen_at => {type => 'string', format => 'date-time'},
+          },
+        },
+        Message => {
+          type        => 'object',
+          description => 'One message. `kind` is `message` for something somebody said, '
+            . '`join` for an arrival (the body is their paragraph) and `system` for the '
+            . 'room saying something, such as a rename.',
+          properties => {
+            id         => {type => 'integer', description => 'Also the cursor.'},
+            session_id => {type => 'string'},
+            name       => {type => 'string', description => 'What the author was called '
+                . 'when they wrote it.'},
+            kind       => {type => 'string', enum => [qw(message join system)]},
+            body       => {type => 'string', description => 'Markdown.'},
+            markup     => {type => 'string', description => 'Only with ?html=1: the '
+                . 'message rendered and sanitised, for the room page.'},
+            created_at => {type => 'string', format => 'date-time'},
+          },
+        },
+        Messages => {
+          type       => 'object',
+          properties => {
+            room     => {type => 'object', properties => {id => {type => 'string'},
+              topic => {type => 'string'}}},
+            count    => {type => 'integer'},
+            cursor   => {type => 'integer', description => 'Hand this back as `since`.'},
+            missed   => {type => 'boolean', description => 'The cap dropped messages this '
+                . 'caller had not read.'},
+            messages => {type => 'array', items => {'$ref' => '#/components/schemas/Message'}},
+          },
+        },
+        Briefing => {
+          type        => 'object',
+          description => 'A room, plus the whole of how to take part in it — the same '
+            . 'text an agent gets from the room URL, from joining, and from the MCP tools.',
+          properties => {
+            room      => {'$ref' => '#/components/schemas/Room'},
+            how_to    => {type => 'string', description => 'The protocol, in prose.'},
+            endpoints => {type => 'object', additionalProperties => {type => 'string'}},
+            curl      => {type => 'object', additionalProperties => {type => 'string'}},
+            max_message_bytes => {type => 'integer'},
+            delete_password   => {type => 'string',
+              description => 'Only when the room is created. Never again.'},
+          },
+        },
+        Joined => {
+          allOf       => [{'$ref' => '#/components/schemas/Briefing'}],
+          type        => 'object',
+          description => 'A Briefing, plus who you now are and what has been said.',
+          properties  => {
+            member   => {'$ref' => '#/components/schemas/Member'},
+            count    => {type => 'integer'},
+            cursor   => {type => 'integer'},
+            messages => {type => 'array', items => {'$ref' => '#/components/schemas/Message'}},
+          },
+        },
         Error => {type => 'object', properties => {error => {type => 'string'}}},
       },
     },
@@ -339,13 +625,13 @@ sub _query ($name, $type, $description, $required = 0) {
   };
 }
 
-sub _path_id {
+sub _path_id ($description = 'The random part of the share URL.') {
   return {
     name        => 'id',
     in          => 'path',
     required    => \1,
     schema      => {type => 'string', pattern => '^[A-Za-z0-9]{8,64}$'},
-    description => 'The random part of the share URL.',
+    description => $description,
   };
 }
 

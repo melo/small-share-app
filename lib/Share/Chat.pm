@@ -1,0 +1,612 @@
+package Share::Chat;
+
+# Chat rooms, for agents working in different sessions — and for whoever opens
+# the URL in a browser.
+#
+# The file side of this service hands one artefact from one agent to one person.
+# This is the other shape the same problem takes: three agents in three
+# terminals, each holding a piece of the same job, with a human as the only wire
+# between them. A room is a URL handed over exactly like a file URL, and
+# everything else follows the file rules — an unguessable secret, no accounts,
+# gone in fifteen days.
+#
+# Three invariants, two of them inherited:
+#
+#   * `secret` is the only identifier, and holding it is what lets you read and
+#     post. There is nothing else to authenticate with.
+#   * Everything a room holds dies with the room: members and messages are
+#     deleted with it, on the same hourly pass that deletes expired files.
+#   * A message's id is a cursor. It comes from one monotonic sequence, so
+#     "everything since 4128" is answerable with an index lookup and no
+#     timestamps to be clever about.
+#
+# The schema lives here rather than in Share::Store, under its own migration
+# name in the same database file. Mojo::SQLite keeps a version per name, so the
+# two sets migrate independently — and the chat tables can be read, dumped and
+# reasoned about without going anywhere near the file store.
+
+use Mojo::Base -base, -signatures;
+use utf8;
+
+use Exporter                qw(import);
+use Mojo::SQLite::Migrations ();
+use Share::Store            qw(human_duration iso8601 password_hash password_ok token);
+
+has 'sql';    # the Mojo::SQLite that Share::Store already opened
+has 'log';
+
+has default_ttl_days => 15;
+has max_ttl_days     => 15;
+
+# A message is a paragraph, a decision, a stack trace worth quoting. Anything
+# bigger is a file, and this service already has somewhere to put those: upload
+# it and post the URL. The limit is deliberately small enough that a room stays
+# readable in a terminal and cheap to hand back through a model's context.
+has max_message_bytes => 16 * 1024;
+
+# Ceiling on the history one room keeps. Past it the oldest messages go, and
+# `pruned_to` remembers how far, so a caller asking for everything since a
+# message that no longer exists is TOLD it missed some rather than quietly
+# handed a shorter conversation than it asked for.
+has max_messages => 5000;
+
+# --------------------------------------------------------------- schema ------
+
+use constant MIGRATIONS => <<'SQL';
+-- 1 up
+CREATE TABLE chat_rooms (
+  id          INTEGER PRIMARY KEY,
+  secret      TEXT    NOT NULL UNIQUE,
+  topic       TEXT    NOT NULL,
+  purpose     TEXT,
+  created_by  TEXT,                     -- session id of whoever opened it
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  pruned_to   INTEGER NOT NULL DEFAULT 0,   -- highest message id dropped by the cap
+  delete_salt TEXT,
+  delete_hash TEXT
+);
+CREATE INDEX chat_rooms_expires_idx ON chat_rooms (expires_at);
+
+CREATE TABLE chat_members (
+  id           INTEGER PRIMARY KEY,
+  room_id      INTEGER NOT NULL,
+  session_id   TEXT    NOT NULL,
+  name         TEXT    NOT NULL,
+  -- Lowercased, and unique per room: two agents both called "planner" in the
+  -- same conversation is a coordination bug the room can prevent for free.
+  name_key     TEXT    NOT NULL,
+  about        TEXT,
+  kind         TEXT    NOT NULL,        -- agent | human
+  joined_at    INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX chat_members_session_idx ON chat_members (room_id, session_id);
+CREATE UNIQUE INDEX chat_members_name_idx ON chat_members (room_id, name_key);
+
+CREATE TABLE chat_messages (
+  id         INTEGER PRIMARY KEY,
+  room_id    INTEGER NOT NULL,
+  session_id TEXT    NOT NULL,
+  -- What the author was called when they wrote it. Denormalised on purpose: a
+  -- transcript should read the way it read at the time, not get rewritten
+  -- underneath everyone because somebody renamed themselves an hour later.
+  name       TEXT    NOT NULL,
+  kind       TEXT    NOT NULL,          -- message | join | system
+  body       TEXT    NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
+
+-- 1 down
+DROP TABLE chat_messages;
+DROP TABLE chat_members;
+DROP TABLE chat_rooms;
+SQL
+
+# A migrations object of our own rather than $sql->migrations, which is shared
+# with Share::Store: setting a name on that one would change which set the
+# automatic migration on first use runs.
+sub init ($self) {
+  Mojo::SQLite::Migrations->new(sqlite => $self->sql)->name('share_chat')
+    ->from_string(MIGRATIONS)->migrate;
+  return $self;
+}
+
+# ---------------------------------------------------------------- rooms ------
+
+sub create_room ($self, %args) {
+  my $topic = _clean_line($args{topic}, 120)
+    // _fail('a room needs a topic — one line saying what is being coordinated');
+  my $purpose = _clean_text($args{purpose}, 2000);
+
+  my $now      = time;
+  my $ttl      = $self->_ttl_seconds($args{ttl_days});
+  my $password = _clean_line($args{delete_password}, 200) // token(24);
+  my ($salt, $hash) = password_hash($password);
+
+  my $secret = token();
+  $self->sql->db->insert(
+    'chat_rooms',
+    { secret      => $secret,
+      topic       => $topic,
+      purpose     => $purpose,
+      created_by  => _clean_line($args{session_id}, 200),
+      created_at  => $now,
+      expires_at  => $now + $ttl,
+      delete_salt => $salt,
+      delete_hash => $hash,
+    }
+  );
+
+  my $room = $self->find_room($secret);
+  # The only moment the plaintext exists outside the caller's hand — same rule
+  # as an uploaded file, and the same consequence for losing it: the room can
+  # then only expire on its own.
+  $room->{delete_password} = $password;
+  return $room;
+}
+
+sub find_room ($self, $secret) {
+  return undef unless defined $secret && $secret =~ /\A[A-Za-z0-9]{8,64}\z/;
+  my $room = $self->sql->db->query('SELECT * FROM chat_rooms WHERE secret = ?', $secret)->hash;
+  return undef unless $room;
+  return undef if $room->{expires_at} <= time;    # expired but not yet reaped is gone
+  return $room;
+}
+
+# Same shape as Share::Store::remove, and the same refusal for both halves of
+# it, so a wrong password cannot be told from a room that never existed.
+sub remove_room ($self, $secret, $password = undef) {
+  my $room  = $self->sql->db->query('SELECT * FROM chat_rooms WHERE secret = ?', $secret)->hash;
+  my $refuse = 'no such room, or the wrong delete password';
+
+  return (0, $refuse) unless $room;
+  return (0, $refuse) unless password_ok($password, $room->{delete_salt}, $room->{delete_hash});
+
+  $self->_purge_room($room);
+  return (1, undef);
+}
+
+sub _purge_room ($self, $room) {
+  my $db = $self->sql->db;
+  $db->delete('chat_messages', {room_id => $room->{id}});
+  $db->delete('chat_members',  {room_id => $room->{id}});
+  $db->delete('chat_rooms',    {id      => $room->{id}});
+  return;
+}
+
+sub _ttl_seconds ($self, $days) {
+  return $self->default_ttl_days * 86400 unless defined $days && length $days;
+  _fail('ttl_days must be a number') unless $days =~ /\A\d+(?:\.\d+)?\z/;
+  my $secs = $days * 86400;
+  _fail(sprintf 'ttl_days must be at most %d', $self->max_ttl_days)
+    if $secs > $self->max_ttl_days * 86400;
+  _fail('ttl_days must be at least 1 hour (0.042)') if $secs < 3600;
+  return int $secs;
+}
+
+# -------------------------------------------------------------- members ------
+
+# Joining is how a session gets a name, and the name is what everyone else in
+# the room reads. Calling it again with the same session id is an update, not a
+# second member: an agent that reconnects, or a person who comes back to the
+# page, is the same participant.
+#
+# Returns (member, $announcement), where the announcement is the message row
+# this join produced — an arrival, or a rename — or undef when nothing about
+# the member changed and there is nothing to tell the room.
+sub join_room ($self, $room, %args) {
+  my $session_id = _clean_line($args{session_id}, 200)
+    // _fail('session_id is required — it is how the room tells participants apart');
+  my $kind = ($args{kind} // 'agent') eq 'human' ? 'human' : 'agent';
+
+  my $name = _clean_line($args{name}, 32)
+    // _fail('pick a name — something a person reading the room would recognise, '
+      . 'like "planner" or "api-refactor"');
+  _fail('a name needs at least one letter or digit') unless $name =~ /[[:alnum:]]/;
+
+  my $about = _clean_text($args{about}, 2000);
+
+  # Required of an agent, optional for a person. The paragraph exists so that
+  # every session in the room can see what the others are doing without asking;
+  # a human who has opened the page is already visibly present and has no
+  # work-in-progress to declare.
+  _fail('say what you are working on — one short paragraph, so the others know '
+      . 'what you are holding')
+    if $kind eq 'agent' && !defined $about;
+
+  my $db  = $self->sql->db;
+  my $now = time;
+
+  my $taken = $db->query('SELECT * FROM chat_members WHERE room_id = ? AND name_key = ?',
+    $room->{id}, lc $name)->hash;
+  _fail(qq{"$name" is taken in this room by another session — pick another one})
+    if $taken && $taken->{session_id} ne $session_id;
+
+  my $existing = $self->member($room, $session_id);
+
+  unless ($existing) {
+    $db->insert(
+      'chat_members',
+      { room_id      => $room->{id},
+        session_id   => $session_id,
+        name         => $name,
+        name_key     => lc $name,
+        about        => $about,
+        kind         => $kind,
+        joined_at    => $now,
+        last_seen_at => $now,
+      }
+    );
+    my $member = $self->member($room, $session_id);
+    # The arrival goes into the transcript rather than only into the roster, so
+    # anyone waiting on the room finds out that someone turned up, and what
+    # they said they were doing, without polling a second endpoint for it.
+    return ($member, $self->_write($room, $session_id, $name, join => $about // ''));
+  }
+
+  $db->update(
+    'chat_members',
+    { name         => $name,
+      name_key     => lc $name,
+      about        => $about // $existing->{about},
+      last_seen_at => $now,
+    },
+    {id => $existing->{id}}
+  );
+
+  my $member = $self->member($room, $session_id);
+  return ($member, undef) if $existing->{name} eq $name;
+  return ($member,
+    $self->_write($room, $session_id, $name, system => "$existing->{name} is now **$name**"));
+}
+
+sub member ($self, $room, $session_id) {
+  return undef unless defined $session_id && length $session_id;
+  return $self->sql->db->query('SELECT * FROM chat_members WHERE room_id = ? AND session_id = ?',
+    $room->{id}, $session_id)->hash;
+}
+
+sub members ($self, $room) {
+  # By id after the timestamp: two sessions can join in the same second, and a
+  # roster that reshuffles between two reads for no reason is a roster nobody
+  # trusts.
+  return $self->sql->db->query(
+    'SELECT * FROM chat_members WHERE room_id = ? ORDER BY joined_at, id', $room->{id})
+    ->hashes->to_array;
+}
+
+# Bookkeeping only, and never a reason to fail a read — the same rule, and for
+# the same reason, as Share::Store::touch.
+sub touch_member ($self, $room, $session_id) {
+  return unless defined $session_id && length $session_id;
+  eval {
+    $self->sql->db->query(
+      'UPDATE chat_members SET last_seen_at = ? WHERE room_id = ? AND session_id = ?',
+      time, $room->{id}, $session_id);
+    1;
+  } or do {
+    my $err = $@ || 'unknown error';
+    $self->log->warn("chat: touch failed for $room->{secret} (carrying on): $err") if $self->log;
+  };
+  return;
+}
+
+# ------------------------------------------------------------- messages ------
+
+sub post ($self, $room, %args) {
+  my $session_id = _clean_line($args{session_id}, 200) // _fail('session_id is required');
+  my $member     = $self->member($room, $session_id)
+    or _fail('join the room before posting: send your session_id, a name and one '
+      . 'paragraph about what you are working on');
+
+  my $body = _clean_text($args{body}, undef) // _fail('a message needs something in it');
+
+  # Measured in bytes, because that is what is stored and what everything
+  # downstream carries. A limit counted in characters would let an emoji-heavy
+  # message through at four times the size a plain one is allowed.
+  my $bytes = $body;
+  utf8::encode($bytes);
+  _fail(sprintf 'that message is %d bytes and the limit is %d — put the long thing in a '
+      . 'file, share it, and post the URL', length $bytes, $self->max_message_bytes)
+    if length $bytes > $self->max_message_bytes;
+
+  $self->touch_member($room, $session_id);
+  return $self->_write($room, $session_id, $member->{name}, message => $body);
+}
+
+sub _write ($self, $room, $session_id, $name, $kind, $body) {
+  my $db = $self->sql->db;
+  $db->insert(
+    'chat_messages',
+    { room_id    => $room->{id},
+      session_id => $session_id,
+      name       => $name,
+      kind       => $kind,
+      body       => $body,
+      created_at => time,
+    }
+  );
+
+  my $id  = $db->dbh->sqlite_last_insert_rowid;
+  my $row = $db->query('SELECT * FROM chat_messages WHERE id = ?', $id)->hash;
+  $self->_prune($room);
+  return $row;
+}
+
+# The per-room ceiling, enforced after the fact like the disk one: a room that
+# has been running for a fortnight sheds its oldest exchanges rather than
+# refusing the next message.
+sub _prune ($self, $room) {
+  my $cap = $self->max_messages or return;
+  my $db  = $self->sql->db;
+
+  my $count = $db->query('SELECT COUNT(*) FROM chat_messages WHERE room_id = ?', $room->{id})
+    ->array->[0];
+  return if $count <= $cap;
+
+  my $cut = $db->query(
+    'SELECT id FROM chat_messages WHERE room_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?',
+    $room->{id}, $cap)->array->[0];
+  return unless defined $cut;
+
+  $db->query('DELETE FROM chat_messages WHERE room_id = ? AND id <= ?', $room->{id}, $cut);
+  # Remembered so that a caller polling from an id that has since been dropped
+  # can be told it missed something, instead of being handed a gap it has no way
+  # to notice.
+  $db->query('UPDATE chat_rooms SET pruned_to = ? WHERE id = ?', $cut, $room->{id});
+  $room->{pruned_to} = $cut;
+  return;
+}
+
+# Always oldest-first, which is the order a transcript is read in.
+#
+#   since    everything after that message id
+#   q        case-insensitive substring match — grep, not a regex; see below
+#   limit    at most this many, defaulting to a hundred
+#
+# Without `since` the newest `limit` are returned, so opening a busy room hands
+# over the tail of the conversation rather than all of it.
+sub messages ($self, $room, %opt) {
+  my $limit = $opt{limit};
+  $limit = 100 unless defined $limit && $limit =~ /\A\d+\z/ && $limit > 0;
+  $limit = 500 if $limit > 500;
+
+  my @where = ('room_id = ?');
+  my @bind  = ($room->{id});
+
+  my $since = $opt{since};
+  if (defined $since && $since =~ /\A\d+\z/) {
+    push @where, 'id > ?';
+    push @bind,  $since;
+  }
+  else { $since = undef }
+
+  # Substring, deliberately, and the tool descriptions say so. A regular
+  # expression supplied by a caller is a hang waiting to happen — one nested
+  # quantifier over a few thousand messages takes a worker out of service, and
+  # there is no timeout in Perl's engine to put a stop to it. Everything grep is
+  # actually reached for here ("who mentioned the migration?") is a substring.
+  if (defined $opt{q} && length $opt{q}) {
+    push @where, 'instr(lower(body), lower(?)) > 0';
+    push @bind,  $opt{q};
+  }
+
+  my $sql = 'SELECT * FROM chat_messages WHERE ' . join(' AND ', @where);
+
+  # With a cursor the caller wants the NEXT hundred; without one it wants the
+  # LAST hundred. Same query, opposite ends, reversed back on the way out.
+  my $rows
+    = defined $since
+    ? $self->sql->db->query("$sql ORDER BY id ASC LIMIT ?",  @bind, $limit)->hashes->to_array
+    : [reverse @{$self->sql->db->query("$sql ORDER BY id DESC LIMIT ?", @bind, $limit)
+        ->hashes->to_array}];
+
+  return $rows;
+}
+
+# The id to poll from next. The newest message when there is one, and otherwise
+# whatever the caller already had — never zero, or a client that opens an empty
+# room would be handed the whole history on its next call.
+sub cursor ($self, $room, $rows, $since = undef) {
+  # Numeric, always. `since` arrives from a query string as a string, and a
+  # cursor that comes back as "999" one call and 999 the next is a difference
+  # somebody's client will eventually compare on.
+  return 0 + $rows->[-1]{id} if @$rows;
+  return 0 + $since if defined $since && $since =~ /\A\d+\z/;
+  return 0 + $self->last_id($room);
+}
+
+sub last_id ($self, $room) {
+  return $self->sql->db->query('SELECT COALESCE(MAX(id), 0) FROM chat_messages WHERE room_id = ?',
+    $room->{id})->array->[0];
+}
+
+# Did this caller ask for messages the cap has already deleted?
+sub missed ($self, $room, $since) {
+  return 0 unless defined $since && $since =~ /\A\d+\z/;
+  return $since < $room->{pruned_to} ? 1 : 0;
+}
+
+# ------------------------------------------------------- housekeeping --------
+
+sub stats ($self) {
+  my $now = time;
+  my $r   = $self->sql->db->query(
+    'SELECT COUNT(*) AS rooms FROM chat_rooms WHERE expires_at > ?', $now)->hash;
+  my $m = $self->sql->db->query(
+    'SELECT COUNT(*) AS messages FROM chat_messages WHERE room_id IN '
+      . '(SELECT id FROM chat_rooms WHERE expires_at > ?)', $now)->hash;
+  return {rooms => $r->{rooms}, messages => $m->{messages}};
+}
+
+# Called from the file reaper's hourly pass, once it has won the claim, so there
+# is one timer and one worker doing all of the deleting.
+sub reap ($self, $now = time) {
+  my $rooms = $self->sql->db->query('SELECT * FROM chat_rooms WHERE expires_at <= ?', $now)
+    ->hashes->to_array;
+  my $messages = 0;
+  for my $room (@$rooms) {
+    $messages += $self->sql->db->query('SELECT COUNT(*) FROM chat_messages WHERE room_id = ?',
+      $room->{id})->array->[0];
+    $self->_purge_room($room);
+  }
+  return {rooms => scalar(@$rooms), messages => $messages};
+}
+
+# ------------------------------------------- the public view of the rows -----
+
+# One representation for the REST API, the MCP tools and the templates alike, so
+# an agent and a person are never told different things about the same room.
+sub room_public ($self, $room, $base_url, %opt) {
+  my $left = $room->{expires_at} - time;
+  return {
+    id      => $room->{secret},
+    # Two URLs again, and for the same reason as a file's: one is the page a
+    # person opens, the other is what a machine talks to.
+    url     => "$base_url/c/$room->{secret}",
+    api_url => "$base_url/api/v1/chatrooms/$room->{secret}",
+    topic   => $room->{topic},
+    purpose => $room->{purpose},
+    created_at => iso8601($room->{created_at}),
+    expires_at => iso8601($room->{expires_at}),
+    expires_in => human_duration($left),
+    ($opt{members} ? (members => [map { $self->member_public($_) } @{$self->members($room)}]) : ()),
+  };
+}
+
+sub member_public ($self, $member) {
+  return {
+    session_id   => $member->{session_id},
+    name         => $member->{name},
+    about        => $member->{about},
+    kind         => $member->{kind},
+    joined_at    => iso8601($member->{joined_at}),
+    last_seen_at => iso8601($member->{last_seen_at}),
+  };
+}
+
+sub message_public ($self, $row) {
+  return {
+    id         => 0 + $row->{id},
+    session_id => $row->{session_id},
+    name       => $row->{name},
+    kind       => $row->{kind},
+    body       => $row->{body},
+    created_at => iso8601($row->{created_at}),
+  };
+}
+
+# ------------------------------------------------------------- briefing ------
+
+# What a session is told when it arrives — from `join_chatroom`, from the REST
+# join, and from fetching the room URL itself with anything that is not a
+# browser. An agent is handed this URL by a human who was handed it by another
+# agent, with no other context at all, so it has to be the whole of how to take
+# part: join, post, read, wait, grep, and where a file goes.
+#
+# It is one text and one table of endpoints rather than prose per tool, because
+# the alternative — each tool explaining a third of the protocol — is how a
+# session ends up polling in a loop when there is a `wait` parameter sitting
+# right there.
+sub briefing ($self, $room, $base_url) {
+  my $api = "$base_url/api/v1/chatrooms/$room->{secret}";
+  my $ttl = int(($room->{expires_at} - $room->{created_at}) / 86400);
+
+  my $how_to = sprintf <<'TXT', $api, $self->max_message_bytes, $api, $api, $api, $base_url, $ttl;
+This is a chat room. Agents working in different sessions coordinate here, and
+a person can open the same URL in a browser and take part.
+
+  1. JOIN FIRST. POST %s/members with your session_id, a
+     short name nobody else in the room has taken, and one paragraph saying what
+     you are working on. Everyone reads that paragraph; it is how the others
+     find out what you are holding without asking.
+
+  2. POST a message: POST .../messages with your session_id and "body".
+     Markdown, up to %d bytes of it.
+
+  3. READ: GET %s/messages?since=<id>. Every message
+     carries an id; keep the last one you saw and hand it back. With no `since`
+     you get the last 100, which is the room's recent history.
+
+  4. WAIT for the next thing said: GET %s/messages?since=<id>&wait=30.
+     The request holds open until someone posts or the wait runs out, then
+     answers in the same shape. Follow a room that way rather than asking again
+     every few seconds.
+
+  5. GREP: GET %s/messages?q=migration — case-insensitive
+     substring over everything the room still holds. A substring, not a regular
+     expression.
+
+NO ATTACHMENTS. Put the file on this same instance and post the URL:
+
+    curl -fsS -F 'file=@diagram.png' %s/api/v1/files
+
+The JSON that prints contains "url" — paste that into a message and anyone in
+the room, human or agent, can open it.
+
+Every message shows the name you picked, the session id you sent, and when it
+was posted. There is no authentication: whoever holds this URL can read the room
+and post to it, so treat the URL as the secret it is.
+
+The room, its messages and its roster are deleted %d days after the room was
+created, and the URL dies with them.
+TXT
+
+  return {
+    how_to    => $how_to,
+    room_url  => "$base_url/c/$room->{secret}",
+    api_url   => $api,
+    endpoints => {
+      join   => "POST $api/members",
+      post   => "POST $api/messages",
+      read   => "GET $api/messages?since=<id>",
+      wait   => "GET $api/messages?since=<id>&wait=30",
+      search => "GET $api/messages?q=<text>",
+      roster => "GET $api",
+    },
+    curl => {
+      join => sprintf(
+        q{curl -fsS -X POST -H content-type:application/json '%s/members' }
+          . q{-d '{"session_id":"$SESSION","name":"planner","about":"what I am working on"}'},
+        $api),
+      post => sprintf(
+        q{curl -fsS -X POST -H content-type:application/json '%s/messages' }
+          . q{-d '{"session_id":"$SESSION","body":"**done**: the migration is green"}'},
+        $api),
+      wait => qq{curl -fsS '$api/messages?since=<id>&wait=30'},
+    },
+    max_message_bytes => 0 + $self->max_message_bytes,
+  };
+}
+
+# --------------------------------------------------------------- helpers -----
+
+sub _fail ($msg) { die {share_error => $msg} }    ## no critic (RequireCarping)
+
+# One line: control characters out, whitespace collapsed, trimmed, cut to size.
+# Returns undef for anything that had no content to begin with, so a caller can
+# tell "not given" from "given and empty" with one `//`.
+sub _clean_line ($value, $max) {
+  return undef unless defined $value;
+  $value =~ s/[\x00-\x1f\x7f]/ /g;
+  $value =~ s/\s+/ /g;
+  $value =~ s/\A\s+|\s+\z//g;
+  return undef unless length $value;
+  return substr $value, 0, $max;
+}
+
+# Prose or markdown: newlines survive, everything else that a terminal would
+# choke on does not. $max is a character count and undef means no cut here —
+# messages are limited in bytes by `post`, which is what the caller is told.
+sub _clean_text ($value, $max) {
+  return undef unless defined $value;
+  $value =~ s/\r\n?/\n/g;
+  $value =~ s/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]//g;
+  $value =~ s/\A\s+|\s+\z//g;
+  return undef unless length $value;
+  return defined $max ? substr($value, 0, $max) : $value;
+}
+
+1;

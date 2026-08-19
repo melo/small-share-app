@@ -87,7 +87,20 @@ list:
 	     FROM files ORDER BY created_at DESC;" \
 	  2>/dev/null || echo "no database at $(DATA)/share.db (or sqlite3 is not installed)"
 
-## reap: delete expired files now instead of waiting for the hourly pass
+## rooms: what chat rooms are open, newest first, read from the database
+# Same reasoning as `list`: there is no endpoint that lists every room, because
+# nothing but the URL grants access to one.
+rooms:
+	@sqlite3 -header -column $(DATA)/share.db \
+	  "SELECT substr(r.secret,1,12)||'…' AS id, r.topic, \
+	          (SELECT COUNT(*) FROM chat_members m WHERE m.room_id = r.id) AS members, \
+	          (SELECT COUNT(*) FROM chat_messages g WHERE g.room_id = r.id) AS messages, \
+	          datetime(r.created_at,'unixepoch') AS opened, \
+	          datetime(r.expires_at,'unixepoch') AS expires \
+	     FROM chat_rooms r ORDER BY r.created_at DESC;" \
+	  2>/dev/null || echo "no database at $(DATA)/share.db (or sqlite3 is not installed)"
+
+## reap: delete expired files and rooms now instead of waiting for the hourly pass
 # </dev/null is not decoration: `docker compose exec -T` inherits this shell's
 # stdin, and without it a `make reap` inside a piped script swallows the rest of
 # the script.
@@ -110,4 +123,4 @@ backup:
 	  $(COMPOSE) start share; \
 	  echo "wrote backups/share-$$ts.tar.gz"; ls -lh backups/share-$$ts.tar.gz
 
-.PHONY: help test coverage e2e dev dev-logs dev-down up down ps logs ts-status health list reap du backup
+.PHONY: help test coverage e2e dev dev-logs dev-down up down ps logs ts-status health list rooms reap du backup

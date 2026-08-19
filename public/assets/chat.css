@@ -1,0 +1,164 @@
+/* The transcript document — the conversation inside the room's frame.
+ *
+ * Its own stylesheet, because it is its own document: sandboxed, in an opaque
+ * origin, with no access to the page around it. The chrome's stylesheet styles
+ * the room; this one styles what is said in it.
+ *
+ * The message bodies are markdown rendered by the same sanitiser that renders a
+ * shared file, so the rules at the bottom are the small, quiet subset of
+ * typography a chat message actually uses. github-markdown.css is deliberately
+ * not pulled in here: it is written for a document, and forty of them stacked
+ * in a scroller is not a document. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #ffffff;
+  --bg-soft: #f6f8fa;
+  --fg: #1f2328;
+  --fg-muted: #59636e;
+  --line: #d1d9e0;
+  --accent: #0969da;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #151b23;
+    --fg: #e6edf3;
+    --fg-muted: #9198a1;
+    --line: #3d444d;
+    --accent: #4493f8;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0.75rem 1rem 2rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.6 var(--sans);
+  -webkit-text-size-adjust: 100%;
+}
+
+.messages { list-style: none; margin: 0; padding: 0; }
+
+.msg {
+  padding: 0.5rem 0 0.6rem;
+  border-top: 1px solid var(--line);
+}
+
+.msg:first-child { border-top: 0; }
+
+.msg-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.6rem;
+  font-size: 0.78rem;
+  color: var(--fg-muted);
+}
+
+.msg-name { font-weight: 600; color: var(--fg); font-size: 0.85rem; }
+
+/* The session id is on every message because that is what identifies a session
+ * — but it is a UUID on a line with a name and a clock, so it gets the space
+ * left over and an ellipsis. The full one is in the title attribute. */
+.msg-session {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-head time { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+.msg-tag {
+  padding: 0 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.msg-body { margin-top: 0.2rem; }
+.msg-body > :first-child { margin-top: 0; }
+.msg-body > :last-child { margin-bottom: 0; }
+
+/* An arrival, and the paragraph that came with it: set apart, because it is the
+ * room telling you something rather than somebody saying it. */
+.msg-join, .msg-system { color: var(--fg-muted); }
+.msg-join .msg-body, .msg-system .msg-body { font-size: 0.9rem; }
+.msg-system .msg-body { font-style: italic; }
+
+/* Your own messages, marked by the frame's script once it knows who is reading.
+ * A tint down the left rather than a second column: a room with four agents in
+ * it reads as one conversation, not as two sides. */
+.msg.is-me { border-left: 3px solid var(--accent); padding-left: 0.6rem; margin-left: -0.75rem; }
+
+.searching {
+  margin: 0 0 0.75rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+}
+
+.empty { color: var(--fg-muted); font-size: 0.9rem; max-width: 52ch; }
+
+/* ---------------------------------------------------- markdown in a message */
+
+.msg-body p { margin: 0.4rem 0; }
+.msg-body h1, .msg-body h2, .msg-body h3,
+.msg-body h4, .msg-body h5, .msg-body h6 {
+  margin: 0.6rem 0 0.3rem;
+  font-size: 1rem;
+  line-height: 1.3;
+}
+
+.msg-body ul, .msg-body ol { margin: 0.4rem 0; padding-left: 1.4rem; }
+.msg-body li { margin: 0.15rem 0; }
+
+.msg-body a { color: var(--accent); }
+
+.msg-body code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  padding: 0.1em 0.3em;
+  background: var(--bg-soft);
+  border-radius: 4px;
+}
+
+.msg-body pre {
+  margin: 0.5rem 0;
+  padding: 0.6rem 0.75rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.msg-body pre code { padding: 0; background: none; font-size: 0.8rem; }
+
+.msg-body blockquote {
+  margin: 0.5rem 0;
+  padding-left: 0.75rem;
+  border-left: 3px solid var(--line);
+  color: var(--fg-muted);
+}
+
+.msg-body table { border-collapse: collapse; margin: 0.5rem 0; font-size: 0.85rem; }
+.msg-body th, .msg-body td { border: 1px solid var(--line); padding: 0.25rem 0.5rem; text-align: left; }
+.msg-body th { background: var(--bg-soft); }
+
+.msg-body img { max-width: 100%; height: auto; border-radius: 6px; }
+.msg-body hr { border: 0; border-top: 1px solid var(--line); margin: 0.75rem 0; }

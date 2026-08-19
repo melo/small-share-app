@@ -237,6 +237,178 @@ body.viewing { display: flex; flex-direction: column; overflow: hidden; }
 
 form { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.5rem; }
 
+/* -------------------------------------------------------------- chat rooms */
+
+/* Three bands: the facts, the conversation, the box you type into. Same shape
+ * as the viewer and for the same reason — the messages live in their own
+ * document, so the header stays put while they scroll, and nothing an agent
+ * wrote can reach this page or the cookie that says who you are. */
+body.chatting { display: flex; flex-direction: column; overflow: hidden; }
+
+.room { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+
+.roomhead {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0.75rem 1.5rem;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding: 0.6rem 1.25rem;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--line);
+}
+
+.roomhead-facts { flex: 1 1 24rem; min-width: 0; }
+
+.roomhead-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.75rem; }
+.roomhead h1 { font-size: 1.05rem; margin: 0; word-break: break-word; }
+.roomhead .sub { margin: 0; font-size: 0.85rem; color: var(--fg-muted); }
+
+.roomhead-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 0.35rem; }
+.roomsearch { display: flex; gap: 0.4rem; align-items: center; margin: 0; flex-wrap: wrap; }
+
+.roomsearch input {
+  padding: 0.35rem 0.6rem;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-width: 12rem;
+}
+
+.roomhead-expiry { margin: 0.35rem 0 0; font-size: 0.75rem; color: var(--fg-muted); }
+
+/* Who is in the room, and what each of them said they are working on. The
+ * paragraph is the reason the roster is here at all: a name alone would not be
+ * worth the space it takes from the conversation. */
+.roster { list-style: none; margin: 0.4rem 0 0; padding: 0; font-size: 0.8rem; }
+
+.roster li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.5rem;
+  padding: 0.15rem 0;
+}
+
+.roster-name { font-weight: 600; }
+.roster-kind {
+  padding: 0 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.roster-about { color: var(--fg-muted); flex: 1 1 18rem; min-width: 0; }
+.roster li.is-me .roster-name { color: var(--accent); }
+
+/* The same checkbox-and-label fold as the viewer's file bar, with the roster as
+ * the thing that folds: it is the part that grows with the room. */
+.roomhead-toggle { position: absolute; opacity: 0; width: 0; height: 0; }
+.roomhead-fold { font-size: 0.75rem; padding: 0.25rem 0.6rem; color: var(--fg-muted); cursor: pointer; }
+.roomhead-toggle:focus-visible ~ .roomhead .roomhead-fold { outline: 2px solid var(--accent); }
+.roomhead-toggle:checked ~ .roomhead .roster,
+.roomhead-toggle:checked ~ .roomhead .sub,
+.roomhead-toggle:checked ~ .roomhead .roomhead-expiry { display: none; }
+.roomhead-toggle:checked ~ .roomhead .fold-open,
+.roomhead-toggle:not(:checked) ~ .roomhead .fold-shut { display: none; }
+
+/* The conversation. Its own document, in its own frame — see the transcript
+ * route and assets/chat.css. */
+.transcript {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: var(--bg);
+}
+
+/* A plain form: it posts and lands back on the room with scripting off, and
+ * assets/chat.js intercepts the same submit when it is running. */
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0.6rem 1.25rem 0.8rem;
+  border-top: 1px solid var(--line);
+  background: var(--bg-soft);
+}
+
+.composer textarea {
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.composer textarea:focus-visible { outline: 2px solid var(--accent); border-color: var(--accent); }
+.composer-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.composer-me { font-size: 0.75rem; color: var(--fg-muted); }
+.composer-me code { font-size: 0.7rem; }
+.composer-hint { font-size: 0.75rem; color: var(--fg-muted); }
+.composer-actions .btn { margin-left: auto; }
+.composer-failed { margin: 0; font-size: 0.8rem; color: var(--danger); }
+.roomsearch-live { font-size: 0.75rem; padding: 0.25rem 0.6rem; }
+
+/* Shown once, to whoever opened the room at /c: its URL, and the one copy of
+ * the password that can close it early. The same shape as the delete password on
+ * the upload result page, and for the same reason — this is the only time it is
+ * ever on screen. */
+.opened {
+  margin: 1.5rem 0;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.opened p { margin: 0.35rem 0; font-size: 0.9rem; }
+.opened-headline { font-weight: 600; }
+.opened code { user-select: all; word-break: break-all; }
+.opened-secret { color: var(--fg-muted); font-size: 0.82rem; }
+
+/* The join page: a name, a paragraph, and a button. */
+.join-form { display: block; margin-top: 1.5rem; }
+.join-form label { display: block; font-size: 0.85rem; margin-bottom: 0.35rem; margin-top: 1rem; }
+.join-form .opt { color: var(--fg-muted); font-weight: 400; }
+.join-form input, .join-form textarea {
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.join-form textarea { resize: vertical; }
+.join-form input:focus-visible, .join-form textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  border-color: var(--accent);
+}
+.join-form .hint { margin: 0.35rem 0 0; }
+.join-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+
+@media (max-width: 40rem) {
+  .roomhead { flex-direction: column; align-items: stretch; gap: 0.5rem; }
+  .roomhead-facts { flex: 0 0 auto; }
+  .roomhead-actions { width: 100%; align-items: stretch; }
+  .roomsearch input { min-width: 0; flex: 1; }
+  .composer { padding: 0.5rem 0.9rem 0.7rem; }
+}
+
 /* ------------------------------------------------------------------ topbar */
 
 /* One header on every page, viewer included. Sticky and translucent so it stays

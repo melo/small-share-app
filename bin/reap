@@ -17,6 +17,7 @@ use strict;
 use warnings;
 
 use lib '/app/lib';
+use Share::Chat  ();
 use Share::Store ();
 
 my $store  = Share::Store->new(root => $ENV{SHARE_ROOT} || '/workspace')->init;
@@ -24,5 +25,14 @@ my $result = $store->reap(force => 1);
 
 printf "reaped %d file(s), %s\n", $result->{files}, Share::Store::human_size($result->{bytes});
 
+# Rooms live in the same database and expire on the same clock, so "delete
+# everything past its expiry, right now" has to mean them too.
+my $chat  = Share::Chat->new(sql => $store->sql)->init;
+my $rooms = $chat->reap;
+printf "reaped %d chat room(s), %d message(s)\n", $rooms->{rooms}, $rooms->{messages};
+
 my $stats = $store->stats;
 printf "still holding %d file(s), %s\n", $stats->{files}, Share::Store::human_size($stats->{bytes});
+
+my $held = $chat->stats;
+printf "still holding %d chat room(s), %d message(s)\n", $held->{rooms}, $held->{messages};

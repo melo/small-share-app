@@ -1,0 +1,670 @@
+#!/usr/bin/env perl
+
+# The chat rooms: the store, the six REST endpoints, the six MCP tools and the
+# three pages a person sees. Run by the same build stage as t/share.t, and for
+# the same reason — a room that cannot be joined, or one whose messages reach
+# the page holding the identity cookie, must never get as far as an image.
+#
+# A file of its own rather than more subtests in t/share.t, because
+# Mojolicious::Lite's app is a singleton in `main`: two Test::Mojo instances in
+# one process are two apps over two stores, and the second one pulls the rug out
+# from under the first. Separate processes have no such argument.
+#
+# Run it by hand with:  cd app && SHARE_ROOT=$(mktemp -d) prove -lv t/chat.t
+
+use Mojo::Base -strict, -signatures;
+use utf8;
+
+use File::Temp  ();
+use Mojo::File  qw(curfile);
+use Mojo::IOLoop ();
+# from_json, not decode_json: anything read out of an MCP result has already
+# been decoded from the response and is characters. See t/share.t.
+use Mojo::JSON  qw(from_json);
+use Test::Mojo  ();
+use Test::More;
+
+my $tmp = File::Temp->newdir;
+$ENV{SHARE_ROOT}     = "$tmp";
+$ENV{SHARE_BASE_URL} = 'https://share.example.test';
+
+# Generous for the bulk of the file, which posts far faster than any room ever
+# will. The limit gets a subtest of its own, against the running app.
+$ENV{SHARE_CHAT_RATE_PER_SECOND} = 1000;
+$ENV{SHARE_CHAT_RATE_PER_MINUTE} = 1000;
+
+# So the health subtest below has something to look at. It is off by default
+# everywhere else, deliberately — see share.pl.
+$ENV{SHARE_HEALTH_DETAIL} = 1;
+delete $ENV{SHARE_TTL_DAYS};
+
+my $t = Test::Mojo->new(curfile->dirname->sibling('share.pl'));
+
+my $PROTOCOL = '2026-07-28';
+my $META     = 'io.modelcontextprotocol/protocolVersion';
+my $CAPS     = 'io.modelcontextprotocol/clientCapabilities';
+my $INFO     = 'io.modelcontextprotocol/clientInfo';
+
+sub _mcp ($method, $params = undef, %opt) {
+  state $id = 2000;
+  my $p = {
+    %{$params // {}},
+    _meta => {$META => $PROTOCOL, $CAPS => {}, $INFO => {name => 'chat-tests', version => '1'}},
+  };
+
+  my %headers = ('MCP-Protocol-Version' => $PROTOCOL, 'Mcp-Method' => $method);
+  $headers{'Mcp-Name'} = $params->{name}
+    if $method eq 'tools/call' && defined $params->{name};
+
+  # A tool that WAITS answers with a promise, and MCP::Server delivers a promise
+  # over an SSE stream rather than as one JSON body. get_chat_messages with a
+  # `wait` is the only call in this suite shaped that way.
+  #
+  # Mojo parses an event stream into `sse` events and never fills the response
+  # body, so there is nothing in ->text to read afterwards: the events have to be
+  # collected as they arrive, which means subscribing before the request goes.
+  my @events;
+  $t->ua->once(start => sub ($ua, $tx) {
+    # The first `sse` carries no event at all — it is the stream announcing
+    # itself — so the payload is the only thing collected here.
+    $tx->res->content->on(sse => sub { push @events, $_[1] if $_[1] });
+  });
+
+  $t->post_ok('/mcp' => \%headers => json =>
+      {jsonrpc => '2.0', id => ++$id, method => $method, params => $p});
+  $t->status_is($opt{status} // 200);
+
+  my $res = $t->tx->res;
+  return $res->json unless ($res->headers->content_type // '') =~ m{text/event-stream};
+  return @events ? from_json($events[-1]{text}) : {};
+}
+
+# One tool call, unwrapped to the structured content it answered with.
+sub _call ($name, $args) {
+  my $res = _mcp('tools/call', {name => $name, arguments => $args});
+  return $res->{result};
+}
+
+# A room, made the way an agent makes one.
+sub _room (%args) {
+  $t->post_ok('/api/v1/chatrooms' => json => {topic => 'a room', %args})->status_is(201);
+  return $t->tx->res->json;
+}
+
+sub _join ($id, %args) {
+  $t->post_ok("/api/v1/chatrooms/$id/members" => json => {%args});
+  return $t->tx->res->json;
+}
+
+sub _post ($id, $session, $body) {
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => $session, body => $body});
+  return $t->tx->res->json;
+}
+
+# ------------------------------------------------------------ the briefing ---
+
+subtest 'a room is one URL, and the URL explains itself to whoever fetches it' => sub {
+  my $made = _room(topic => 'ship 1.4', purpose => 'three sessions, one release',
+    session_id => 'sess-a');
+
+  my $id = $made->{room}{id};
+  like $id, qr/\A[A-Za-z0-9]{32}\z/, 'the id is 32 base62 characters, like a file id';
+  is $made->{room}{url}, "https://share.example.test/c/$id", 'the URL a human is given';
+  is $made->{room}{api_url}, "https://share.example.test/api/v1/chatrooms/$id",
+    'and the one a machine talks to';
+  like $made->{delete_password}, qr/\A\S{8,}\z/, 'a delete password, once';
+
+  # The whole protocol, in the answer, because the agent on the other end of
+  # this URL may have no MCP server registered and nothing else to read.
+  like $made->{how_to}, qr/JOIN FIRST/,               'the briefing says to join first';
+  like $made->{how_to}, qr/wait=30/,                  'and that waiting beats polling';
+  like $made->{how_to}, qr/case-insensitive\s+substring/s, 'and what grep means here';
+  like $made->{how_to}, qr/NO ATTACHMENTS/,           'and that files go through the file side';
+  like $made->{how_to}, qr{https://share\.example\.test/api/v1/files},
+    'with the upload URL spelled out — not the room URL with /api/v1/files stuck on it';
+  like $made->{how_to}, qr/deleted 15 days after/, 'and the retention, as configured';
+  is $made->{max_message_bytes}, 16 * 1024, 'the message limit, as a number';
+
+  # Fetching the room URL itself with anything that has not asked for HTML is
+  # the same briefing. This is the path an agent takes when a person pastes the
+  # URL into its conversation.
+  $t->get_ok("/c/$id")->status_is(200)->content_type_like(qr{application/json})
+    ->json_is('/room/id' => $id)->json_has('/how_to')->json_has('/endpoints/wait')
+    ->json_has('/curl/post');
+
+  # …and it does NOT carry the delete password, which was disclosed once.
+  ok !exists $t->tx->res->json->{delete_password}, 'the briefing never repeats the password';
+
+  # A browser asks for HTML and gets the room instead.
+  $t->get_ok("/c/$id" => {Accept => 'text/html,application/xhtml+xml'})->status_is(200)
+    ->content_type_like(qr{text/html})->content_like(qr/Join the room/);
+
+  # ?json=1 for when you do not control the headers.
+  $t->get_ok("/c/$id?json=1" => {Accept => 'text/html'})->status_is(200)
+    ->content_type_like(qr{application/json});
+
+  $t->get_ok('/api/v1/chatrooms/nosuchroomnosuchroom12345678')->status_is(404)
+    ->json_like('/error' => qr/no such room/);
+  $t->get_ok('/c/nosuchroomnosuchroom12345678' => {Accept => 'text/html'})->status_is(404)
+    ->content_like(qr/does not point at a chat room/);
+
+  # …and an agent that curled a room which has since expired is told so in the
+  # JSON it came for, rather than being handed a page written for a person.
+  $t->get_ok('/c/nosuchroomnosuchroom12345678')->status_is(404)
+    ->content_type_like(qr{application/json})->json_like('/error' => qr/no such room/);
+};
+
+subtest 'a room can be opened just by asking for one' => sub {
+  # `curl …/c` is the whole ceremony: an agent gets a room and the briefing in
+  # one call, a person gets a room and lands at its door. It is a GET that
+  # creates something, which buys a URL short enough to type from memory.
+  $t->get_ok('/c')->status_is(201)->header_like(Location => qr{/c/[A-Za-z0-9]{32}\z})
+    ->json_is('/room/topic' => 'Untitled room')
+    ->json_has('/how_to')->json_has('/delete_password');
+
+  my $first = $t->tx->res->json;
+  ok $first->{delete_password}, 'and the one copy of the password to close it early';
+
+  # A second call is a second room. Nothing is reused and nothing is guessed.
+  $t->get_ok('/c')->status_is(201);
+  isnt $t->tx->res->json->{room}{id}, $first->{room}{id}, 'each call opens its own room';
+
+  $t->get_ok('/c?topic=ship+1.4&purpose=three+sessions,+one+release')->status_is(201)
+    ->json_is('/room/topic' => 'ship 1.4')
+    ->json_is('/room/purpose' => 'three sessions, one release');
+
+  # An uptime probe pointed at /c must not open a room a minute.
+  my $before = $t->app->chat->stats->{rooms};
+  $t->head_ok('/c')->status_is(200);
+  is $t->app->chat->stats->{rooms}, $before, 'HEAD creates nothing';
+
+  # The room it made is an ordinary room in every other way.
+  my $id = $first->{room}{id};
+  ok _join($id, session_id => 'sess-a', name => 'planner', about => 'opened it with curl'),
+    'and it can be joined and posted to like any other';
+  _post($id, 'sess-a', 'first thing said in it');
+  $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)->json_is('/count' => 2);
+};
+
+subtest 'the door drops a person at a room, and tells them once how to close it' => sub {
+  $t->reset_session;
+
+  my %html = (Accept => 'text/html');
+  $t->get_ok('/c?topic=opened+in+a+browser' => \%html)->status_is(302);
+  my $location = $t->tx->res->headers->location;
+  like $location, qr{/c/[A-Za-z0-9]{32}\z}, 'a browser is redirected to the room itself';
+
+  # The password is carried across the redirect and shown on the door — the same
+  # rule a file's delete password follows: the only copy, and never again.
+  $t->get_ok($location => \%html)->status_is(200)
+    ->content_like(qr/You opened this room/)
+    ->content_like(qr{Delete password: <code>\S+</code>})
+    ->content_like(qr/opened in a browser/)
+    ->content_like(qr/Join the room/);
+
+  $t->get_ok($location => \%html)->status_is(200)
+    ->content_unlike(qr/You opened this room/)
+    ->content_unlike(qr/Delete password/);
+};
+
+subtest 'opening rooms is rate limited too, in both dialects' => sub {
+  my $cfg = $t->app->config;
+  my @was = @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)};
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = (1, 1);
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+
+  $t->get_ok('/c')->status_is(201);
+  $t->get_ok('/c')->status_is(429)->json_like('/error' => qr/too many requests/)
+    ->header_like('Retry-After' => qr/\A\d+\z/);
+
+  # A browser is told the same thing in words rather than handed JSON.
+  $t->get_ok('/c' => {Accept => 'text/html'})->status_is(429)
+    ->content_like(qr/Not just yet/)->content_like(qr/few new rooms a minute/);
+
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = @was;
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+};
+
+# ---------------------------------------------------------------- joining ----
+
+subtest 'joining means a name nobody else has, and what you are working on' => sub {
+  my $id = _room(topic => 'joining')->{room}{id};
+
+  $t->post_ok("/api/v1/chatrooms/$id/members" => json => {session_id => 'a'})->status_is(400)
+    ->json_like('/error' => qr/pick a name/);
+  $t->post_ok("/api/v1/chatrooms/$id/members" => json => {name => 'a'})->status_is(400)
+    ->json_like('/error' => qr/session_id is required/);
+
+  # An agent that will not say what it is holding is the one thing a
+  # coordination room cannot have in it.
+  $t->post_ok("/api/v1/chatrooms/$id/members" => json => {session_id => 'a', name => 'planner'})
+    ->status_is(400)->json_like('/error' => qr/say what you are working on/);
+
+  my $joined = _join($id, session_id => 'sess-a', name => 'planner',
+    about => 'holding the release checklist');
+  $t->status_is(200);
+  is $joined->{member}{name}, 'planner', 'joined under the name it asked for';
+  is $joined->{member}{kind}, 'agent',   'as an agent';
+  is $joined->{count}, 1, 'and the arrival is in the transcript, not only in the roster';
+  is $joined->{messages}[0]{kind}, 'join', 'as a join';
+  is $joined->{messages}[0]{body}, 'holding the release checklist',
+    'carrying the paragraph, so anyone waiting on the room reads it at once';
+  is $joined->{cursor}, $joined->{messages}[0]{id}, 'with a cursor to read on from';
+
+  # Two agents called "planner" in one conversation is a coordination bug the
+  # room can refuse for free.
+  $t->post_ok("/api/v1/chatrooms/$id/members" => json =>
+      {session_id => 'sess-b', name => 'PLANNER', about => 'also planning'})
+    ->status_is(400)->json_like('/error' => qr/is taken in this room/);
+
+  # The same session calling again is an update, not a second member.
+  my $again = _join($id, session_id => 'sess-a', name => 'planner', about => 'now tagging');
+  is scalar @{$again->{room}{members}}, 1, 'rejoining does not clone the member';
+  is $again->{room}{members}[0]{about}, 'now tagging', 'and it updates the paragraph';
+  is $again->{count}, 1, 'with nothing new said about it';
+
+  # A rename is worth a line in the transcript: everyone else has been reading
+  # the old name all afternoon.
+  my $renamed = _join($id, session_id => 'sess-a', name => 'releaser', about => 'now tagging');
+  is $renamed->{member}{name}, 'releaser', 'renamed';
+  is $renamed->{count}, 2, 'and the room was told';
+  is $renamed->{messages}[-1]{kind}, 'system', 'as a system line';
+  like $renamed->{messages}[-1]{body}, qr/planner is now \*\*releaser\*\*/, 'saying so';
+
+  # The freed name is available again.
+  ok _join($id, session_id => 'sess-b', name => 'planner', about => 'took the old name')
+    ->{member}, 'a name released by a rename can be taken';
+};
+
+# --------------------------------------------------------------- posting ----
+
+subtest 'posting is for members, and a message is markdown and nothing else' => sub {
+  my $id = _room(topic => 'posting')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'planner', about => 'the checklist');
+
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'stranger', body => 'hello'})
+    ->status_is(400)->json_like('/error' => qr/join the room before posting/);
+
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json => {session_id => 'sess-a', body => ''})
+    ->status_is(400)->json_like('/error' => qr/a message needs something in it/);
+
+  my $said = _post($id, 'sess-a', "**staging is green**\n\n- ran the migration");
+  $t->status_is(201);
+  is $said->{message}{name}, 'planner', 'the message carries the name at the time';
+  is $said->{message}{session_id}, 'sess-a', 'and the session that sent it';
+  like $said->{message}{created_at}, qr/\AZ?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/, 'and a timestamp';
+  is $said->{cursor}, $said->{message}{id}, 'and the cursor is its id';
+
+  # Big things are files. This service has somewhere to put those already.
+  my $chat = $t->app->chat;
+  my $was  = $chat->max_message_bytes;
+  $chat->max_message_bytes(64);
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-a', body => 'x' x 100})
+    ->status_is(400)->json_like('/error' => qr/put the long thing in a file/);
+
+  # Bytes, not characters: an emoji must not buy four times the room.
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-a', body => "\x{1f680}" x 20})
+    ->status_is(400)->json_like('/error' => qr/\A那?that message is 80 bytes/i);
+  $chat->max_message_bytes($was);
+
+  # Form parameters work as well as JSON, because both are one line of curl.
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => form =>
+      {session_id => 'sess-a', body => 'posted as a form'})->status_is(201)
+    ->json_is('/message/body' => 'posted as a form');
+};
+
+# --------------------------------------------------------------- reading ----
+
+subtest 'reading from a cursor, and grepping what was said' => sub {
+  my $id = _room(topic => 'reading')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'planner', about => 'reading test');
+  my $first = _post($id, 'sess-a', 'one about the migration')->{message}{id};
+  _post($id, 'sess-a', 'two');
+  my $third = _post($id, 'sess-a', 'three, also migration')->{message}{id};
+
+  $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)
+    ->json_is('/count' => 4)->json_is('/cursor' => $third)->json_is('/missed' => Mojo::JSON->false)
+    ->json_is('/room/id' => $id)
+    ->json_is('/messages/0/kind' => 'join')
+    ->json_is('/messages/3/body' => 'three, also migration');
+
+  # Oldest first, always: that is the order a transcript is read in.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$first")->status_is(200)
+    ->json_is('/count' => 2)->json_is('/messages/0/body' => 'two')
+    ->json_is('/cursor' => $third);
+
+  # Nothing new is an empty answer that still moves nothing.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$third")->status_is(200)
+    ->json_is('/count' => 0)->json_is('/cursor' => $third);
+
+  # Watching a busy room brings the tail, not the history.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?limit=2")->status_is(200)
+    ->json_is('/count' => 2)->json_is('/messages/1/body' => 'three, also migration');
+
+  # grep: a substring, case-insensitively, oldest first.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?q=MIGRATION")->status_is(200)
+    ->json_is('/count' => 2)->json_is('/messages/0/id' => $first);
+  $t->get_ok("/api/v1/chatrooms/$id/messages?q=nothing-said-that")->status_is(200)
+    ->json_is('/count' => 0);
+
+  # A pattern is not a regular expression here, and must not behave like one.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?q=.*")->status_is(200)->json_is('/count' => 0);
+};
+
+subtest 'a room keeps only so much, and says when a reader missed some' => sub {
+  my $id   = _room(topic => 'pruning')->{room}{id};
+  my $chat = $t->app->chat;
+  _join($id, session_id => 'sess-a', name => 'planner', about => 'pruning test');
+
+  my $was = $chat->max_messages;
+  $chat->max_messages(3);
+  my $early = _post($id, 'sess-a', 'the first thing')->{message}{id};
+  _post($id, 'sess-a', "message $_") for 1 .. 4;
+
+  $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)->json_is('/count' => 3)
+    ->json_is('/messages/2/body' => 'message 4');
+
+  # A caller polling from a message that has since been dropped is TOLD, rather
+  # than handed a shorter conversation than it asked for and left to notice.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$early")->status_is(200)
+    ->json_is('/missed' => Mojo::JSON->true);
+  $chat->max_messages($was);
+};
+
+# ------------------------------------------------------------ long polling ---
+
+subtest 'a caller can wait for the next thing said instead of asking again' => sub {
+  my $id = _room(topic => 'waiting')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'planner', about => 'waiting test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/messages")->tx->res->json->{cursor};
+
+  # Posted from a timer, so the request really is parked while nothing has
+  # happened yet and really is woken by the write.
+  Mojo::IOLoop->timer(
+    0.3 => sub { $t->app->chat->post($t->app->chat->find_room($id),
+        session_id => 'sess-a', body => 'woke you') });
+
+  my $started = time;
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=10")->status_is(200)
+    ->json_is('/count' => 1)->json_is('/messages/0/body' => 'woke you');
+  my $took = time - $started;
+  ok $took < 5, "answered as soon as it was posted, not at the deadline (${took}s)";
+
+  # With something already waiting, `wait` costs nothing at all.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?wait=10")->status_is(200)->json_is('/count' => 2);
+
+  # And a wait that expires is an ordinary empty answer with the cursor intact.
+  my $latest = $t->tx->res->json->{cursor};
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$latest&wait=1")->status_is(200)
+    ->json_is('/count' => 0)->json_is('/cursor' => $latest);
+
+  # A search answers about what has been said, so it never waits.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?q=nothing&wait=30")->status_is(200)
+    ->json_is('/count' => 0);
+};
+
+# ------------------------------------------------------------- the human -----
+
+subtest 'a person is asked who they are before the room opens' => sub {
+  my $id = _room(topic => 'the human', purpose => 'a person and an agent')->{room}{id};
+  _join($id, session_id => 'agent-1', name => 'planner', about => 'holding the checklist');
+  $t->app->chat->post($t->app->chat->find_room($id),
+    session_id => 'agent-1', body => "# Plan\n\n<script>alert(1)</script>");
+
+  my %html = (Accept => 'text/html');
+  $t->get_ok("/c/$id" => \%html)->status_is(200)
+    ->content_like(qr/the human/)
+    ->content_like(qr/<label for="join-name">/)
+    # The roster is shown before joining: who is already in there is exactly
+    # what someone deciding whether to join wants to know.
+    ->content_like(qr/roster-name">planner/)
+    ->content_like(qr/holding the checklist/)
+    # Nothing said in the room is on this page. A name first.
+    ->content_unlike(qr/Plan/)
+    ->header_like('Content-Security-Policy' => qr/default-src 'none'/)
+    ->header_is('X-Robots-Tag' => 'noindex, nofollow, noarchive');
+
+  # A name is required, and the paragraph is not: a person who has opened the
+  # page is already visibly present.
+  $t->post_ok("/c/$id/join" => form => {name => '', about => ''})->status_is(400)
+    ->content_like(qr/pick a name/);
+  $t->post_ok("/c/$id/join" => form => {name => 'planner'})->status_is(400)
+    ->content_like(qr/is taken in this room/);
+
+  $t->post_ok("/c/$id/join" => form => {name => 'Pedro', about => 'deciding on the tag'})
+    ->status_is(302)->header_like(Location => qr{/c/$id\z});
+
+  # The identity cookie is this browser's, signed, and holds a name and a
+  # session id — there is no account behind it.
+  my $cookie = $t->tx->res->cookie('share');
+  ok $cookie, 'a session cookie was set';
+
+  $t->get_ok("/c/$id" => \%html)->status_is(200)
+    ->content_like(qr/<iframe class="transcript"/)
+    ->content_like(qr/data-cursor="\d+"/)
+    ->content_like(qr/data-me="human-[A-Za-z0-9]{12}"/)
+    ->content_like(qr/You are <strong>Pedro/)
+    ->content_like(qr/<form class="composer"/);
+
+  # The messages are in the frame, not in the page holding the cookie.
+  my $page = $t->tx->res->text;
+  unlike $page, qr/alert\(1\)/, 'no message text reaches the chrome page';
+
+  $t->get_ok("/c/$id/transcript" => \%html)->status_is(200)
+    ->content_like(qr/<li class="msg msg-join"/)
+    ->content_like(qr/<li class="msg msg-message"/)
+    ->content_like(qr{<h1>Plan</h1>})
+    # Rendered by the same sanitiser that renders an uploaded file, and framed
+    # by the same kind of sandbox. Neither is trusted alone.
+    ->content_unlike(qr/<script>alert/)
+    ->header_like('Content-Security-Policy' => qr/frame-ancestors https:/);
+
+  # Posting with scripting off is a form post that lands back on the room.
+  $t->post_ok("/c/$id/messages" => form => {body => 'from the browser'})->status_is(302);
+  $t->get_ok("/c/$id/transcript" => \%html)->status_is(200)
+    ->content_like(qr/from the browser/);
+
+  # Searching is a GET aimed at the frame, so it works with scripting off too.
+  $t->get_ok("/c/$id/transcript?q=browser" => \%html)->status_is(200)
+    ->content_like(qr/Messages matching/)->content_like(qr/from the browser/)
+    ->content_unlike(qr{<h1>Plan</h1>});
+
+  # The markup the browser is handed for a message that arrives while the page
+  # is open is the same template — one renderer, not two.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?html=1&limit=1")->status_is(200)
+    ->json_like('/messages/0/markup' => qr/<li class="msg msg-/)
+    ->json_like('/messages/0/markup' => qr/data-session=/);
+  $t->get_ok("/api/v1/chatrooms/$id/messages?limit=1")->status_is(200);
+  ok !exists $t->tx->res->json->{messages}[0]{markup},
+    'and an agent asking for the same messages is not sent HTML it has no use for';
+};
+
+subtest 'somebody who has not joined sees the door, not the room' => sub {
+  my $id = _room(topic => 'strangers')->{room}{id};
+
+  # A fresh browser: no cookie for this room, whatever the last subtest left.
+  $t->reset_session;
+  $t->get_ok("/c/$id/transcript" => {Accept => 'text/html'})->status_is(302)
+    ->header_like(Location => qr{/c/$id\z});
+  $t->post_ok("/c/$id/messages" => form => {body => 'sneaking in'})->status_is(302);
+  $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)->json_is('/count' => 0);
+};
+
+# ---------------------------------------------------------------- limits -----
+
+subtest 'a hammering caller is refused, and it does not cost an upload' => sub {
+  # The chat bucket and the upload bucket are separate on purpose: a busy room
+  # must not stop anybody sharing a file.
+  my $cfg = $t->app->config;
+  my @was = @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)};
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = (1, 1);
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+
+  my $made = _room(topic => 'fast');
+  $t->post_ok('/api/v1/chatrooms' => json => {topic => 'too fast'})->status_is(429)
+    ->json_like('/error' => qr/too many requests/)->header_like('Retry-After' => qr/\A\d+\z/);
+
+  # …while an upload is unaffected, because it is counted somewhere else.
+  $t->post_ok('/api/v1/files?filename=alongside.md' => '# fine')->status_is(201);
+  my $file = $t->tx->res->json;
+  $t->delete_ok("/api/v1/files/$file->{id}" =>
+      {'X-Delete-Password' => $file->{delete_password}})->status_is(200);
+
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = @was;
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+
+  # A room that was made before the limit bit is still perfectly usable.
+  ok _join($made->{room}{id}, session_id => 's', name => 'n', about => 'a')->{member},
+    'and the room made before the limit still works';
+};
+
+subtest 'health counts rooms and messages only where it is turned on' => sub {
+  $t->get_ok('/api/v1/health')->status_is(200)->json_is('/status' => 'ok')
+    ->json_has('/files')->json_has('/rooms')->json_has('/messages');
+  ok $t->tx->res->json->{rooms} > 0, 'and the rooms it is holding are counted';
+};
+
+# ------------------------------------------------------------------- MCP -----
+
+subtest 'MCP: the room tools are there, and they are about coordination' => sub {
+  my $res   = _mcp('tools/list');
+  my %tools = map { $_->{name} => $_ } @{$res->{result}{tools}};
+  ok $tools{$_}, "$_ is registered" for
+    qw(create_chatroom join_chatroom post_chat_message get_chat_messages
+    search_chat_messages delete_chatroom);
+
+  like $tools{create_chatroom}{description}, qr/other sessions/, 'create says what it is for';
+  like $tools{get_chat_messages}{description}, qr/HOLDS until/, 'and reading says it can wait';
+  like $tools{post_chat_message}{description}, qr/No attachments/,
+    'and posting says where a file goes';
+
+  # The server-level instructions mention the rooms, because an agent reads
+  # those before it has called anything.
+  my $discover = _mcp('server/discover');
+  like $discover->{result}{instructions}, qr/TALKING TO OTHER AGENTS/,
+    'the instructions introduce the rooms';
+};
+
+subtest 'MCP: open a room, hand over the URL, and talk in it' => sub {
+  my $made = _call('create_chatroom',
+    {topic => 'release 1.4', purpose => 'two agents', session_id => 'sess-a'});
+  my $info = $made->{structuredContent};
+  my $url  = $info->{room}{url};
+
+  like $url, qr{\Ahttps://share\.example\.test/c/[A-Za-z0-9]{32}\z}, 'a room URL to hand over';
+  like $made->{content}[-1]{text}, qr/Give the human this URL:\s+\Q$url\E/,
+    'said in words too, because handing it over is the whole action';
+  like $info->{how_to}, qr/JOIN FIRST/, 'with the same briefing the REST side gives';
+
+  # Every tool takes the URL as it was pasted, or just the id out of it.
+  my $joined = _call('join_chatroom',
+    {room => $url, session_id => 'sess-a', name => 'planner', about => 'the checklist'});
+  is $joined->{structuredContent}{member}{name}, 'planner', 'joined by URL';
+
+  my $id = $info->{room}{id};
+  ok _call('join_chatroom',
+    {room => $id, session_id => 'sess-b', name => 'builder', about => 'the container builds'})
+    ->{structuredContent}{member}, 'and joined by bare id';
+
+  my $said = _call('post_chat_message', {room => $url, session_id => 'sess-b',
+    body => 'image is up'})->{structuredContent};
+  is $said->{message}{name}, 'builder', 'posted';
+
+  my $read = _call('get_chat_messages', {room => $url})->{structuredContent};
+  is $read->{count}, 3, 'and read back — two arrivals and the message';
+  is $read->{cursor}, $said->{message}{id}, 'with a cursor to carry on from';
+
+  my $found = _call('search_chat_messages', {room => $url, q => 'IMAGE'})->{structuredContent};
+  is $found->{count}, 1, 'grep finds it, case insensitively';
+
+  is_deeply _call('search_chat_messages', {room => $url, q => 'nothing here'})->{content}[0]
+    {text} =~ /matches/ ? 1 : 0, 1, 'and says so plainly when nothing matches';
+
+  # An unknown room is an error the agent can read, not a crash.
+  my $missing = _call('get_chat_messages', {room => 'nosuchroomnosuchroom12345678'});
+  ok $missing->{isError}, 'an expired or closed room is an error result';
+  like $missing->{content}[0]{text}, qr/no live chat room/, 'and says which';
+
+  # Closing needs the password from create_chatroom.
+  ok _call('delete_chatroom', {room => $url, delete_password => 'wrong'})->{isError},
+    'a wrong password will not close a room';
+  my $closed = _call('delete_chatroom',
+    {room => $url, delete_password => $info->{delete_password}});
+  ok !$closed->{isError}, 'the right one does';
+  like $closed->{content}[0]{text}, qr/no longer works/, 'and says the URL is dead';
+
+  $t->get_ok("/api/v1/chatrooms/$id")->status_is(404);
+};
+
+subtest 'MCP: reading can wait, and waiting does not block the worker' => sub {
+  my $info = _call('create_chatroom', {topic => 'waiting over MCP'})->{structuredContent};
+  my $url  = $info->{room}{url};
+  my $id   = $info->{room}{id};
+  _call('join_chatroom',
+    {room => $url, session_id => 'sess-a', name => 'planner', about => 'waiting'});
+
+  my $cursor = _call('get_chat_messages', {room => $url})->{structuredContent}{cursor};
+
+  Mojo::IOLoop->timer(
+    0.3 => sub { $t->app->chat->post($t->app->chat->find_room($id),
+        session_id => 'sess-a', body => 'over here') });
+
+  my $waited = _call('get_chat_messages', {room => $url, since => $cursor, wait => 10});
+  is $waited->{structuredContent}{count}, 1, 'the tool answered when the message landed';
+  is $waited->{structuredContent}{messages}[0]{body}, 'over here', 'with the message';
+
+  # A wait that expires is an ordinary empty answer.
+  my $latest = $waited->{structuredContent}{cursor};
+  is _call('get_chat_messages', {room => $url, since => $latest, wait => 1})
+    ->{structuredContent}{count}, 0, 'and an empty one when nothing was said';
+};
+
+# ---------------------------------------------------------------- expiry -----
+
+subtest 'a room and everything in it goes when it expires' => sub {
+  my $made = _room(topic => 'expiring');
+  my $id   = $made->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'planner', about => 'about to expire');
+  _post($id, 'sess-a', 'said before the end');
+
+  my $chat = $t->app->chat;
+  my $room = $chat->find_room($id);
+  $chat->sql->db->query('UPDATE chat_rooms SET expires_at = ? WHERE id = ?',
+    time - 1, $room->{id});
+
+  # Expired but not yet reaped is gone as far as anybody asking is concerned —
+  # the same rule a file follows.
+  ok !$chat->find_room($id), 'the store will not hand back an expired room';
+  $t->get_ok("/api/v1/chatrooms/$id")->status_is(404);
+
+  my $reaped = $chat->reap;
+  is $reaped->{rooms}, 1, 'the reaper takes the room';
+  ok $reaped->{messages} >= 2, 'and every message in it';
+  is $chat->sql->db->query('SELECT COUNT(*) FROM chat_members WHERE room_id = ?',
+    $room->{id})->array->[0], 0, 'and the roster with them';
+};
+
+subtest 'closing a room early needs the password it was made with' => sub {
+  my $made = _room(topic => 'closing');
+  my $id   = $made->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'planner', about => 'closing');
+
+  # A wrong password and a room that never existed get the same answer, so this
+  # cannot be used to find out which ids exist.
+  $t->delete_ok("/api/v1/chatrooms/$id" => {'X-Delete-Password' => 'nope'})->status_is(403)
+    ->json_like('/error' => qr/no such room, or the wrong delete password/);
+  $t->delete_ok('/api/v1/chatrooms/nosuchroomnosuchroom12345678' =>
+      {'X-Delete-Password' => 'nope'})->status_is(403)
+    ->json_like('/error' => qr/no such room, or the wrong delete password/);
+
+  $t->delete_ok("/api/v1/chatrooms/$id" =>
+      {'X-Delete-Password' => $made->{delete_password}})->status_is(200)
+    ->json_is('/deleted' => $id);
+  $t->get_ok("/api/v1/chatrooms/$id")->status_is(404);
+};
+
+done_testing;

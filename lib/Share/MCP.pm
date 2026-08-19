@@ -1,6 +1,9 @@
 package Share::MCP;
 
-# The MCP server, built on the CPAN MCP distribution (MCP::Server, by the
+# The MCP server: four tools for handing a file to a human, and six for talking
+# to the other agents working on the same thing.
+#
+# Built on the CPAN MCP distribution (MCP::Server, by the
 # Mojolicious author). It speaks protocol revision 2026-07-28 — stateless, no
 # initialize handshake, `server/discover` in its place — and the HTTP transport
 # answers the older initialize-based handshake for clients that have not caught
@@ -9,7 +12,7 @@ package Share::MCP;
 # This file used to be 330 lines of hand-rolled JSON-RPC against the 2025-06-18
 # revision. Version negotiation, Origin validation, the 405s on GET and DELETE,
 # batching, error codes and schema validation of tool arguments all belong to
-# the library now. What is left is the four tools and what they say.
+# the library now. What is left is the tools and what they say.
 #
 # NO TOOL CARRIES FILE BYTES, in either direction. Uploading means calling
 # get_upload_url and running the curl command it returns; reading a file back
@@ -33,6 +36,7 @@ use utf8;
 
 use MCP::Server  ();
 use Mojo::URL    ();
+use Scalar::Util ();
 use Share::Store qw(human_size);
 
 # Built once at startup. The tools reach the request through their own context,
@@ -82,21 +86,34 @@ sub _tool ($server, %spec) {
 
   $spec{code} = sub ($tool, $args) {
     my $result = eval { $code->($tool, $args) };
+    my $failed = sub ($err) { _failure($tool, $name, $args, $err) };
+
+    # One tool waits — get_chat_messages, when it is asked to — and a waiting
+    # tool answers with a promise. A die inside one of those never reaches the
+    # eval above, so the same report is attached to its rejection: an agent
+    # should get the same sentence and the same reference whichever way the
+    # tool it called happened to be written.
+    return $result->catch($failed)
+      if !$@ && Scalar::Util::blessed($result) && $result->isa('Mojo::Promise');
+
     return $result unless my $err = $@;
-
-    my $ref = sprintf '%d.%d', $$, ++$FAILURES;
-    my $log = eval { _c($tool)->app->log };
-    $log->error(sprintf 'MCP tool %s failed [ref %s] with arguments (%s): %s',
-      $name, $ref, join(', ', sort keys %$args), $err)
-      if $log;
-
-    return $tool->text_result(
-      "$name failed inside the share server — this is a bug in the server, not "
-        . "something to work around. Quote reference $ref to whoever runs it; the "
-        . 'error itself is in its log under that reference.', 1);
+    return $failed->($err);
   };
 
   return $server->tool(%spec);
+}
+
+sub _failure ($tool, $name, $args, $err) {
+  my $ref = sprintf '%d.%d', $$, ++$FAILURES;
+  my $log = eval { _c($tool)->app->log };
+  $log->error(sprintf 'MCP tool %s failed [ref %s] with arguments (%s): %s',
+    $name, $ref, join(', ', sort keys %$args), $err)
+    if $log;
+
+  return $tool->text_result(
+    "$name failed inside the share server — this is a bug in the server, not "
+      . "something to work around. Quote reference $ref to whoever runs it; the "
+      . 'error itself is in its log under that reference.', 1);
 }
 
 # ----------------------------------------------------------------- prose -----
@@ -143,6 +160,16 @@ terminal: a long report, a generated diagram, a screenshot, a PDF.
 To read a file back, including one a human uploaded and sent you: call
 get_shared_file for its metadata, then fetch the "content_url" it returns. Do
 not ask this server for the contents; it will only ever give you the URL.
+
+TALKING TO OTHER AGENTS. This server also holds chat rooms, for when the work is
+split across sessions and the only wire between them is the person you are both
+talking to. Call create_chatroom, give the human the URL it returns, and they
+paste it into the other sessions; each one calls join_chatroom with a name and a
+paragraph saying what it is working on, and from then on post_chat_message,
+get_chat_messages (which can WAIT for the next one rather than being asked again
+and again) and search_chat_messages are the whole of it. The same URL opened in a
+browser is a room the human can read and take part in, live. No attachments —
+share the file and post its URL.
 
 Things worth knowing:
 
@@ -286,6 +313,256 @@ sub _tools ($server) {
     },
   );
 
+  # ------------------------------------------------------------ chat rooms ---
+  #
+  # Six tools over the six REST endpoints in share.pl, and nothing an agent
+  # could not do with curl against the room URL. They exist for the same reason
+  # get_upload_url does: they fill in the base URL and the shape of the call, so
+  # the one thing an agent has to get right is what it says.
+
+  _tool(
+    $server,
+    name        => 'create_chatroom',
+    description => 'Open a chat room for coordinating with agents in other sessions, and '
+      . 'get back the URL to hand over. Give that URL to the person you are talking to; '
+      . 'they paste it into the other sessions, and each one joins with a name and a '
+      . 'note about what it is working on. The same URL opened in a browser is a room '
+      . 'the human can read and post in. Use it when work is split across sessions and '
+      . 'relaying every message through a person is the bottleneck.',
+    input_schema => {
+      type       => 'object',
+      required   => ['topic'],
+      properties => {
+        topic   => _str('One line saying what is being coordinated here. Everyone sees it.'),
+        purpose => _str('A paragraph of context for whoever arrives: the goal, the '
+            . 'constraints, what "done" looks like.'),
+        session_id => _str('Your session id, recorded as the room\'s opener.'),
+        ttl_days   => {
+          type        => 'number',
+          description => 'Delete the room after this many days. Default and maximum 15.',
+        },
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c    = _c($tool);
+      my $room = $c->chat->create_room(
+        topic      => $args->{topic},
+        purpose    => $args->{purpose},
+        session_id => $args->{session_id},
+        ttl_days   => $args->{ttl_days},
+      );
+
+      my $info     = $c->chat->room_public($room, $c->base_url);
+      my $briefing = $c->chat->briefing($room, $c->base_url);
+
+      my $result = $tool->structured_result({
+        room            => $info,
+        delete_password => $room->{delete_password},
+        %$briefing,
+        next => 'Give the human the "url". Join it yourself with join_chatroom, and say '
+          . 'in this conversation what the room is for so they can pass that on.',
+      });
+
+      # Said in plain text as well as in the structure, because this is the one
+      # sentence the agent has to act on: hand the URL over.
+      push @{$result->{content}},
+        { type => 'text',
+          text => "The room is open.\n\nGive the human this URL:  $info->{url}\n\n"
+            . "They paste it into the other sessions. Each one calls join_chatroom with a "
+            . "name and one paragraph about what it is working on.\n\n"
+            . "delete_password: $room->{delete_password} — the only copy, and the only "
+            . "way to close the room before it expires in $info->{expires_in}.\n",
+        };
+      return $result;
+    },
+  );
+
+  _tool(
+    $server,
+    name        => 'join_chatroom',
+    description => 'Join a chat room you were given the URL for. Say who you are: a short '
+      . 'name the others will see on every message, and one paragraph about what you are '
+      . 'working on. You get back the roster, the recent messages and a cursor to read on '
+      . 'from. Do this before posting — a room where nobody says what they are holding is '
+      . 'a room that coordinates nothing.',
+    input_schema => {
+      type       => 'object',
+      required   => [qw(room session_id name about)],
+      properties => {
+        room       => _str('The room URL you were given, or just the id out of it.'),
+        session_id => _str('Your session id. It is shown on every message you post.'),
+        name       => _str('A short name a person would recognise — "planner", '
+            . '"api-refactor". It has to be one nobody else in the room has taken.'),
+        about => _str('One paragraph: what you are working on, and what you need from '
+            . 'the others. Everyone in the room reads this.'),
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      my ($member) = $c->chat->join_room($room,
+        session_id => $args->{session_id},
+        name       => $args->{name},
+        about      => $args->{about},
+        kind       => 'agent');
+
+      my $rows = $c->chat->messages($room);
+      return $tool->structured_result({
+        room     => $c->chat->room_public($room, $c->base_url, members => 1),
+        member   => $c->chat->member_public($member),
+        count    => scalar @$rows,
+        cursor   => $c->chat->cursor($room, $rows),
+        messages => [map { $c->chat->message_public($_) } @$rows],
+        %{$c->chat->briefing($room, $c->base_url)},
+      });
+    },
+  );
+
+  _tool(
+    $server,
+    name        => 'post_chat_message',
+    description => 'Say something in a room you have joined. Markdown. No attachments: '
+      . 'share the file with get_upload_url and put its URL in the message, which is how '
+      . 'the human reading along gets to see it too.',
+    input_schema => {
+      type       => 'object',
+      required   => [qw(room session_id body)],
+      properties => {
+        room       => _str('The room URL, or its id.'),
+        session_id => _str('The session id you joined with.'),
+        body       => _str('The message, as markdown.'),
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      my $row = $c->chat->post($room, session_id => $args->{session_id}, body => $args->{body});
+      return $tool->structured_result(
+        {message => $c->chat->message_public($row), cursor => 0 + $row->{id}});
+    },
+  );
+
+  _tool(
+    $server,
+    name        => 'get_chat_messages',
+    description => 'Read a room. With "since" you get everything said after that message '
+      . 'id; without it, the last hundred. Keep the "cursor" you get back and hand it in '
+      . 'as "since" next time. Set "wait" and the call HOLDS until somebody posts or the '
+      . 'wait runs out — that is how to follow a conversation, rather than asking again '
+      . 'in a loop.',
+    input_schema => {
+      type       => 'object',
+      required   => ['room'],
+      properties => {
+        room  => _str('The room URL, or its id.'),
+        since => {type => 'integer', description => 'Message id to read on from — the '
+            . '"cursor" from your last call.'},
+        limit => {type => 'integer', description => 'At most this many, up to 500. '
+            . 'Default 100.'},
+        wait => {type => 'integer', description => 'Seconds to wait for the next message '
+            . 'before answering with nothing. Up to 60. Default 0, which answers at once.'},
+        session_id => _str('Your session id, so the room can show you as still here.'),
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      $c->chat->touch_member($room, $args->{session_id});
+
+      my $since = $args->{since};
+      my %query = (since => $since, limit => $args->{limit});
+      my $wait  = $args->{wait} // 0;
+      $wait = 60 if $wait > 60;
+      $wait = 0  if $wait < 0;
+
+      my $answer = sub ($rows) {
+        $tool->structured_result({
+          count    => scalar @$rows,
+          cursor   => $c->chat->cursor($room, $rows, $since),
+          missed   => $c->chat->missed($room, $since) ? \1 : \0,
+          messages => [map { $c->chat->message_public($_) } @$rows],
+        });
+      };
+
+      # An ordinary read answers here and now, with a single JSON body, which is
+      # all this server has ever done. Only a caller that asked to WAIT gets the
+      # other shape: a promise, which MCP::Server awaits and delivers over an SSE
+      # stream. Nothing blocks either way — the same helper backs the REST long
+      # poll, and a worker holds as many waiting callers as it has connections.
+      return $answer->($c->chat->messages($room, %query)) unless $wait;
+
+      # The transport holds the request open for as long as this takes, so the
+      # connection has to be told to stop being impatient: Mojolicious hangs up
+      # on an idle one after fifteen seconds.
+      $c->inactivity_timeout($wait + 15);
+
+      return $c->chat_await($room, \%query, $wait)->then($answer);
+    },
+  );
+
+  _tool(
+    $server,
+    name        => 'search_chat_messages',
+    description => 'Grep a room: every message containing this text, oldest first, case '
+      . 'insensitive. It is a substring and not a regular expression — a pattern from a '
+      . 'caller is a way to hang the server, and "who mentioned the migration" is a '
+      . 'substring anyway.',
+    input_schema => {
+      type       => 'object',
+      required   => [qw(room q)],
+      properties => {
+        room  => _str('The room URL, or its id.'),
+        q     => _str('The text to look for.'),
+        limit => {type => 'integer', description => 'At most this many matches, up to '
+            . '500. The most recent ones. Default 100.'},
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      my $rows = $c->chat->messages($room, q => $args->{q}, limit => $args->{limit});
+      return $tool->text_result(qq{Nothing in this room matches "$args->{q}".})
+        unless @$rows;
+      return $tool->structured_result({
+        count    => scalar @$rows,
+        query    => $args->{q},
+        messages => [map { $c->chat->message_public($_) } @$rows],
+      });
+    },
+  );
+
+  _tool(
+    $server,
+    name        => 'delete_chatroom',
+    description => 'Close a room now, before it expires, taking every message in it. '
+      . 'Needs the delete_password from create_chatroom — the room URL alone cannot '
+      . 'delete anything, and no other call will tell you the password.',
+    input_schema => {
+      type       => 'object',
+      required   => [qw(room delete_password)],
+      properties => {
+        room            => _str('The room URL, or its id.'),
+        delete_password => _str('The delete_password create_chatroom returned.'),
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my (undef, $id) = _room($c, $args->{room});
+      my ($ok, $why) = $c->chat->remove_room($id, $args->{delete_password});
+      return $tool->text_result($why, 1) unless $ok;
+      return $tool->text_result("Closed $id. The URL no longer works, and the messages "
+          . 'are gone.');
+    },
+  );
+
   _tool(
     $server,
     name        => 'delete_shared_file',
@@ -315,6 +592,22 @@ sub _tools ($server) {
 sub _gone ($id) {
   $id = '' unless defined $id;
   return qq{no live file with id "$id" — it was deleted, or it expired};
+}
+
+# A room is handed to an agent as a URL, because a URL is what a person can
+# paste into a conversation. Taking the id out of one here means no tool ever
+# answers "that is not an id" to something that plainly names the room.
+sub _room ($c, $value) {
+  my $id = defined $value ? "$value" : '';
+  $id =~ s{[?#].*\z}{};
+  $id =~ s{/+\z}{};
+  $id =~ s{.*/}{};
+  return ($c->chat->find_room($id), $id);
+}
+
+sub _no_room ($id) {
+  return qq{no live chat room with id "$id" — it was closed, or it expired. Ask whoever }
+    . q{sent you the URL for a new one.};
 }
 
 1;

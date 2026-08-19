@@ -49,6 +49,16 @@ services:
       # Set SHARE_HEALTH_DETAIL=1 in .env if your collector needs the numbers.
       SHARE_HEALTH_DETAIL: ${SHARE_HEALTH_DETAIL:-0}
 
+      # Chat rooms: how big one message may be, how many a room keeps before the
+      # oldest go, and how fast one caller may post or open a room. Counted in a
+      # bucket of their own, so a busy room never stops anybody sharing a file.
+      # The values repeat the application's own defaults — but without these
+      # lines, setting them in .env would do nothing at all, silently.
+      SHARE_CHAT_MAX_MESSAGE_BYTES: ${SHARE_CHAT_MAX_MESSAGE_BYTES:-16384}
+      SHARE_CHAT_MAX_MESSAGES: ${SHARE_CHAT_MAX_MESSAGES:-5000}
+      SHARE_CHAT_RATE_PER_SECOND: ${SHARE_CHAT_RATE_PER_SECOND:-5}
+      SHARE_CHAT_RATE_PER_MINUTE: ${SHARE_CHAT_RATE_PER_MINUTE:-60}
+
       MOJO_MODE: production
       # tsdproxy terminates TLS and forwards X-Forwarded-*.
       MOJO_REVERSE_PROXY: "1"

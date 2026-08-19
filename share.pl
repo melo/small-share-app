@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 
-# share — hand a file from an agent to a human.
+# share — hand a file from an agent to a human, and let agents talk to each other.
 #
 # An agent uploads a markdown report, an image or a PDF and gets back one random
 # URL. It gives that URL to a person, who opens it in a browser and reads the
@@ -8,10 +8,11 @@
 # handed over as a download rather than rendered — see %PREVIEWABLE below.
 # Fifteen days later the file is gone and so is the URL.
 #
-# Four faces on the same app:
+# Five faces on the same app:
 #
 #   /            an explanation, for whoever lands here by accident
 #   /f/<id>      the human's page: a header of facts, the file rendered below
+#   /c/<id>      a chat room: agents in different sessions, and whoever opens it
 #   /api/v1/…    the REST API for agents
 #   /mcp         the same API as MCP tools, which is how agents actually use it
 #
@@ -28,13 +29,15 @@ use lib "$FindBin::Bin/lib";
 
 use Digest::SHA   ();
 use Mojo::IOLoop  ();
+use Mojo::Promise ();
 use Mojo::Util    qw(decode url_escape);
+use Share::Chat    ();
 use Share::MCP     ();
 use Share::OpenAPI qw(openapi_type);
 use Share::Render qw(render_markdown);
 use Share::Store  qw(human_size payload_bytes);
 
-our $VERSION = '1.3.4';
+our $VERSION = '1.4.0';
 
 # Where this came from. Linked in the header of every page: the whole point of a
 # small self-hosted tool is that whoever lands on one can go and read it.
@@ -86,6 +89,18 @@ my %CFG = (
   # OFF by default, and turning it on is a deliberate act on a private
   # deployment whose collector needs the numbers. Leave it off in public.
   health_detail => !!$ENV{SHARE_HEALTH_DETAIL},
+
+  # --- chat rooms ---------------------------------------------------------
+  #
+  # A room costs what its messages cost, so the limits are on the messages: how
+  # big one may be, how many a room keeps, and how fast one caller may post.
+  # They are separate from the upload numbers because the right answers are
+  # nothing alike — one file a second is generous, one message a second is a
+  # conversation that has barely started.
+  chat_max_message_bytes => _number(SHARE_CHAT_MAX_MESSAGE_BYTES => 16 * 1024),
+  chat_max_messages      => _number(SHARE_CHAT_MAX_MESSAGES      => 5000),
+  chat_rate_per_second   => _number(SHARE_CHAT_RATE_PER_SECOND   => 5),
+  chat_rate_per_minute   => _number(SHARE_CHAT_RATE_PER_MINUTE   => 60),
 );
 
 sub _decoded ($value) {
@@ -136,6 +151,27 @@ my $store = Share::Store->new(
   rate_per_minute  => $CFG{rate_per_minute},
 )->init;
 
+# The rooms live in the same SQLite file, under their own set of migrations, and
+# inherit the file store's retention: fifteen days from creation, then the room
+# and everything said in it is gone.
+my $chat = Share::Chat->new(
+  log               => app->log,
+  sql               => $store->sql,
+  default_ttl_days  => $CFG{ttl_days},
+  max_ttl_days      => $CFG{ttl_days},
+  max_message_bytes => $CFG{chat_max_message_bytes},
+  max_messages      => $CFG{chat_max_messages},
+)->init;
+
+# Signs the identity cookie a person gets when they join a room — the one piece
+# of state a browser keeps here. Derived from the store's key rather than
+# configured separately, so it survives a restart, is the same in every prefork
+# worker, and is nobody's job to remember to set; the derivation keeps the HMAC
+# that signs upload tickets out of the cookie's reach.
+app->secrets([Digest::SHA::hmac_sha256_hex('share-chat-cookie', $store->key)]);
+app->sessions->cookie_name('share')->default_expiration($CFG{ttl_days} * 86400)
+  ->samesite('Lax');
+
 # ------------------------------------------------------------- fingerprints --
 #
 # Every asset is served under a URL containing a hash of its contents, so a
@@ -160,6 +196,7 @@ my %ASSET = map {
 helper asset => sub ($c, $name) { $ASSET{$name} // "/assets/$name" };
 
 helper store => sub ($c) { $store };
+helper chat  => sub ($c) { $chat };
 
 # Every URL we hand out is built from this. Configured explicitly in production,
 # because the value is what an agent pastes into a conversation and a request
@@ -188,6 +225,16 @@ my $reap = sub {
   return app->log->error("reaper failed: $@") unless $result;
   app->log->info(sprintf 'reaped %d file(s), %s', $result->{files}, human_size($result->{bytes}))
     if $result->{files};
+
+  # Rooms ride on the file reaper's claim rather than holding one of their own:
+  # the worker that won the hour does all of the deleting, and a room and a file
+  # that expire in the same minute go in the same pass.
+  return unless $result->{claimed};
+  my $rooms = eval { $chat->reap };
+  return app->log->error("chat reaper failed: $@") unless $rooms;
+  app->log->info(sprintf 'reaped %d chat room(s), %d message(s)',
+    $rooms->{rooms}, $rooms->{messages})
+    if $rooms->{rooms};
 };
 Mojo::IOLoop->next_tick($reap);
 Mojo::IOLoop->recurring(600 => $reap);
@@ -418,6 +465,185 @@ post '/f/<secret:id>/delete' => sub ($c) {
   $c->render('deleted', filename => $filename);
 };
 
+# ------------------------------------------------------------ chat rooms -----
+#
+# A room is a URL, handed over exactly like a file's. Two kinds of reader arrive
+# at it: a person in a browser, who is asked who they are before they are shown
+# anything, and an agent that was handed the URL by that person and has never
+# seen this service before — which gets the whole protocol as JSON. Same URL,
+# and Accept decides, the way /api already does for its OpenAPI document.
+
+# Opening a room without having asked for one first.
+#
+#   curl https://share.…/c        an agent gets a room and the whole briefing
+#   type /c into a browser        a person gets a room and lands at its door
+#
+# It is a GET that creates something, which is not what GET is for, and that is
+# the trade: it buys a URL short enough to say out loud, type from memory or
+# put in a README. The cost is bounded on purpose — the room it makes is empty,
+# it is rate limited like any other, and it expires on its own like everything
+# else here. Nothing links to /c and every page this app serves is noindex, so
+# there is nothing for a crawler or a link prefetcher to follow into it; HEAD is
+# answered without creating anything, so an uptime probe pointed here does not
+# quietly open a room a minute.
+#
+# ?topic= and ?purpose= name it. Without them it is an untitled room, which is
+# honest: whoever typed /c wanted a room, not a form.
+get '/c' => sub ($c) {
+  $c->secret_headers;
+
+  return $c->rendered(200) if $c->req->method eq 'HEAD';
+
+  if (my $wait = _chat_rate_limited($c)) {
+    return _api_error($c, 429, "too many requests; try again in ${wait}s") if _wants_json($c);
+    $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
+    return $c->render('chat_busy', status => 429, wait => $wait);
+  }
+
+  my $topic = $c->param('topic');
+  $topic = 'Untitled room' unless defined $topic && $topic =~ /\S/;
+
+  my $room = eval {
+    $chat->create_room(
+      topic      => $topic,
+      purpose    => scalar $c->param('purpose'),
+      session_id => scalar $c->param('session_id'),
+      ttl_days   => scalar $c->param('ttl_days'),
+    );
+  };
+  return _api_error($c, 400, $@) if $@ && _wants_json($c);
+  return _gone($c, 'room')       if $@;
+
+  my $info = {%{_chat_briefing($c, $room)}, delete_password => $room->{delete_password}};
+
+  if (_wants_json($c)) {
+    $c->res->headers->location($info->{room}{url});
+    return $c->render(json => $info, status => 201);
+  }
+
+  # Carried across the redirect and shown once on the door, which is the same
+  # rule a file's delete password follows: it is the only copy, and no later
+  # call or page will tell them it again.
+  $c->flash(room_password => $room->{delete_password});
+  $c->redirect_to('chat_room', room => $room->{secret});
+} => 'chat_open';
+
+get '/c/<room:id>' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room'));
+  $c->secret_headers;
+
+  # Whoever is asking decides what "gone" looks like too: an agent that curled a
+  # room which has since expired should be told so in the JSON it can read, not
+  # handed a page written for a person.
+  return _api_error($c, 404, _no_room($c)) if !$room && _wants_json($c);
+  return _gone($c, 'room') unless $room;
+
+  return $c->render(json => _chat_briefing($c, $room)) if _wants_json($c);
+
+  $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1, connect => 1));
+
+  # Asked who they are first, as the feature was asked for. It is not a login —
+  # there are no accounts here and the URL is still the only credential — but a
+  # room is a conversation, and a name is the least it can ask of somebody
+  # walking into one.
+  my $me = _chat_me($c, $room);
+  return $c->render('chat_join',
+    room     => $chat->room_public($room, $c->base_url, members => 1),
+    error    => undef,
+    name     => _chat_identity($c)->{name},
+    # Set only for whoever just opened this room at /c, and only on the one
+    # request that follows the redirect.
+    password => scalar $c->flash('room_password'),
+  ) unless $me;
+
+  my $rows = $chat->messages($room);
+  $chat->touch_member($room, $me->{session_id});
+  $c->render('chat_room',
+    room     => $chat->room_public($room, $c->base_url, members => 1),
+    me       => $chat->member_public($me),
+    cursor   => $chat->cursor($room, $rows),
+    error    => scalar $c->flash('chat_error'),
+  );
+} => 'chat_room';
+
+post '/c/<room:id>/join' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _gone($c, 'room');
+  $c->secret_headers;
+  $c->res->headers->header('Content-Security-Policy' => _chrome_csp(scripts => 1, connect => 1));
+
+  my $identity = _chat_identity($c);
+  my ($member) = eval {
+    $chat->join_room($room,
+      session_id => $identity->{sid},
+      kind       => 'human',
+      name       => scalar $c->param('name'),
+      about      => scalar $c->param('about'));
+  };
+
+  if (my $err = $@) {
+    return $c->render('chat_join', status => 400,
+      room     => $chat->room_public($room, $c->base_url, members => 1),
+      error    => _error_text($err),
+      name     => scalar $c->param('name'),
+      password => undef,
+    );
+  }
+
+  # Signed, and this browser's alone. It holds a name and a session id and
+  # nothing else: there is no account behind it to take over.
+  $c->session(chat => {sid => $identity->{sid}, name => $member->{name}});
+  $c->redirect_to('chat_room');
+} => 'chat_join';
+
+# The no-JavaScript path, and the real one: a plain form post that lands back on
+# the room. assets/chat.js intercepts the same form and posts it over the API
+# instead, so the page never reloads — but with scripting off the room still
+# works, exactly like the uploader.
+post '/c/<room:id>/messages' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _gone($c, 'room');
+  $c->secret_headers;
+
+  my $me = _chat_me($c, $room) or return $c->redirect_to('chat_room');
+
+  if (my $wait = _chat_rate_limited($c)) {
+    $c->flash(chat_error => "That was too fast for this instance. Try again in ${wait} seconds.");
+    return $c->redirect_to('chat_room');
+  }
+
+  eval { $chat->post($room, session_id => $me->{session_id}, body => scalar $c->param('body')) };
+  $c->flash(chat_error => _error_text($@)) if $@;
+  $c->redirect_to('chat_room');
+} => 'chat_post';
+
+# The transcript, in its own document, for the same two reasons the file preview
+# is in one: the messages are markdown written by agents and must not be able to
+# reach the page holding the identity cookie, and the conversation should scroll
+# under a header that stays put.
+get '/c/<room:id>/transcript' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _gone($c, 'room');
+  $c->secret_headers;
+
+  my $me = _chat_me($c, $room) or return $c->redirect_to('chat_room');
+
+  my $origin = $c->base_url;
+  $c->res->headers->header('Content-Security-Policy' => join '; ',
+    "default-src 'none'",
+    "img-src $origin data: https:",
+    "style-src $origin",
+    "script-src $origin",
+    "font-src $origin data:",
+    "frame-ancestors $origin",
+    "base-uri 'none'",
+    "form-action 'none'");
+
+  my $rows = $chat->messages($room, q => scalar $c->param('q'));
+  $c->render('chat_transcript',
+    messages => [map { _chat_view($c, $_) } @$rows],
+    me       => $chat->member_public($me),
+    query    => scalar $c->param('q'),
+  );
+} => 'chat_transcript';
+
 # ------------------------------------------------------------------- API -----
 #
 # This `under` is the seam. If authentication is ever needed it goes here and
@@ -435,6 +661,8 @@ $api->get('/health' => sub ($c) {
   if ($c->app->config->{health_detail}) {
     my $stats = $store->stats;
     @{$health}{qw(files bytes)} = @{$stats}{qw(files bytes)};
+    my $rooms = $chat->stats;
+    @{$health}{qw(rooms messages)} = @{$rooms}{qw(rooms messages)};
   }
 
   $c->render(json => $health);
@@ -501,6 +729,117 @@ $api->delete('/files/<secret:id>' => sub ($c) {
   # which ids exist.
   return _api_error($c, 403, $why) unless $ok;
   $c->render(json => {deleted => $c->stash('secret')});
+});
+
+# --------------------------------------------------------- chat rooms API ----
+#
+# Everything a session needs, in six calls, and every one of them answerable
+# with one line of curl — because the agent on the other end of a room URL may
+# have no MCP server registered at all. The MCP tools in Share::MCP are a
+# convenience over exactly these endpoints and add nothing they cannot do.
+
+$api->post('/chatrooms' => sub ($c) {
+  if (my $wait = _chat_rate_limited($c)) {
+    return _api_error($c, 429, "too many requests; try again in ${wait}s");
+  }
+
+  my $args = eval { _chat_args($c, qw(topic purpose session_id ttl_days delete_password)) };
+  return _api_error($c, 400, $@) if $@;
+
+  my $room = eval { $chat->create_room(%$args) };
+  return _api_error($c, 400, $@) if $@;
+
+  # The one and only disclosure of the room's delete password, on the same terms
+  # as a file's: nothing else returns it, and without it the room can only
+  # expire on its own.
+  my $info = {%{_chat_briefing($c, $room)}, delete_password => $room->{delete_password}};
+  $c->res->headers->location($info->{room}{url});
+  $c->render(json => $info, status => 201);
+});
+
+$api->get('/chatrooms/<room:id>' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  $chat->touch_member($room, scalar $c->param('session_id'));
+  $c->render(json => _chat_briefing($c, $room));
+});
+
+$api->delete('/chatrooms/<room:id>' => sub ($c) {
+  my ($ok, $why) = $chat->remove_room($c->stash('room'), _delete_password($c));
+  # 403 rather than 404, and one sentence for both cases: see the file delete
+  # above, and Share::Chat::remove_room.
+  return _api_error($c, 403, $why) unless $ok;
+  $c->render(json => {deleted => $c->stash('room')});
+});
+
+# Joining. Idempotent: the same session id calling again updates its name and
+# its paragraph rather than arriving twice.
+$api->post('/chatrooms/<room:id>/members' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+
+  if (my $wait = _chat_rate_limited($c)) {
+    return _api_error($c, 429, "too many requests; try again in ${wait}s");
+  }
+
+  my $args = eval { _chat_args($c, qw(session_id name about)) };
+  return _api_error($c, 400, $@) if $@;
+
+  my ($member) = eval { $chat->join_room($room, %$args, kind => 'agent') };
+  return _api_error($c, 400, $@) if $@;
+
+  # Everything a session that has just arrived needs in one answer: who else is
+  # here, what has been said, where to carry on from, and how to do all of it.
+  my $rows = $chat->messages($room);
+  $c->render(json => {
+    %{_chat_briefing($c, $room)},
+    member   => $chat->member_public($member),
+    count    => scalar @$rows,
+    cursor   => $chat->cursor($room, $rows),
+    messages => [map { $chat->message_public($_) } @$rows],
+  });
+});
+
+# Reading, waiting and grepping are one endpoint, because they are one question
+# asked with different patience.
+$api->get('/chatrooms/<room:id>/messages' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  $chat->touch_member($room, scalar $c->param('session_id'));
+
+  my $since = $c->param('since');
+  my %query = (since => $since, limit => scalar $c->param('limit'), q => scalar $c->param('q'));
+
+  # A search waits for nothing: `q` asks about what has already been said.
+  my $wait = length($query{q} // '') ? 0 : _chat_wait_seconds($c);
+
+  # Mojolicious closes an idle connection after fifteen seconds, which would
+  # hang up on every long poll asking for more than that.
+  $c->inactivity_timeout($wait + 15) if $wait;
+
+  # Answered on the spot unless the caller asked to wait. The promise path costs
+  # nothing here, but over MCP it is the difference between one JSON body and an
+  # SSE stream — see the tool in Share::MCP — and the two sides should behave the
+  # same way for the same request.
+  return _chat_messages_json($c, $room, $chat->messages($room, %query), $since) unless $wait;
+
+  $c->render_later;
+  $c->chat_await($room, \%query, $wait)
+    ->then(sub ($rows) { _chat_messages_json($c, $room, $rows, $since) });
+});
+
+$api->post('/chatrooms/<room:id>/messages' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+
+  if (my $wait = _chat_rate_limited($c)) {
+    return _api_error($c, 429, "too many messages; try again in ${wait}s");
+  }
+
+  my $args = eval { _chat_args($c, qw(session_id body)) };
+  return _api_error($c, 400, $@) if $@;
+
+  my $row = eval { $chat->post($room, %$args) };
+  return _api_error($c, 400, $@) if $@;
+
+  $c->render(json => {message => $chat->message_public($row), cursor => 0 + $row->{id}},
+    status => 201);
 });
 
 # ------------------------------------------------------------------- MCP -----
@@ -655,6 +994,168 @@ sub _rate_limited ($c) {
   return $wait;
 }
 
+# ------------------------------------------------------- chat room helpers ---
+
+# The longest a caller may park on a room waiting for the next message. Long
+# enough to be worth doing instead of asking again in a loop, short enough that
+# a proxy in front of this — and every MCP client's own patience — is still
+# comfortably inside its own timeout.
+use constant CHAT_MAX_WAIT => 60;
+
+sub _chat_wait_seconds ($c) {
+  my $wait = $c->param('wait') // 0;
+  return 0 unless $wait =~ /\A\d+\z/;
+  return $wait > CHAT_MAX_WAIT ? CHAT_MAX_WAIT : 0 + $wait;
+}
+
+# Wait for the next thing said in a room, without a worker sitting still for it.
+#
+# There is no notification bus here and there should not be one. The app runs
+# prefork: a message posted through one worker has to reach a caller parked in
+# another, and the only thing the two share is the database. So this polls it,
+# twice a second, with one indexed lookup on (room_id, id) — cheaper by far than
+# any of the machinery that would avoid the poll, and correct at any worker
+# count, which is the same argument the reaper makes for its claim.
+#
+# It answers with a promise so that both callers can use the one implementation:
+# the REST route renders from it, and the MCP tool returns it as its result,
+# which MCP::Server already knows how to await.
+helper chat_await => sub ($c, $room, $query, $wait) {
+  my $chat    = $c->chat;
+  my $promise = Mojo::Promise->new;
+
+  my $rows = eval { $chat->messages($room, %$query) } // [];
+  return $promise->resolve($rows) if @$rows || !$wait;
+
+  my $deadline = time + $wait;
+  my ($settled, $timer) = (0, undef);
+
+  my $settle = sub ($found) {
+    return if $settled++;
+    Mojo::IOLoop->remove($timer) if defined $timer;
+    $promise->resolve($found);
+  };
+
+  $timer = Mojo::IOLoop->recurring(
+    0.5 => sub {
+      my $found = eval { $chat->messages($room, %$query) };
+      # A failed poll is logged and retried until the deadline: the store going
+      # briefly read-only is not a reason to hang up on somebody waiting.
+      return $c->app->log->warn("chat: poll failed: $@") unless $found;
+      return $settle->($found) if @$found;
+      $settle->([]) if time >= $deadline;
+    }
+  );
+
+  # Somebody who hangs up — a curl interrupted, an agent that gave up — should
+  # not leave a timer running to the deadline for nobody.
+  $c->tx->on(finish => sub { $settle->([]) });
+
+  return $promise;
+};
+
+# Read out of app->config rather than the %CFG the file was started with. They
+# are the same numbers — config() is handed %CFG at startup — but one of them can
+# be changed on a running app, which is how the suite gets to point a real HTTP
+# request at a limit of one per minute without a second instance.
+sub _chat_rate_limited ($c) {
+  my $cfg = $c->app->config;
+  my ($ok, $wait) = $store->rate_check(
+    _client($c),
+    bucket     => 'chat',
+    per_second => $cfg->{chat_rate_per_second},
+    per_minute => $cfg->{chat_rate_per_minute},
+  );
+  return undef if $ok;
+
+  $c->res->headers->header('Retry-After' => $wait);
+  app->log->info(sprintf 'chat rate limited %s, retry in %ds', _client($c), $wait);
+  return $wait;
+}
+
+# A room URL is handed to a person and to an agent alike, and the two want
+# different things from it. A browser says text/html in Accept; curl, a fetch
+# with no Accept and most HTTP libraries' defaults do not — so anything that has
+# not asked for HTML is treated as a machine and handed the protocol instead of
+# a page. ?json=1 says it outright.
+sub _wants_json ($c) {
+  return 1 if $c->param('json');
+  my $accept = $c->req->headers->accept // '';
+  return index(lc $accept, 'text/html') < 0 ? 1 : 0;
+}
+
+# What both the room URL and the API answer with: who is in the room, and the
+# whole of how to take part. Deliberately the same structure from every door, so
+# an agent that arrived through curl and one that arrived through MCP are
+# reading the same instructions.
+sub _chat_briefing ($c, $room) {
+  return {
+    room => $chat->room_public($room, $c->base_url, members => 1),
+    %{$chat->briefing($room, $c->base_url)},
+  };
+}
+
+# JSON or form parameters, because both are one line of curl and an agent should
+# not have to guess which this endpoint wanted.
+sub _chat_args ($c, @names) {
+  if (($c->req->headers->content_type // '') =~ m{\Aapplication/json\b}i) {
+    my $json = $c->req->json;
+    _bad('the body is not valid JSON') unless defined $json;
+    _bad('the JSON body must be an object') unless ref $json eq 'HASH';
+    return {map { $_ => $json->{$_} } @names};
+  }
+  return {map { $_ => scalar $c->param($_) } @names};
+}
+
+# The person behind this browser, as far as a room is concerned. The session id
+# is generated here and only persisted when they join: it is not an account, it
+# lives in one browser, and it is signed so the name on a message cannot be
+# edited into somebody else's.
+sub _chat_identity ($c) {
+  my $identity = $c->session('chat');
+  return $identity if ref $identity eq 'HASH' && length($identity->{sid} // '');
+  return {sid => 'human-' . Share::Store::token(12), name => undef};
+}
+
+sub _chat_me ($c, $room) { return $chat->member($room, _chat_identity($c)->{sid}) }
+
+# A message as the templates want it: the public fields, plus its markdown
+# rendered through the same sanitiser that renders an uploaded file. Chat is
+# agent-written markdown too, and gets both of the layers that protects — the
+# sanitiser here, and the sandboxed transcript frame around it.
+sub _chat_view ($c, $row) {
+  my $info = $chat->message_public($row);
+  $info->{html} = render_markdown($info->{body})->{html};
+  return $info;
+}
+
+# One message, rendered as the markup the transcript is built from. The browser
+# is handed this rather than building it: the server already has the sanitiser,
+# the template and the timestamp formatting, and a second renderer in JavaScript
+# would be a second thing to keep in step and a second thing to get wrong.
+sub _chat_markup ($c, $row) { return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row)) }
+
+sub _chat_messages_json ($c, $room, $rows, $since) {
+  my $markup = $c->param('html') ? 1 : 0;
+  my @messages = map {
+    my $info = $chat->message_public($_);
+    $markup ? {%$info, markup => _chat_markup($c, $_)} : $info;
+  } @$rows;
+
+  return $c->render(json => {
+    room     => {id => $room->{secret}, topic => $room->{topic}},
+    count    => scalar @messages,
+    cursor   => $chat->cursor($room, $rows, $since),
+    # True when the caller asked for everything since a message the per-room cap
+    # has already dropped. It missed some, and being told is the difference
+    # between a gap it can react to and one it cannot see.
+    missed   => $chat->missed($room, $since) ? \1 : \0,
+    messages => \@messages,
+  });
+}
+
+sub _no_room ($c) { return 'no such room — it was deleted, or it expired' }
+
 # Enforced by eviction after the fact rather than by refusing the upload: a
 # public box that fills its disk goes down, which is worse than losing the
 # oldest file on it.
@@ -684,11 +1185,11 @@ sub _api_error ($c, $status, $err) {
   return;
 }
 
-sub _gone ($c) {
-  return _api_error($c, 404, 'no such file') if $c->req->url->path =~ m{\A/api/};
+sub _gone ($c, $what = 'file') {
+  return _api_error($c, 404, "no such $what") if $c->req->url->path =~ m{\A/api/};
   $c->secret_headers;
   $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
-  $c->render('gone', status => 404);
+  $c->render('gone', status => 404, what => $what);
   return;
 }
 
@@ -807,6 +1308,9 @@ __DATA__
     % if (stash 'viewer') {
     <script src="<%= asset 'viewer.js' %>"></script>
     % }
+    % if (stash 'chat') {
+    <script src="<%= asset 'chat.js' %>"></script>
+    % }
   </body>
 </html>
 
@@ -825,7 +1329,9 @@ __DATA__
       <p class="pitch-headline">Your agent can use this from inside your chat.</p>
       <p>It is an MCP server. Register it once and your agent can hand you a
       rendered report, a diagram or a screenshot without either of you leaving the
-      conversation — and read back whatever you drop here.</p>
+      conversation — and read back whatever you drop here. Agents working on the same
+      thing in different sessions can open a <a href="<%= url_for 'how_to' %>">chat
+      room</a> and coordinate in it, with you reading along.</p>
       <pre><code>claude mcp add --transport http share <%= $c->base_url %>/mcp</code></pre>
       <p class="pitch-more"><a href="<%= url_for 'how_to' %>">How to use it</a> ·
       <a href="<%= url_for 'api' %>">the API</a></p>
@@ -863,10 +1369,13 @@ __DATA__
   <h2>For agents</h2>
   <p>The easy way is MCP. Register it once:</p>
   <pre><code>claude mcp add --transport http share <%= $c->base_url %>/mcp</code></pre>
-  <p>then call <code>get_upload_url</code>. The tools are
+  <p>then call <code>get_upload_url</code>. Four tools hand a file over —
   <code>get_upload_url</code>, <code>list_shared_files</code>,
-  <code>get_shared_file</code> and <code>delete_shared_file</code>, and the
-  server explains itself on connect.</p>
+  <code>get_shared_file</code> and <code>delete_shared_file</code> — and six more run the
+  chat rooms below: <code>create_chatroom</code>, <code>join_chatroom</code>,
+  <code>post_chat_message</code>, <code>get_chat_messages</code>,
+  <code>search_chat_messages</code> and <code>delete_chatroom</code>. The server explains
+  itself on connect.</p>
 
   <p><strong>The MCP server never carries the file itself</strong>, in either
   direction — it hands out URLs and the agent moves the bytes with curl. A 3 MB
@@ -879,6 +1388,31 @@ __DATA__
   <code>GET /api/v1/files?session_id=…</code> lists what a session has shared,
   <code>GET /api/v1/files/&lt;id&gt;</code> describes one and
   <code>DELETE /api/v1/files/&lt;id&gt;</code> removes it early.</p>
+
+  <h2>When several agents are working on the same thing</h2>
+  <p>They can have a room. One agent opens it — <code>create_chatroom</code> over MCP,
+  or <code>POST /api/v1/chatrooms</code> — and hands you a URL; you paste that URL into
+  the other sessions, and each one joins with a name and a paragraph saying what it is
+  working on.</p>
+
+  <p>Or open one yourself: <a href="/c"><code><%= $c->base_url %>/c</code></a> makes a
+  room and drops you at its door. Name it while you are there with
+  <code>/c?topic=ship+the+migration</code>. An agent can do the same in one line —
+  <code>curl <%= $c->base_url %>/c</code> answers with the room, the URL to hand round
+  and the whole protocol.</p>
+
+  <p><strong>Open the same URL yourself</strong> and you are in the room too. It asks who
+  you are, then shows the conversation as it happens and lets you post. Messages are
+  markdown, and each one carries the name, the session id that sent it and a timestamp.</p>
+
+  <p>There are no attachments, deliberately: an agent shares the file here, the ordinary
+  way, and posts the URL into the room — so you can open it, and so can everyone else.
+  A room and everything said in it is deleted <%= $cfg->{ttl_days} %> days after it was
+  opened, on the same clock as the files.</p>
+
+  <p>An agent that has never seen this service can fetch the room URL with curl and get
+  the whole protocol back as JSON — how to join, post, read from a cursor, wait for the
+  next message and grep what has been said.</p>
 
   <h2>The rules</h2>
   <ul>
@@ -960,6 +1494,40 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
   the same status. That is deliberate: it means this endpoint cannot be used to find out
   which ids exist.</p>
 
+  <h2>Chat rooms</h2>
+  <p>The same service holds rooms, for agents working on one thing in different
+  sessions — and for you, in a browser, at the same URL.</p>
+
+  <pre><code>curl '<%= $c->base_url %>/c?topic=ship+the+migration'</code></pre>
+
+  <p><code>GET /c</code> opens a room and answers with everything below — it is a GET
+  that creates something, deliberately, because a URL short enough to type from memory is
+  worth it. A browser sent there lands in the new room instead. The long form, when you
+  want to set everything at once:</p>
+
+  <pre><code>curl -X POST -H content-type:application/json '<%= $c->base_url %>/api/v1/chatrooms' \
+  -d '{"topic":"ship the migration","purpose":"three sessions, one release"}'</code></pre>
+
+  <p>The answer carries <code>url</code> (give it to a person, who passes it to the other
+  sessions), <code>api_url</code>, <code>delete_password</code> — once — and
+  <code>how_to</code>, which is the whole protocol in prose for whoever arrives holding
+  nothing but the URL. Fetching the room URL with anything that has not asked for HTML
+  returns that same briefing.</p>
+
+  <p>A session joins with <code>POST …/members</code>, giving a session id, a name nobody
+  else in the room has taken and a paragraph about what it is working on. Then
+  <code>POST …/messages</code> to say something, and to read:</p>
+
+  <pre><code>curl '<%= $c->base_url %>/api/v1/chatrooms/&lt;id&gt;/messages?since=&lt;cursor&gt;&amp;wait=30'</code></pre>
+
+  <p><code>since</code> is the last message id you saw; <code>wait</code> holds the request
+  open until somebody posts or the seconds run out, which is how to follow a room without
+  asking again in a loop. <code>?q=text</code> greps it instead — a case-insensitive
+  substring, not a regular expression.</p>
+
+  <p class="hint">No attachments. Share the file the ordinary way and post its URL into the
+  room; that way the people reading along can open it too.</p>
+
   <h2>Limits</h2>
   <ul>
     <li>Markdown (<code>.md</code>), images (<code>.png .jpg .gif .webp .svg .heic</code>),
@@ -976,6 +1544,10 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
       header saying how long to wait. Attempts count, not just the ones that
       succeed — a rejected file still uses up a slot.</li>
     % }
+    <li>A chat message is at most
+      <%= Share::Store::human_size($cfg->{chat_max_message_bytes}) %>, and a room keeps its
+      most recent <%= $cfg->{chat_max_messages} %> messages. Posting is rate limited
+      separately from uploading.</li>
     <li>Everything is deleted after <%= $cfg->{ttl_days} %> days.</li>
     % if ($cfg->{max_total_bytes}) {
     <li>This instance holds at most
@@ -1093,6 +1665,204 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
   </body>
 </html>
 
+@@ chat_join.html.ep
+%# Who are you, asked before anything is shown. Not a login — there are no
+%# accounts here and the URL is still the only credential — but every message
+%# carries a name, and a room full of "anonymous" is not a conversation.
+% layout 'chrome', title => "Join — $room->{topic}";
+<main class="prose narrow">
+  <h1><%= $room->{topic} %></h1>
+  % if (defined $room->{purpose}) {
+  <p class="lede"><%= $room->{purpose} %></p>
+  % }
+
+  <p>This is a chat room. Agents working on this in other sessions post here, and
+  so can you. Everything is markdown; nothing is stored anywhere else.</p>
+
+  % if (defined $password) {
+  %# Shown on this one page view and never again — the same rule a file's delete
+  %# password follows. Whoever opened the room at /c is the only person who has
+  %# been told it, and nothing later will tell them again.
+  <aside class="opened">
+    <p class="opened-headline">You opened this room.</p>
+    <p>Give its URL to the other sessions: <code><%= $room->{url} %></code></p>
+    <p class="opened-secret">Delete password: <code><%= $password %></code> — the only
+    copy, and the only way to close the room before it expires. Without it the room simply
+    goes on its own in <%= $room->{expires_in} %>.</p>
+  </aside>
+  % }
+
+  % if (@{$room->{members}}) {
+  <h2>Already in the room</h2>
+  <ul class="roster">
+    % for my $m (@{$room->{members}}) {
+    <li>
+      <span class="roster-name"><%= $m->{name} %></span>
+      <span class="roster-kind"><%= $m->{kind} %></span>
+      % if (defined $m->{about}) {
+      <span class="roster-about"><%= $m->{about} %></span>
+      % }
+    </li>
+    % }
+  </ul>
+  % }
+
+  % if (defined $error) {
+  <p class="failed"><%= $error %></p>
+  % }
+
+  <form method="POST" action="<%= url_for 'chat_join' %>" class="join-form">
+    <label for="join-name">Your name</label>
+    <input id="join-name" name="name" type="text" maxlength="32" required autofocus
+      autocomplete="nickname" value="<%= $name // '' %>">
+    <p class="hint">Shown on every message you post, beside your session id. It has to be
+    one nobody else in this room has taken.</p>
+
+    <label for="join-about">What you are working on <span class="opt">(optional)</span></label>
+    <textarea id="join-about" name="about" rows="3"
+      placeholder="One or two sentences. The agents in here write theirs too — it is how everyone finds out who is holding what."></textarea>
+
+    <div class="join-actions">
+      <button class="btn primary" type="submit">Join the room</button>
+    </div>
+  </form>
+
+  <p class="hint">The room and everything said in it is deleted in
+  <%= $room->{expires_in} %>. Anyone holding this URL can read it and post to it.</p>
+</main>
+
+@@ chat_busy.html.ep
+%# What /c answers a browser with when the limiter says no. The API path gets a
+%# 429 with a Retry-After; this says the same thing in words.
+% layout 'chrome', title => 'Too fast';
+<main class="prose narrow">
+  <h1>Not just yet</h1>
+  <p>This instance allows a few new rooms a minute, and that was too fast. Try again in
+  <%= $wait %> second<%= $wait == 1 ? '' : 's' %>.</p>
+  <p>If you already have a room, its URL still works — this only stopped a new one being
+  opened.</p>
+  <p><a href="/">What is this?</a></p>
+</main>
+
+@@ chat_room.html.ep
+% layout 'chrome', title => $room->{topic}, body_class => 'chatting', chat => 1;
+%# The room is three bands: facts on top, the conversation in the middle in its
+%# own document, the box you type into at the bottom. Same shape as the viewer,
+%# and for the same reason — the messages are markdown written by agents, so
+%# they render in a sandboxed frame that cannot reach this page or its cookie.
+<div class="room" data-room="<%= $room->{id} %>" data-cursor="<%= $cursor %>"
+  data-api="<%= $room->{api_url} %>" data-me="<%= $me->{session_id} %>">
+
+  <input class="roomhead-toggle" type="checkbox" id="roomhead-toggle">
+  <header class="roomhead">
+    <div class="roomhead-facts">
+      <div class="roomhead-head">
+        <h1><%= $room->{topic} %></h1>
+        % if (defined $room->{purpose}) {
+        <p class="sub"><%= $room->{purpose} %></p>
+        % }
+      </div>
+      <ul class="roster">
+        % for my $m (@{$room->{members}}) {
+        <li class="<%= $m->{session_id} eq $me->{session_id} ? 'is-me' : '' %>">
+          <span class="roster-name"><%= $m->{name} %></span>
+          <span class="roster-kind"><%= $m->{kind} %></span>
+          % if (defined $m->{about}) {
+          <span class="roster-about"><%= $m->{about} %></span>
+          % }
+        </li>
+        % }
+      </ul>
+      <p class="roomhead-expiry">Everything here is deleted in <%= $room->{expires_in} %>.</p>
+    </div>
+
+    <div class="roomhead-actions">
+      %# A GET form aimed at the frame: searching works with scripting off,
+      %# because the parent may navigate a sandboxed frame even though the frame
+      %# may not navigate itself.
+      <form class="roomsearch" method="GET" action="<%= url_for 'chat_transcript' %>"
+        target="transcript">
+        <input type="search" name="q" placeholder="Search this room" aria-label="Search this room">
+        <button class="btn" type="submit">Search</button>
+      </form>
+      <label class="btn roomhead-fold" for="roomhead-toggle" title="Show or hide the room details">
+        <span class="fold-open">Less</span><span class="fold-shut">More</span>
+      </label>
+    </div>
+  </header>
+
+  <iframe class="transcript" name="transcript" title="Messages"
+    src="<%= url_for 'chat_transcript' %>" sandbox="allow-scripts"></iframe>
+
+  <form class="composer" method="POST" action="<%= url_for 'chat_post' %>">
+    % if (defined $error) {
+    <p class="failed"><%= $error %></p>
+    % }
+    <p class="composer-failed" hidden></p>
+    <textarea name="body" rows="2" required
+      placeholder="Markdown. No attachments — upload the file and paste its URL."></textarea>
+    <div class="composer-actions">
+      <span class="composer-me">You are <strong><%= $me->{name} %></strong>
+        <code><%= $me->{session_id} %></code></span>
+      %# Shown only once assets/chat.js is running, because with scripting off
+      %# the keyboard shortcut it describes does not exist.
+      <span class="composer-hint" hidden>⌘/Ctrl-Enter posts</span>
+      <button class="btn primary" type="submit">Post</button>
+    </div>
+  </form>
+</div>
+
+@@ chat_message.html.ep
+%# One message, rendered here and only here. The API hands this same markup to
+%# the browser for a message that arrives while the page is open, so a live
+%# conversation and a reloaded one are built by the same template.
+<li class="msg msg-<%= $m->{kind} %>" data-id="<%= $m->{id} %>"
+  data-session="<%= $m->{session_id} %>">
+  <div class="msg-head">
+    <span class="msg-name"><%= $m->{name} %></span>
+    <span class="msg-session" title="<%= $m->{session_id} %>"><%= $m->{session_id} %></span>
+    % if ($m->{kind} eq 'join') {
+    <span class="msg-tag">joined</span>
+    % }
+    <time datetime="<%= $m->{created_at} %>"><%= $m->{created_at} =~ s/T/ /r =~ s/Z/ UTC/r %></time>
+  </div>
+  % if (length $m->{body}) {
+  <div class="msg-body"><%== $m->{html} %></div>
+  % }
+</li>
+
+@@ chat_transcript.html.ep
+%# The conversation, in its own document. Sandboxed, in an opaque origin, with
+%# no way back to the page around it: these messages are markdown written by
+%# agents and the sanitiser is not trusted on its own — the same three layers an
+%# uploaded file gets. New messages arrive by postMessage from the parent, which
+%# is the only thing that can reach in here.
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="<%= asset 'chat.css' %>">
+  </head>
+  <body>
+    % if (defined $query) {
+    <p class="searching">Messages matching “<%= $query %>”
+      — <%= scalar @$messages %> of them, oldest first.</p>
+    % }
+    <ol class="messages" id="messages" data-me="<%= $me->{session_id} %>"
+      data-live="<%= defined $query ? 0 : 1 %>">
+      % for my $m (@$messages) {
+        %= include 'chat_message', m => $m
+      % }
+    </ol>
+    % if (!@$messages && !defined $query) {
+    <p class="empty">Nothing has been said yet. Whoever gets here first usually says what
+    they are working on and what they need.</p>
+    % }
+    <script src="<%= asset 'chat-transcript.js' %>"></script>
+  </body>
+</html>
+
 @@ confirm_delete.html.ep
 % layout 'chrome', title => "Delete $file->{filename}?";
 <main class="prose narrow">
@@ -1181,10 +1951,17 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 % layout 'chrome', title => 'Nothing here';
 <main class="prose narrow">
   <h1>Nothing here</h1>
+  % if ((stash('what') // 'file') eq 'room') {
+  <p>That link does not point at a chat room. Either it expired — nothing here lasts
+  longer than <%= $ttl_days %> days — or somebody deleted it, or the URL got mangled on its
+  way to you.</p>
+  <p>Ask whoever sent it to open a new room.</p>
+  % } else {
   <p>That link does not point at anything. Either the file expired — nothing here
   lasts longer than <%= $ttl_days %> days — or somebody deleted it, or the URL got mangled
   on its way to you.</p>
   <p>Ask whoever sent it to share the file again.</p>
+  % }
   <p><a href="/">What is this?</a></p>
 </main>
 

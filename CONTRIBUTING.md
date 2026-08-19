@@ -9,8 +9,8 @@ make test
 ```
 
 That builds the image up to its `builder` stage, which ends with
-`pdi-run-tests`: every script in `bin/` is syntax-checked and `t/share.t` runs
-in full, against the exact dependency set the runtime image ships. It is the
+`pdi-run-tests`: every script in `bin/` is syntax-checked and everything under
+`t/` runs in full, against the exact dependency set the runtime image ships. It is the
 same thing CI runs and the same stage published images are built through, so if
 it passes locally it passes in CI.
 
@@ -59,8 +59,14 @@ make dev-down
 
 ## What a good change looks like
 
-- **A test.** `t/share.t` is one file of `Test::Mojo` subtests and it is where
-  behaviour is pinned down. New behaviour, new subtest.
+- **A test.** `t/share.t` and `t/chat.t` are files of `Test::Mojo` subtests and
+  they are where behaviour is pinned down — files and pages in the first, chat
+  rooms in the second. New behaviour, new subtest.
+
+  Two files rather than one because Mojolicious::Lite's app is a singleton in
+  `main`: a second `Test::Mojo` in the same process is a second app over a
+  second store, and it pulls the rug out from under the first. Separate
+  processes have no such argument.
 - **Comments that say why.** The code is short enough to read; what is not
   obvious from reading it is the reasoning, especially where something is
   deliberately not the obvious approach. There are several of those, and each

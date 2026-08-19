@@ -24,7 +24,7 @@ use Mojo::SQLite ();
 use Mojo::Util   qw(b64_decode);
 use POSIX        qw(strftime);
 
-our @EXPORT_OK = qw(human_duration human_size iso8601 payload_bytes);
+our @EXPORT_OK = qw(human_duration human_size iso8601 password_hash password_ok payload_bytes token);
 
 has 'key';    # HMAC secret for signed upload URLs; see _load_key
 
@@ -103,6 +103,19 @@ CREATE INDEX upload_hits_idx ON upload_hits (client, at);
 
 -- 3 down
 DROP TABLE upload_hits;
+
+-- 4 up
+-- Attempts are counted per bucket now, because posting to a chat room is
+-- limited too and its sensible number is nothing like an upload's: one file a
+-- second is generous, one message a second is a conversation stalling.
+-- Defaulted rather than backfilled — every row already in here is an upload.
+ALTER TABLE upload_hits ADD COLUMN bucket TEXT NOT NULL DEFAULT 'upload';
+DROP INDEX upload_hits_idx;
+CREATE INDEX upload_hits_idx ON upload_hits (bucket, client, at);
+
+-- 4 down
+DROP INDEX upload_hits_idx;
+CREATE INDEX upload_hits_idx ON upload_hits (client, at);
 SQL
 
 sub init ($self) {
@@ -135,7 +148,7 @@ sub _load_key ($self) {
   my $file = $self->root->child('share.key');
   return $file->slurp =~ s/\s+\z//r if -s $file;
 
-  my $key = _token(64);
+  my $key = token(64);
   $file->spew($key);
   chmod 0600, $file;
   return $key;
@@ -195,6 +208,23 @@ sub _pbkdf2 ($password, $salt, $rounds = KDF_ROUNDS) {
     $out ^= $block;
   }
   return unpack 'H*', $out;
+}
+
+# The two ends of a delete password, exported so the chat side stores one the
+# same way. There is one KDF in this codebase with one test vector behind it;
+# a second implementation next door would be a second thing to get wrong.
+sub password_hash ($password) {
+  my $salt = token(16);
+  return ($salt, _pbkdf2($password, $salt));
+}
+
+# False for a missing password, a missing hash and a wrong password alike — the
+# caller is expected to answer all three with the same sentence.
+sub password_ok ($password, $salt, $hash) {
+  return 0 unless defined $password && length $password;
+  return 0 unless defined $salt     && length $salt;
+  return 0 unless defined $hash     && length $hash;
+  return _constant_eq(_pbkdf2($password, $salt), $hash);
 }
 
 sub sign_query ($self, $pairs) {
@@ -410,10 +440,10 @@ sub add ($self, %args) {
   # One is generated when the caller does not supply one, so that every upload
   # comes back with a way to undo it. It is returned exactly once, on the row
   # this method hands back, and `public` below never carries it.
-  my $password = _trim($args{delete_password}) // _token(24);
-  my $salt     = _token(16);
+  my $password = _trim($args{delete_password}) // token(24);
+  my ($salt, $hash) = password_hash($password);
 
-  my $secret = _token();
+  my $secret = token();
   my $rel    = join '/', substr($secret, 0, 2), substr($secret, 2, 2), $secret;
   my $blob   = $self->root->child('files', split m{/}, $rel);
   $blob->dirname->make_path;
@@ -435,7 +465,7 @@ sub add ($self, %args) {
         created_at   => $now,
         expires_at   => $now + $ttl,
         delete_salt  => $salt,
-        delete_hash  => _pbkdf2($password, $salt),
+        delete_hash  => $hash,
       }
     );
     1;
@@ -529,37 +559,45 @@ sub touch ($self, $row) {
 # prefork, so an in-memory counter would be per-worker and a client would get
 # the limit multiplied by the number of workers. The table is tiny and pruned on
 # every call.
-sub rate_check ($self, $client) {
-  my ($per_second, $per_minute) = ($self->rate_per_second, $self->rate_per_minute);
+sub rate_check ($self, $client, %opt) {
+  # Uploads unless told otherwise, so every existing caller means what it always
+  # did. Chat posts pass their own bucket and their own pair of numbers, and the
+  # two never eat into each other: a busy room must not stop anyone uploading a
+  # file, which is the whole reason the buckets are separate.
+  my $bucket     = $opt{bucket}     // 'upload';
+  my $per_second = $opt{per_second} // $self->rate_per_second;
+  my $per_minute = $opt{per_minute} // $self->rate_per_minute;
   return (1, undef) unless $per_second || $per_minute;
 
   $client = 'unknown' unless defined $client && length $client;
   my $now = time;
   my $db  = $self->sql->db;
 
-  # Nothing older than the widest window can matter to anyone.
+  # Nothing older than the widest window can matter to anyone, in any bucket.
   $db->query('DELETE FROM upload_hits WHERE at < ?', $now - 60);
 
   if ($per_second) {
-    my $recent = $db->query('SELECT COUNT(*) FROM upload_hits WHERE client = ? AND at >= ?',
-      $client, $now)->array->[0];
+    my $recent
+      = $db->query('SELECT COUNT(*) FROM upload_hits WHERE bucket = ? AND client = ? AND at >= ?',
+      $bucket, $client, $now)->array->[0];
     return (0, 1) if $recent >= $per_second;
   }
 
   if ($per_minute) {
-    my $recent = $db->query('SELECT COUNT(*) FROM upload_hits WHERE client = ? AND at > ?',
-      $client, $now - 60)->array->[0];
+    my $recent
+      = $db->query('SELECT COUNT(*) FROM upload_hits WHERE bucket = ? AND client = ? AND at > ?',
+      $bucket, $client, $now - 60)->array->[0];
     if ($recent >= $per_minute) {
       # Tell them when the window actually frees up rather than guessing a
       # round number: the oldest hit in the window is when a slot returns.
       my $oldest = $db->query(
-        'SELECT MIN(at) FROM upload_hits WHERE client = ? AND at > ?', $client, $now - 60)
-        ->array->[0] // $now;
+        'SELECT MIN(at) FROM upload_hits WHERE bucket = ? AND client = ? AND at > ?',
+        $bucket, $client, $now - 60)->array->[0] // $now;
       return (0, ($oldest + 60) - $now || 1);
     }
   }
 
-  $db->insert('upload_hits', {client => $client, at => $now});
+  $db->insert('upload_hits', {bucket => $bucket, client => $client, at => $now});
   return (1, undef);
 }
 
@@ -602,11 +640,7 @@ sub remove ($self, $secret, $password = undef) {
   my $refuse = "no such file, or the wrong delete password";
 
   return (0, $refuse) unless $row;
-  return (0, $refuse) unless defined $row->{delete_hash} && length $row->{delete_hash};
-  return (0, $refuse) unless defined $password && length $password;
-
-  my $given = _pbkdf2($password, $row->{delete_salt});
-  return (0, $refuse) unless _constant_eq($given, $row->{delete_hash});
+  return (0, $refuse) unless password_ok($password, $row->{delete_salt}, $row->{delete_hash});
 
   $self->_purge($row);
   return (1, undef);
@@ -736,7 +770,7 @@ my $ALPHABET = join '', 'a' .. 'z', 'A' .. 'Z', 0 .. 9;
 
 # 32 chars of base62 is ~190 bits. Rejection sampling (62 * 4 == 248) keeps the
 # distribution flat instead of biasing the first six letters of the alphabet.
-sub _token ($len = 32) {
+sub token ($len = 32) {
   open my $fh, '<:raw', '/dev/urandom' or croak "cannot open /dev/urandom: $!";
   my $out = '';
   while (length $out < $len) {

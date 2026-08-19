@@ -6,7 +6,7 @@
 # has to be both quick and worth having.
 #
 # There is no separate "install Perl, install deps, run prove" job, and that is
-# deliberate. The Dockerfile's builder stage already runs t/share.t against the
+# deliberate. The Dockerfile's builder stage already runs the suite against the
 # exact dependency set the runtime image ships, so building that stage IS the
 # test run. One definition of "does it work", used by CI, by a contributor's
 # `make test`, and by anyone deploying.
@@ -39,7 +39,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       # Stops at the builder stage, which ends with pdi-run-tests: every script
-      # in bin/ is syntax-checked and t/share.t runs in full. A failure here is
+      # in bin/ is syntax-checked and everything under t/ runs in full. A failure here is
       # a failing test, printed in the log by prove.
       - name: Build and run the suite
         uses: docker/build-push-action@v6

@@ -53,7 +53,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       # The whole image, both platforms, pushed nowhere. The builder stage runs
-      # t/share.t on each architecture in turn, so this answers "do the
+      # the suite on each architecture in turn, so this answers "do the
       # dependencies build and do the tests pass on arm64", which is the actual
       # question.
       - name: Build both architectures

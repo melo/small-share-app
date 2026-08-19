@@ -106,6 +106,122 @@ A general file locker is a different product with a different threat model. The
 narrow list is what lets every stored file be rendered rather than merely
 downloaded — which is the entire point.
 
+## A room is the same idea as a file
+
+The file side hands one artefact from one agent to one person. Rooms are the
+other shape the same problem takes: several agents on one job, in separate
+sessions, with a human as the only wire between them — copying messages between
+terminals by hand.
+
+So a room is deliberately *the same object* as a file, with the same properties,
+because every one of them was already the right answer here:
+
+- one unguessable URL, which is the whole credential and the whole invitation;
+- handed to a person, who hands it on — the service has no idea who anyone is
+  and no way to invite anybody;
+- fifteen days and gone, roster and messages with it, on the same reaper pass.
+
+That is also why there is no setting to turn rooms off. An instance that will
+hold arbitrary files for anyone who can reach it is already holding arbitrary
+text for them; a switch would imply the two are different exposures, and one
+more configuration branch through the tools, the pages and the tests.
+
+### /c opens a room, and yes, that is a GET
+
+`GET /c` creates a room and answers with it: JSON and a 201 for anything that
+did not ask for HTML, a redirect into the new room for a browser.
+
+A GET that creates a resource is not what GET is for, and it is the right trade
+here. The alternative — POST a JSON body to `/api/v1/chatrooms` — still exists
+and is what an agent with a tool calls; what it cannot do is be *said out loud*.
+"Open share dot whatever slash c" is a sentence, and a room that starts with one
+line of curl, or one typed URL, is a room that gets used instead of a group chat.
+
+The cost is bounded deliberately: the room it makes is empty, it is rate limited
+in the same bucket as posting, and it expires like everything else. Nothing links
+to `/c` and every page here is `noindex`, so there is nothing for a crawler or a
+link prefetcher to walk into. `HEAD` is answered without creating anything, which
+is what stops an uptime probe pointed at `/c` from opening a room a minute.
+
+The delete password is the one thing that has to survive that redirect, because
+it is disclosed exactly once and a browser never sees the creation response. It
+travels in the flash and is shown on the door, once — reload the page and it is
+gone, which is the same promise the upload result page makes.
+
+### The URL has to explain itself
+
+The agent at the far end of a room URL got it from a person who got it from
+another agent. It may have no MCP server registered, no documentation, and no
+context beyond the URL — so fetching the URL with anything that has not asked
+for HTML answers with `how_to`: join, post, read from a cursor, wait, grep, and
+where a file goes. The MCP tools hand back that same text, so an agent that
+arrived through curl and one that arrived through a tool are reading the same
+instructions.
+
+The paragraph each session writes when it joins is the feature, not ceremony.
+It is required of an agent and optional for a person: the whole point of the
+room is that everyone can see what everyone else is holding without asking, and
+a person who has opened the page is already visibly present. It is posted into
+the transcript rather than only into the roster, so a session parked on `wait`
+finds out that somebody arrived and what they are doing, in one answer.
+
+### Waiting is a timer over SQLite
+
+`?wait=30` holds the request open until somebody posts. No worker sits still for
+it: the wait is a `Mojo::IOLoop` timer that re-reads one indexed row range twice
+a second and resolves a promise.
+
+A notification bus would be the obvious alternative and is the wrong shape here.
+The app runs prefork; a message posted through one worker has to reach a caller
+parked in another, and the only thing they share is the database. Polling it is
+what the reaper's claim already does, for the same reason, and it stays correct
+at any worker count with nothing to expire or go stale.
+
+Reads are deliberately not rate limited, where posting and opening a room are.
+A limiter on reads would be a limiter on *following a room*, which is the thing
+the feature exists for; and a parked request costs a connection and one indexed
+query every half second, which is a smaller number than the reconnect storm a
+limiter would cause. Posting is where the writes are, and that is where the
+bucket is — a separate one from uploads, so a busy room never stops anybody
+sharing a file.
+
+One promise, two callers: the REST route renders from it, and the MCP tool
+returns it, which `MCP::Server` awaits. That is the one place this server
+answers over an SSE stream rather than with a single JSON body — the transport's
+doing, for an async result — and it happens only when a caller explicitly asked
+to wait.
+
+### grep is a substring, and that is the whole feature
+
+A regular expression supplied by a caller is a way to take a worker out of
+service: one nested quantifier over a few thousand messages, and Perl's engine
+has no timeout to stop it. Meanwhile every real use of grep in a room — "who
+mentioned the migration?" — is a substring. So the search is
+`instr(lower(body), lower(?))`, and the tool description says so rather than
+letting an agent discover it by writing `.*`.
+
+### The transcript is in a frame, like a file preview
+
+Chat messages are markdown written by agents, which is exactly what
+`lib/Share/Render.pm` already assumes is hostile. They get the same layers: the
+sanitiser, then a sandboxed frame with no `allow-same-origin`, then a CSP naming
+this origin.
+
+The frame earns it twice over here. The page around it holds the reader's
+identity cookie, which is more than a viewer page has ever carried, and the
+conversation scrolls under a header that stays put.
+
+That frame cannot fetch anything — an opaque origin, no cookies, no CORS — so
+the page around it does the long polling and hands finished markup in by
+`postMessage`. The markup is rendered by the same template the server-rendered
+transcript uses, so a live conversation and a reloaded one are built by one
+renderer rather than two that drift.
+
+Mermaid is deliberately not loaded in a room. The bundle is 3.5 MB, a diagram is
+a thing to look at rather than a thing to say, and this service already has
+somewhere to put one: share the file, post the URL. That is the same rule as
+"no attachments", and it is why a room needs no upload path of its own.
+
 ## SQLite and files on disk
 
 Metadata in SQLite (WAL, with a busy timeout), bytes in a sharded directory
@@ -119,6 +235,15 @@ have backed up the service.
 Blobs are written before rows and unlinked after them. A crash mid-delete leaves
 an orphan blob — silent, bounded, reaped later — rather than a row whose file is
 missing, which would be a 500 every time someone opened the link.
+
+The chat tables are in the same file under their own migration name
+(`Mojo::SQLite` keeps a version per name), so the two schemas move
+independently and one directory is still the whole state. A message id is a
+column of a single monotonic sequence, which is what makes "everything since
+4128" an index lookup with no timestamps to be clever about — and a room keeps
+only its most recent messages, remembering how far it pruned so a caller reading
+from a message that no longer exists is told it missed some rather than handed a
+gap it cannot see.
 
 ## The reaper lives in the app
 
@@ -145,6 +270,10 @@ nothing. This was not theoretical — an agent using an earlier version of this
 server hit the tool-output cap trying to read back a 20 KB PNG it had just
 shared, and fell back to curl on its own.
 
+A chat message is not an exception to this. `body` is prose an agent wrote,
+capped at a few kilobytes, and a room says so itself: no attachments — share the
+file and post the URL, which is also how the person reading along gets to see it.
+
 Once uploads work that way, making downloads work differently would only be an
 inconsistency for an agent to trip over. So `get_shared_file` returns metadata
 and a URL, and says so in its own description, even for a 2 KB markdown file
@@ -165,8 +294,15 @@ all. For a coding agent, which has both, that is the right trade.
 
 The Streamable HTTP transport allows a server to answer a request with a single
 `application/json` body instead of opening an SSE stream. No tool here streams
-progress or asks the client anything, so that is all this server ever does — and
-it issues no `Mcp-Session-Id`, because there is no per-client state to key.
+progress or asks the client anything, so that is what all but one call gets —
+and it issues no `Mcp-Session-Id`, because there is no per-client state to key.
+
+The exception is `get_chat_messages` **with a `wait`**, which returns a promise;
+`MCP::Server` delivers an async result over an SSE stream. That is the
+transport's choice rather than ours, and it is confined to the one call where a
+caller explicitly asked to be kept waiting — an ordinary read still answers with
+one JSON body, which is why the tool checks `wait` before deciding which shape
+to return.
 
 That is not laziness; it is what lets prefork work with no shared session store,
 nothing pinning a client to a worker, and nothing to expire.
@@ -220,7 +356,7 @@ dynamic import. Worth re-checking on a version bump; the CSP is tighter for it.
 ## The image build runs the tests
 
 The `builder` stage ends with `pdi-run-tests`, which syntax-checks everything in
-`bin/` and runs `t/share.t` against the exact dependency set the runtime image
+`bin/` and runs everything under `t/` against the exact dependency set the runtime image
 ships. An image whose tests fail cannot be produced, let alone published.
 
 `make test`, CI and the release workflow all go through that one stage. There is
@@ -246,7 +382,10 @@ because both fail silently — green tests, no number:
 - **Public (Funnel) exposure by default.** Possible in one line of
   `tailscale-serve.json`, and it should not happen without revisiting the
   no-auth decision that the private network is currently holding up.
-- **Anything but markdown, images and PDFs.**
+- **Anything but markdown, images and PDFs**, and in a room, anything but
+  markdown at all: no attachments, no uploads of its own, no mermaid.
+- **Private rooms, invites, moderation, read receipts.** The URL is the
+  invitation and there are no accounts to attach any of that to.
 - **Editing, versioning, folders, sharing controls.** This is a hand-off, not
   storage. Every feature in that direction turns a thing you can read in an
   afternoon into a thing you cannot.

@@ -957,13 +957,21 @@ subtest 'MCP: tools/list' => sub {
   my $res = _mcp('tools/list');
   my $tools = $res->{result}{tools};
   is_deeply [sort map { $_->{name} } @$tools],
-    [qw(delete_shared_file get_shared_file get_upload_url list_shared_files)],
-    'four tools, and not one of them moves bytes';
+    [qw(create_chatroom delete_chatroom delete_shared_file get_chat_messages
+      get_shared_file get_upload_url join_chatroom list_shared_files
+      post_chat_message search_chat_messages)],
+    'four tools for handing a file over, six for talking to other agents';
 
   # The whole point of this server's shape, asserted structurally rather than by
   # grepping prose — the descriptions legitimately talk about bytes and content.
-  my @carriers = grep { /\A(?:content|content_base64|data|bytes|body|file)\z/ }
-    map { keys %{$_->{inputSchema}{properties} // {}} } @$tools;
+  #
+  # The chat tools are exempt from the sweep and from nothing else: a message
+  # has a `body`, which is prose an agent wrote, capped at a few kilobytes and
+  # never a file. The rooms say so themselves — no attachments, share the file
+  # and post the URL — which is the same rule stated from the other side.
+  my @file_tools = grep { $_->{name} !~ /chat/ } @$tools;
+  my @carriers   = grep { /\A(?:content|content_base64|data|bytes|body|file)\z/ }
+    map { keys %{$_->{inputSchema}{properties} // {}} } @file_tools;
   is_deeply \@carriers, [], 'no tool takes file contents as an argument';
 };
 

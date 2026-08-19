@@ -18,6 +18,11 @@ services:
       # on both upload routes, is covered properly in app/t/share.t.
       SHARE_RATE_PER_SECOND: "0"
       SHARE_RATE_PER_MINUTE: "0"
+      # Off for the same reason: a room test posts thirty messages in a second
+      # to give the transcript something to scroll. The chat limiter, and the
+      # 429 it answers with, are covered in app/t/chat.t.
+      SHARE_CHAT_RATE_PER_SECOND: "0"
+      SHARE_CHAT_RATE_PER_MINUTE: "0"
       MOJO_MODE: production
     volumes:
       - e2e-data:/workspace

@@ -139,7 +139,7 @@ jobs:
             org.opencontainers.image.title=small-share-app
             org.opencontainers.image.description=Hand a file from an agent to a human, and back
 
-      # The builder stage runs t/share.t, so this cannot publish an image whose
+      # The builder stage runs the whole suite, so this cannot publish an image whose
       # tests do not pass — the same guarantee ci.yml gives on every push to
       # main, enforced again here because a tag can be cut from a commit CI
       # never saw.

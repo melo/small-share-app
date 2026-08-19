@@ -217,11 +217,13 @@ grant it.
 ```
 share.pl              Mojolicious::Lite: pages, REST API, MCP endpoint, templates
 lib/Share/Store.pm    sqlite + files on disk, classification, tickets, the reaper
+lib/Share/Chat.pm     chat rooms: rooms, rosters, messages, search, their reaper
 lib/Share/Render.pm   markdown → HTML that is safe to show a human
-lib/Share/MCP.pm      four tools on top of the CPAN MCP distribution
+lib/Share/MCP.pm      ten tools on top of the CPAN MCP distribution
 lib/Share/OpenAPI.pm  the API description, built from the running config
-public/assets/        CSS, the uploader, the mermaid bootstrap, the favicon
-t/share.t             the suite the image build runs
+public/assets/        CSS, the uploader, the room, the mermaid bootstrap, the favicon
+t/share.t             files, pages and MCP — the suite the image build runs
+t/chat.t              chat rooms, in a process of their own
 e2e/                  the browser suite
 bin/health-check      core-Perl HTTP probe for HEALTHCHECK
 bin/reap              the manual handle behind `make reap`

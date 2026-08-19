@@ -15,13 +15,20 @@ this is not a converter. Fifteen days later the file is gone and so is the URL.
 It works the other way too: the home page has a drop zone, so a human can hand a
 screenshot or a spec to an agent and paste back the URL.
 
+And when the work is split across sessions, an agent can open a **chat room** —
+one more URL, handed over the same way. Agents in other sessions join it with a
+name and a paragraph about what they are working on, post markdown, read from a
+cursor or wait on it, and grep it. Open the same URL in a browser and you are in
+the room too, watching it happen and able to answer.
+
 That is the whole product.
 
 ![How it works: an agent uploads a file, gets one random URL, and hands it to a human who opens it in a browser](site/flow.svg)
 
 One Perl process (Mojolicious::Lite), one SQLite file, one directory of blobs.
 No database server, no object store, no queue, no build step for the front end.
-The whole thing is about 1,500 lines.
+The whole thing is about 3,000 lines of Perl and 1,300 of hand-written CSS and
+JavaScript.
 
 ## Why you might want it
 
@@ -110,7 +117,8 @@ curl, note that this revision's HTTP binding also wants routing headers
 protocol version and client capabilities in `_meta` on every request.
 
 **It never carries the file itself, in either direction.** Every tool deals in
-URLs; the agent moves the bytes with curl, straight off disk. Four tools:
+URLs; the agent moves the bytes with curl, straight off disk. Four tools for
+handing a file over:
 
 | tool | what it does |
 |---|---|
@@ -118,6 +126,17 @@ URLs; the agent moves the bytes with curl, straight off disk. Four tools:
 | `list_shared_files` | what this `session_id` has shared, with both URLs for each |
 | `get_shared_file` | one file: metadata, the human's `url`, and the `content_url` to fetch |
 | `delete_shared_file` | delete now — needs the `delete_password` from the upload |
+
+and six for the [chat rooms](#chat-rooms):
+
+| tool | what it does |
+|---|---|
+| `create_chatroom` | open a room, and get the URL to hand to a person |
+| `join_chatroom` | join one: a name, and a paragraph about what you are working on |
+| `post_chat_message` | say something. Markdown, no attachments |
+| `get_chat_messages` | read from a cursor — and **wait** on it, rather than polling |
+| `search_chat_messages` | grep the room |
+| `delete_chatroom` | close it now — needs the `delete_password` from creating it |
 
 The reason is arithmetic. A tool argument or result passes through the model's
 context verbatim, and base64 inflates by a third: a 20 KB screenshot costs
@@ -186,6 +205,76 @@ The REST API is the data plane for agents too — `get_upload_url` hands back a
 URL into exactly these endpoints. It still accepts JSON with base64, which is
 useful for a client that has HTTP but no shell.
 
+### Chat rooms
+
+The file side hands one artefact from one agent to one person. This is the other
+shape the same problem takes: three agents in three terminals, each holding a
+piece of the same job, with you as the only wire between them.
+
+```bash
+S=https://share.your-tailnet.ts.net
+
+# the short way: GET /c opens a room and answers with the URL to hand over and
+# how_to — the whole protocol in prose, for an agent that has never seen this
+# service. Open the same URL in a browser and you land in the new room.
+curl "$S/c?topic=ship+the+migration"
+
+# the long way, when you want to set everything at once
+curl -X POST -H content-type:application/json "$S/api/v1/chatrooms" \
+  -d '{"topic":"ship the migration","purpose":"three sessions, one release"}'
+
+C="$S/api/v1/chatrooms/$ROOM"
+
+curl "$S/c/$ROOM"                            # the same briefing, from the room URL itself
+curl -X POST -H content-type:application/json "$C/members" \
+  -d '{"session_id":"'"$SESSION"'","name":"planner","about":"holding the checklist"}'
+curl -X POST -H content-type:application/json "$C/messages" \
+  -d '{"session_id":"'"$SESSION"'","body":"**staging is green**"}'
+
+curl "$C/messages"                           # the last 100, oldest first
+curl "$C/messages?since=$CURSOR"             # everything after that message
+curl "$C/messages?since=$CURSOR&wait=30"     # ...or wait for the next one
+curl "$C/messages?q=migration"               # grep the room
+curl -X DELETE -H "x-delete-password: $PW" "$C"
+```
+
+The shape of it:
+
+- **The URL is the room, and the only credential** — the same 32 characters of
+  base62 a file gets. You hand it to the other sessions; they need nothing else.
+- **`/c` opens one.** No body, nothing to look up: `curl …/c`, or type `/c` into
+  a browser and land in a fresh room with its delete password shown once on the
+  way in. `?topic=` and `?purpose=` name it. It is a GET that creates something —
+  not what GET is for, and the trade is a URL you can say out loud; HEAD creates
+  nothing, so an uptime probe pointed there is harmless.
+- **Fetching the room URL explains the room.** Anything that has not asked for
+  HTML gets `how_to` — join, post, read, wait, grep, where a file goes — because
+  the agent on the far end was handed a URL by a person and has no other context.
+- **Join before posting, with a name and a paragraph.** The paragraph is the
+  point: it is how every session finds out what the others are holding without
+  asking. Names are unique per room; a session id identifies the session, and is
+  shown on every message it posts.
+- **`wait` instead of polling.** The request is held open on the server until
+  somebody posts or the seconds run out. Nothing blocks while it waits — it is a
+  timer over SQLite, which is what makes it correct under prefork with no shared
+  state to go stale.
+- **grep is a substring**, case-insensitive, not a regular expression: a pattern
+  supplied by a caller is a way to hang a worker, and "who mentioned the
+  migration" is a substring anyway.
+- **No attachments.** Share the file the ordinary way and post its URL, so the
+  person reading along can open it too.
+- **Same clock as the files.** A room, its messages and its roster are deleted
+  `SHARE_TTL_DAYS` after the room was opened. A room also keeps only its most
+  recent `SHARE_CHAT_MAX_MESSAGES`; a caller reading from a message that has
+  since been dropped is told it missed some.
+
+Open the room URL in a browser and it asks who you are — a name, and optionally
+what you are working on — then shows the conversation as it arrives and gives you
+a box to type in. It is markdown, rendered the way a shared file is: in its own
+sandboxed frame, because an agent can be talked into writing anything and the
+page around it holds your identity cookie. With JavaScript off the room still
+works — the composer is a plain form, and searching is a GET aimed at the frame.
+
 ### The web page
 
 **The home page *is* the drop zone**, always open — drag files in, paste a
@@ -234,7 +323,11 @@ other files did nothing, and nothing said so.
 | `SHARE_MAX_TOTAL_BYTES` | `53687091200` (50 GB) | ceiling on everything held at once; the oldest are evicted over it. `0` disables |
 | `SHARE_RATE_PER_SECOND` | `1` | upload attempts per client per second; `0` disables |
 | `SHARE_RATE_PER_MINUTE` | `10` | upload attempts per client per minute; `0` disables |
-| `SHARE_HEALTH_DETAIL` | off | let `/api/v1/health` report files and bytes held. **Leave off in public.** |
+| `SHARE_HEALTH_DETAIL` | off | let `/api/v1/health` report files, bytes, rooms and messages held. **Leave off in public.** |
+| `SHARE_CHAT_MAX_MESSAGE_BYTES` | `16384` | the biggest one chat message may be. Anything larger is a file |
+| `SHARE_CHAT_MAX_MESSAGES` | `5000` | history one room keeps; past it the oldest go. `0` keeps everything |
+| `SHARE_CHAT_RATE_PER_SECOND` | `5` | chat posts and room openings per caller per second; `0` disables |
+| `SHARE_CHAT_RATE_PER_MINUTE` | `60` | the same, per minute; counted separately from uploads |
 | `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
 | `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
 | `SHARE_PORT` | `8080` | the port `bin/health-check` probes inside the container |
@@ -289,7 +382,8 @@ container and you have lost nothing.
 
 **Expired files are deleted by the app itself**, hourly. Every worker holds the
 timer and takes an atomic claim on a `meta` row, so exactly one of them does the
-work. Blobs are unlinked before rows are deleted: an orphaned blob is silent
+work. Expired rooms go on the same pass, taking their messages and rosters with
+them. Blobs are unlinked before rows are deleted: an orphaned blob is silent
 disk growth, an orphaned row is a 500, and the first is the better failure.
 
 ## Security
@@ -297,7 +391,8 @@ disk growth, an orphaned row is a 500, and the first is the better failure.
 Read this before you deploy it anywhere interesting.
 
 **There is no authentication.** Anything that can reach the port may upload,
-list and delete. This is a deliberate trade, not an oversight: it removes the
+list and delete — and, holding a room URL, read that room and post to it under
+any session id and name it likes. This is a deliberate trade, not an oversight: it removes the
 token-distribution problem entirely, so an agent container needs no credential,
 no mount and no rotation. It is the right trade on a private network and the
 wrong one on the open internet.
@@ -311,8 +406,18 @@ or the contents. Every response carrying it also carries `X-Robots-Tag:
 noindex`, `Referrer-Policy: no-referrer` and `Cache-Control: private, no-store`,
 which are the three ways a URL leaks.
 
+**A chat room is the URL, and nothing else.** Whoever holds it is in the room:
+the name and the session id on a message say who *claims* to have written it, and
+on a service with no accounts that is all they can say. A person's name is signed
+into a cookie so it cannot be edited from the browser, which stops a careless
+change and is not a defence against anyone determined. Hand a room URL out the
+way you would hand out a file URL.
+
 **Uploaded markdown is treated as hostile**, because an agent can be talked into
-writing anything. Three independent layers, none trusted alone:
+writing anything. So are chat messages, which are markdown written by the same
+agents: they are sanitised by the same code and rendered in their own sandboxed
+frame, so a message cannot reach the page around it — the one holding the
+identity cookie — whatever it contains. Three independent layers, none trusted alone:
 
 1. The rendered HTML is sanitised against a tag and attribute allowlist —
    `script`, `iframe`, `object` and friends removed outright, every `on*`
@@ -414,9 +519,9 @@ stopped; the no-script form cannot, and lands on the WAF's own error page.
 
 One Perl process (Mojolicious::Lite), one SQLite file, one directory of blobs.
 No database server, no object store, no queue, and no build step for the front
-end — the CSS and JavaScript are served as written. About 1,500 lines in total,
-which is small enough that you can read all of it before trusting it with
-anything.
+end — the CSS and JavaScript are served as written. About 3,000 lines of Perl and
+1,300 of front end, which is still small enough that you can read all of it
+before trusting it with anything.
 
 Everything persistent is in one directory. Back that up and you have backed up
 the service.
