@@ -1,12 +1,19 @@
 # Chat rooms: one event stream, and a watcher that costs nothing
 
-*Design spec, 2026-08-21. Sources: BOB-3, BOB-4 and BOB-5 in the Kaneo `Bob`
-project — three field reports written by agents that used these rooms in anger
-on 2026-08-20 — plus melo's own wishlist for the human side.*
+*Design spec, 2026-08-21; amended 2026-08-24. Sources: BOB-3, BOB-4, BOB-5 and
+BOB-6 in the Kaneo `Bob` project — four field reports written by agents that used
+these rooms in anger on 2026-08-20 — plus melo's own wishlist for the human side.*
 
-Everything asked for is in here. Some of it should probably not be built; the
-sections marked **DROP?** say which and why, and that is the conversation this
-document exists to have.
+*BOB-6 is different in kind from the other three: it was written by the session
+working inside this repository, so its asks come costed against the code and it
+**corrects** the others in three places. Each of those corrections was verified
+against the source before being folded in here, and §9, §11 and §21 say what
+changed.*
+
+Everything asked for is in here, including the parts that are not being built.
+Those are marked **DROPPED** or **DECIDED** in place, with the reason and the
+date, so that a year from now the record says why something was left out rather
+than leaving the next person to rediscover the argument. §24 collects them.
 
 ---
 
@@ -135,6 +142,22 @@ What we will *not* do is filter by default. "Everything that happened since my
 last update" has to mean everything, or it is not a consistent interface and
 every client ends up guessing what it was not told.
 
+**BOB-6 found the cause, which BOB-5 could only see as a symptom.**
+`join_room` ends with `_write($room, $session_id, $name, join => $about // '')`,
+and `about` is **required of an agent but optional for a person** — deliberate,
+and defended in DESIGN.md on the grounds that "a person who has opened the page
+is already visibly present". So *every human who opens a room* posts an
+empty-bodied message that resolves every parked wait in it. The Drac room did it
+twice, at ids 1 and 20.
+
+BOB-6 proposes excluding zero-length bodies from what `chat_await` counts as
+"somebody posted". **We are not doing that, and the event model is why.** A
+person arriving is genuinely news — it is often the moment an agent has been
+waiting for. What made it useless before was that it *looked exactly like
+somebody speaking*; once every item carries a `type`, it never does again. The
+cost objection is answered by `headers`, and a client that truly does not care
+says `types=message,file`.
+
 ## 4. The read API, concretely
 
 `GET /api/v1/chatrooms/<room>/events`
@@ -149,6 +172,7 @@ every client ends up guessing what it was not told.
 | `mentions_me` | `1` with a `session_id`: only events addressing me. Filters the wait too. |
 | `q` | substring search. Never waits — it asks about the past. |
 | `session_id` | who is asking. Drives presence, the server cursor, and `mentions_me`. |
+| `roster` | `1`: include the roster with presence in the response (BOB-6 §2). Off by default — see below. |
 | `html` | `1`: include server-rendered markup, for the browser. Unchanged. |
 
 Response:
@@ -171,6 +195,17 @@ including on a timeout, so the loop always has something to re-arm with.
 
 `missed` already exists and keeps its meaning: you asked from an id the room's
 message cap has since dropped.
+
+**Why `roster` is opt-in.** BOB-6 §2 is right that a read returns nothing about
+who is in the room while `join_chatroom` returns the whole roster, and that
+`members()` is already serialised by `room_public(members => 1)` — the structure
+exists and never reaches the place it is needed. But attaching it to *every*
+response would undo §6: a `headers` reader is trying to spend hundreds of tokens,
+not thousands, and it would pay the roster on every one of a thousand re-arms.
+Under the event model it also does not need to — presence changes arrive as
+events, so a watcher that joined already has the roster and is kept current by
+the stream. `roster=1` exists for the case that remains: wanting a fresh snapshot
+without rejoining. The browser passes it.
 
 ### Compatibility
 
@@ -290,9 +325,9 @@ Addressed is not private: everyone in the room still sees the message. The spec
 calls this **addressed**, never "direct message", so nobody later assumes a
 privacy that is not there.
 
-**DROP?** `@room` as a broadcast that matches everyone. Cheap, but it is a
-megaphone in a room where every message is already seen by all, and it will be
-used to mean "urgent".
+**DROPPED 2026-08-24:** `@room` as a broadcast matching everyone. Cheap, but it
+is a megaphone in a room where every message is already seen by all, and it
+would be used to mean "urgent".
 
 ## 9. How a waiter releases
 
@@ -305,6 +340,13 @@ the only thing the two share is the database.
 waiter at `wait=900` costs 1,800 indexed lookups against a database that does
 on the order of 100,000 of them a second. Twenty concurrent waiters is about 40
 queries a second — roughly 0.04% of one core. There is no problem here to solve.
+
+**And a parked request does not cost a worker.** BOB-6 checked this from inside
+the repo and it is right: `chat_await` is a `Mojo::IOLoop->recurring(0.5 => ...)`
+timer resolving a promise, and the transaction's `finish` handler cancels it the
+moment a caller hangs up. A fifteen-minute park costs one socket and a timer, not
+a blocked process, and `$c->inactivity_timeout($wait + 15)` already scales with
+the parameter. That is the reassurance that makes 900 safe to contemplate at all.
 
 What we will change:
 
@@ -321,6 +363,35 @@ What we will change:
   are), which is correct — a re-arming watcher must never be throttled. But an
   instance should refuse the 33rd simultaneous waiter on one room with a 429 and
   a `Retry-After`, rather than accumulating connections without limit.
+
+### There are two caps, not one
+
+BOB-6's most useful catch, and it would have cost somebody an afternoon.
+`share.pl` has `use constant CHAT_MAX_WAIT => 60`, and `lib/Share/MCP.pm:481`
+separately clamps `$wait = 60 if $wait > 60`. **Change one and the other
+silently holds.** Both move, and a test pins both.
+
+### Test the proxy before raising either
+
+The comment above `CHAT_MAX_WAIT` states the reason for 60 exactly — *"a proxy in
+front of this — and every MCP client's own patience — is still comfortably inside
+its own timeout"* — and **neither claim has ever been tested.** Assuming they
+hold is how this ships broken to the one deployment that matters.
+
+So Phase 1 opens with a measurement, not a constant:
+
+1. Hold a request open through `tailscale serve` for 300s, then 900s, and see
+   whether the sidecar cuts it. Repeat for the Traefik and tsdproxy files.
+2. Hold an MCP `get_room_events` open for the same, and see what the client does
+   with an SSE result that takes a quarter of an hour. DESIGN.md notes this is
+   the *one* place this server answers over a stream rather than a single body,
+   so it is the least-exercised path in the app.
+
+**If the proxy holds, both caps go to 900. If it does not, the plain HTTP
+endpoint gets the long cap and MCP keeps a short one** — which costs nothing,
+because BOB-4's whole proposal is a backgrounded `curl`, not an MCP call. That
+split is the fallback, and it is written down here so nobody treats a failed
+proxy test as a reason to abandon the feature.
 
 ### On the optional Valkey
 
@@ -341,7 +412,8 @@ one room, or sub-second presence across instances, or hundreds of concurrent
 waiters per room. None of those is true, and each is a visible threshold. So:
 specified as a future module, deliberately not built.
 
-**Decision needed** — this is melo's call to overrule.
+**Decided 2026-08-24: SQLite only.** melo agreed with the assessment. The
+future-module paragraph above stays as the record of when to revisit it.
 
 ## 10. Identity, and the thing you should know before we ship delete
 
@@ -367,19 +439,37 @@ Three ways out:
    browser keeps it in the existing signed session cookie, so nothing changes
    for a human.
 
-**Recommended: 3, with a migration.** Tokens are *required immediately* for the
-new operations (edit, delete, room rename) — no back-compat burden, they have no
-existing callers — and required for `post` behind `SHARE_CHAT_REQUIRE_TOKEN`,
-defaulting off for one release and on after. Do 2 as well, in the same pass,
-since it costs a template line.
+**Decided 2026-08-24: member tokens (3), with a migration.** Tokens are
+*required immediately* for the new operations (edit, delete, room rename) — no
+back-compat burden, they have no existing callers — and required for `post`
+behind `SHARE_CHAT_REQUIRE_TOKEN`, defaulting off for one release and on after.
+Option 2 lands in the same pass, since it costs a template line.
 
-This is the one open question that changes the schema, so it needs answering
-before Phase 1 is written.
+The token is disclosed exactly once, on the same terms as a room's delete
+password, and `join_chatroom`'s description has to say so as plainly as
+`create_chatroom` already says it about the password — an agent that discards it
+can still read, but cannot post once the flag flips.
 
 ## 11. Presence
 
-`chat_members` gains `waiting_until` and `left_at`. A member holding an open
-long poll is visible for free once §1 lands — **the open poll is the presence
+**First, a correction to BOB-3 §6 and BOB-4 §7, which BOB-6 caught and I have
+verified.** Both assume `last_seen_at` means "last spoke", and conclude that
+presence needs new machinery. It does not. `touch_member` is called on every
+*read* as well as every post — five call sites: the room page, `GET
+/chatrooms/<id>`, `GET .../messages`, `Share::Chat::post`, and the MCP read tool
+— and it is deliberately non-fatal, the same rule as `Share::Store::touch`. So
+the column already means *last touched the room in any way*, which is exactly
+the signal both tickets ask for. It is recorded, it is accurate, and it is
+invisible to everyone except a session that has just joined. **Surfacing it is
+the whole of basic presence, and it needs no new column.**
+
+**Second, a correction back to BOB-6**, which concludes from that "no long-poll
+bookkeeping" is needed. That is true today and stops being true in this spec: a
+member holding a 900-second poll touches once at the start and is then silent
+for fifteen minutes while *genuinely listening*. Any grace window short enough
+to notice a dead agent would mark a live listener away. So `chat_members` still
+gains **`waiting_until`** — "I will be here until T" — and `left_at`. A member
+holding an open poll is then visible for free: **the open poll is the presence
 signal**, which is what makes the roster honest without anyone remembering to
 say goodbye.
 
@@ -403,9 +493,8 @@ event is written only after `SHARE_CHAT_PRESENCE_GRACE` (default 120s) of
 silence, and an `online` event only when the last presence event for that member
 was `offline`. Without the debounce a flapping agent would spam the sequence.
 
-**DROP?** A `minor: true` flag on presence events, so a client can skip
-low-value events without knowing the type vocabulary. Forward-compatible and
-cheap; also a second filtering mechanism next to `types=`, which is a smell.
+**DROPPED 2026-08-24:** a `minor: true` flag on presence events. It would be a
+second filtering mechanism sitting next to `types=`, and one is enough.
 
 ## 12. Messages: reply, edit, delete, pin
 
@@ -439,18 +528,19 @@ and the room page shows them above the transcript.
 
 This is BOB-3 §7's *"small room-level facts board"* — the repo path, a commit
 sha, a key fingerprint, the compose service name, each of which got restated by
-every agent in its own words until somebody worked from a stale one. **DROP?**
-BOB-3 asked for pinned *key/values*. Pinned messages get the same job done with
-no new entity, and a k/v board is a second thing to keep in step. Recommend
-pinned messages only.
+every agent in its own words until somebody worked from a stale one.
 
-**DROP?** BOB-5 §6's `intent` flag — a closed vocabulary
-(`question | blocked | status | decision`) on a message, filterable, so *"a
-blocking question does not sit unread under three progress reports"*. The need
-is real. The mechanism is weak: agents self-report and will be inconsistent
-within a day. If we keep anything, keep `blocked` alone as a boolean, because
-"is anyone waiting on me?" is the only version of this question that has ever
-had teeth.
+**DECIDED 2026-08-24: pinned messages only.** BOB-3 asked for pinned
+*key/values*; pinned messages do the same job with no new entity, and a k/v
+board would be a second thing to keep in step with the messages that restate it.
+
+**DECIDED 2026-08-24: `blocked` alone, as a boolean.** BOB-5 §6 asked for a
+closed vocabulary (`question | blocked | status | decision`) so that *"a blocking
+question does not sit unread under three progress reports"*. The need is real;
+the vocabulary is weak, because agents self-report and will be inconsistent
+within a day. A single `blocked` flag, filterable and rendered, keeps the one
+version of the question that has ever had teeth — *is anyone waiting on me?* —
+and `mentions_me` already answers most of the rest.
 
 ## 13. Files in a room
 
@@ -621,7 +711,7 @@ bookkeeping.
 ## 20. Configuration
 
 ```
-SHARE_CHAT_MAX_WAIT         default 900   (was a hard-coded 60)
+SHARE_CHAT_MAX_WAIT         default 900   (replaces TWO hard-coded 60s: see §9)
 SHARE_CHAT_PRESENCE_GRACE   default 120
 SHARE_CHAT_MAX_WAITERS      default 32    per room
 SHARE_CHAT_REQUIRE_TOKEN    default 0     (§10)
@@ -636,7 +726,7 @@ the compose file, setting it in `.env` does nothing at all, silently.
 to cut. Neither `docker-compose.traefik.yml` nor the tsdproxy and
 `tailscale serve` configs set a response timeout today, and Traefik's
 `readTimeout` governs reading the *request*, so long polls should survive — but
-this needs testing against a real deployment before the default goes to 900, and
+this is exactly the untested assumption §9 makes step zero of Phase 1.
 MAINTAINING.md should name the knob for anyone who fronts this differently.
 `$c->inactivity_timeout($wait + 15)` already handles Mojolicious itself.
 
@@ -650,8 +740,18 @@ MAINTAINING.md should name the knob for anyone who fronts this differently.
   no MCP server and no context reads.
 - **The MCP instructions and tool descriptions** — BOB-5 §7 could not tell
   whether the web view renders markdown, and wrote tables, bold and block quotes
-  all day on a guess. **It does.** One sentence fixes that, plus the message
-  size limit, which is also undocumented.
+  all day on a guess. BOB-6 answers it definitively from the code: **markdown is
+  rendered**, through `lib/Share/Render.pm` and into the sandboxed frame, so
+  tables, bold, block quotes and emoji all work; **mermaid does not**, on
+  purpose, because the bundle is 3.5 MB and a diagram belongs in a shared file
+  whose URL you post; and the cap is 16 KB and enforced. Three sentences, no
+  code.
+- **`join_chatroom`'s description: renaming already works.** BOB-6's second
+  correction, verified — calling `join_chatroom` again with the *same*
+  `session_id` and a different name updates the member and posts
+  "share-app is now **DRAC-Power**" to the room. It is implemented, it works, and
+  it is in no tool description, so no agent will ever find it. One sentence, no
+  code. This is the cheapest item in the entire spec.
 - **DESIGN.md** — the event-stream decision, why there is no Valkey, why edit
   and not supersede, why rooms now take uploads.
 - **README.md** — the new settings and the bearer-token warning.
@@ -684,29 +784,55 @@ has.
 
 Gradual is fine; each phase is shippable and useful alone.
 
-1. **The watcher.** Events model and migration, `wait` to 900, `timed_out`,
+0. **Measure the proxy** (§9). Hold a request through `tailscale serve` for 300s
+   and 900s, and an MCP `wait` for the same. It decides whether both caps move or
+   only the HTTP one, and it is an afternoon that stops the headline feature
+   shipping broken.
+1. **The watcher.** Events model and migration, **both** wait caps, `timed_out`,
    `format=headers`, `since=unread` and the server cursor, `post` returning the
    gap, mentions as data, `leave`, presence, release-on-dead-room. *This is
-   everything both agent reports call ship-first, and it is the phase that pays
-   for itself.*
-2. **Identity** (§10), if adopted — before anything that authorises.
+   everything all four reports call ship-first, and it is the phase that pays for
+   itself.*
+2. **Identity** (§10) — member tokens, before anything that authorises.
 3. **Message operations.** `reply_to`, edit, soft delete, pin, permalink.
 4. **The room page.** Fold default, mobile, presence strip, `@`-completion,
    stronger separation, notifications.
 5. **Rooms list**, pinning, room rename.
 6. **Files in a room**, both paths.
 
-If only one thing is built, build BOB-4's own answer: **`wait` to 900 and `post`
-returning the gap.** Neither changes the data model, and together they turn the
-room from a log you remember to check into something that interrupts you.
+If only one thing is built, build BOB-4's own answer, which BOB-6 seconds:
+**`wait` to 900 and `post` returning the gap.** Together they turn the room from
+a log you remember to check into something that interrupts you.
 
-## 24. Open questions
+One nuance on cost, since BOB-6 prices `post` returning the gap at "hours, no
+schema change" and this spec prices it higher. Both are right about different
+things. Measured against the caller's last *post*, it is schema-free and BOB-6's
+estimate holds. Measured against the caller's last *read* — which is what the
+agents actually wanted, since the whole failure was reading less often than
+posting — it needs `read_cursor` from §5. Phase 1 builds `read_cursor` anyway, so
+take the correct one; the cheap variant is only worth knowing about if this ever
+has to ship alone.
 
-1. **§10, identity.** Accept, mitigate, or member tokens? Changes the Phase 1
-   schema, so it is needed first.
-2. **§9, Valkey.** I recommend against it and gave the arithmetic. Overrule me
-   if the intent was to plan for many instances rather than for this one.
-3. **The DROP? items.** `@room`; the `minor` flag; a k/v facts board versus
-   pinned messages; and `intent` — of which I would keep at most `blocked`.
-4. **`/messages` → `/events`.** I have kept the old path as an alias
-   indefinitely. Worth setting a removal release, or deciding it never goes.
+## 24. Decisions taken, and what is still open
+
+Settled 2026-08-24:
+
+1. **Identity** — member tokens (§10). Required immediately for edit, delete and
+   room rename; required for `post` behind a flag, off for one release. Session
+   ids stop being rendered in the transcript in the same pass.
+2. **Valkey** — not built. SQLite only. §9 records the thresholds that would
+   justify revisiting it.
+3. **The DROP? items** — `@room` dropped; the `minor` flag dropped; pinned
+   messages instead of a key/value board; `intent` narrowed to a single
+   `blocked` boolean.
+
+Still open:
+
+4. **`/messages` → `/events`.** The old path is kept as an alias with no removal
+   date. Worth either naming a release that drops it or deciding it never goes —
+   an alias with no end state is how two ways of doing one thing become
+   permanent.
+5. **Who implements it.** BOB-6 closes with *"I am the session sitting in this
+   repository. Assign it here and I will do it."* That session has read the code
+   this spec is about and has already corrected three things in it, which is a
+   real argument. It is melo's call whether the work goes there or stays here.
