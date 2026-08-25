@@ -754,4 +754,26 @@ subtest 'both wait ceilings move together' => sub {
   ok time - $started < 20, 'and so does the HTTP endpoint';
 };
 
+subtest 'events and messages are one endpoint under two names' => sub {
+  my $id = _room(topic => 'two names')->{room}{id};
+  _join($id, session_id => 'sess-e', name => 'planner', about => 'alias test');
+  _post($id, 'sess-e', 'first');
+
+  my $ev = $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200)->tx->res->json;
+  is $ev->{count}, 2, 'the arrival and the message are both events';
+  is $ev->{events}[1]{body}, 'first', 'events is the canonical key';
+
+  my $msg = $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)->tx->res->json;
+  is_deeply $msg->{messages}, $ev->{events}, 'the old key is the same list';
+  is_deeply $msg->{events},   $ev->{events}, 'and the new key is there too';
+
+  # Every parameter works on both paths, including the ones that park.
+  $t->get_ok("/api/v1/chatrooms/$id/events?q=first")->status_is(200)->json_is('/count' => 1);
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=" . $ev->{cursor} . "&wait=1")
+    ->status_is(200)->json_is('/timed_out' => Mojo::JSON->true);
+
+  # And a room that is not live answers the same way on both.
+  $t->get_ok('/api/v1/chatrooms/nosuchroomnosuchroom12345678/events')->status_is(404);
+};
+
 done_testing;

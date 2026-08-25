@@ -812,8 +812,14 @@ $api->post('/chatrooms/<room:id>/members' => sub ($c) {
 });
 
 # Reading, waiting and grepping are one endpoint, because they are one question
-# asked with different patience.
-$api->get('/chatrooms/<room:id>/messages' => sub ($c) {
+# asked with different patience — and now under two names.
+#
+# `/events` is what this is: one monotonic sequence per room, where a message is
+# one kind of thing that happened and an arrival, a rename and the room's own
+# death are others. `/messages` is what it was called yesterday, and it keeps
+# working unchanged — it already returned arrivals and renames alongside speech,
+# so nothing about its behaviour moves, only the name of the list it hands back.
+my $read_events = sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
   $chat->touch_member($room, scalar $c->param('session_id'));
 
@@ -836,7 +842,10 @@ $api->get('/chatrooms/<room:id>/messages' => sub ($c) {
   $c->render_later;
   $c->chat_await($room, \%query, $wait)
     ->then(sub ($rows) { _chat_messages_json($c, $room, $rows, $since, waited => 1) });
-});
+};
+
+$api->get('/chatrooms/<room:id>/events'   => $read_events);
+$api->get('/chatrooms/<room:id>/messages' => $read_events);
 
 $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
@@ -1153,6 +1162,10 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
   return $c->render(json => {
     room     => {id => $room->{secret}, topic => $room->{topic}},
     count    => scalar @messages,
+    # Both names for one list. The old one is what assets/chat.js switches on and
+    # what every caller written before rooms had an event stream reads; it costs
+    # one key on the wire and it is the whole of how /messages keeps its promise.
+    events   => \@messages,
     cursor   => $chat->cursor($room, $rows, $since),
     # True when the caller asked for everything since a message the per-room cap
     # has already dropped. It missed some, and being told is the difference
