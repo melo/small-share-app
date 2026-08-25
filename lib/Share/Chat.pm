@@ -361,6 +361,38 @@ sub members ($self, $room) {
     ->hashes->to_array;
 }
 
+# Where this member has read to, and how to move it.
+#
+# The asymmetry is the whole design: carry your own cursor and the server stays
+# out of it; ask for `unread` and the server keeps it for you. A watcher that
+# picks `unread` is stateless, and stateless is the only kind that survives being
+# re-invoked — which is exactly what a backgrounded curl does to it, every time
+# it fires.
+sub read_cursor ($self, $room, $session_id) {
+  my $member = $self->member($room, $session_id) or return undef;
+  return 0 + $member->{read_cursor};
+}
+
+sub mark_read ($self, $room, $session_id, $cursor) {
+  return unless defined $cursor && $cursor =~ /\A\d+\z/;
+  my $member = $self->member($room, $session_id) or return;
+  # Never backwards. Two reads can overlap, and the later one landing first must
+  # not un-read what the earlier one already delivered.
+  return if $cursor <= $member->{read_cursor};
+  $self->sql->db->query('UPDATE chat_members SET read_cursor = ? WHERE id = ?',
+    $cursor, $member->{id});
+  return;
+}
+
+# How far behind this member is. Zero for somebody who never joined, because a
+# stranger is not behind — there is nothing they were meant to have read.
+sub unread_count ($self, $room, $session_id) {
+  my $member = $self->member($room, $session_id) or return 0;
+  return 0 + $self->sql->db->query(
+    'SELECT COUNT(*) FROM chat_events WHERE room_id = ? AND id > ?',
+    $room->{id}, $member->{read_cursor})->array->[0];
+}
+
 # Bookkeeping only, and never a reason to fail a read — the same rule, and for
 # the same reason, as Share::Store::touch.
 sub touch_member ($self, $room, $session_id) {

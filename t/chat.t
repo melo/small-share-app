@@ -815,4 +815,76 @@ subtest 'a catch-up can cost hundreds of tokens instead of thousands' => sub {
   $t->get_ok("/api/v1/chatrooms/$id/events/999999")->status_is(404);
 };
 
+subtest 'the server keeps your place, but only when you ask it to' => sub {
+  my $id = _room(topic => 'cursors')->{room}{id};
+  _join($id, session_id => 'sess-r', name => 'reader',  about => 'cursor test');
+  _join($id, session_id => 'sess-p', name => 'speaker', about => 'cursor test');
+  _post($id, 'sess-p', 'one');
+  _post($id, 'sess-p', 'two');
+
+  # A watcher that remembers nothing asks for what it has not read.
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+    ->status_is(200)->tx->res->json;
+  is $got->{count}, 4, 'two arrivals and two messages';
+  is $got->{unread}, 0, 'and it is now caught up';
+
+  # Asking again gets nothing, because the server advanced the cursor.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+    ->status_is(200)->json_is('/count' => 0);
+
+  # An explicit cursor does NOT move the stored one: the caller is carrying its
+  # own position and the server has no business overwriting it.
+  _post($id, 'sess-p', 'three');
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=0&session_id=sess-r")->status_is(200)
+    ->json_is('/count' => 5);
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+    ->status_is(200)->json_is('/count' => 1)->json_is('/events/0/body' => 'three');
+
+  # A watcher that reads with its OWN cursor acknowledges separately, and can
+  # acknowledge only as far as it actually got. That is the whole reason the two
+  # are different calls: a session that dies between reading and acting should
+  # come back to the work it did not finish, not to the messages it merely
+  # received.
+  _post($id, 'sess-p', 'four');
+  _post($id, 'sess-p', 'five');
+  my $mine = $t->app->chat->read_cursor($t->app->chat->find_room($id), 'sess-r');
+  my $back = $t->get_ok("/api/v1/chatrooms/$id/events?since=$mine&session_id=sess-r")
+    ->tx->res->json;
+  is $back->{count},  2, 'two more arrived';
+  is $back->{unread}, 2, 'and an explicit read did not silently mark them read';
+
+  $t->post_ok("/api/v1/chatrooms/$id/members/sess-r/read" => json =>
+      {cursor => $back->{events}[0]{id}})->status_is(200)->json_is('/unread' => 1);
+
+  # A cursor never goes backwards: two reads can overlap, and the later one
+  # landing first must not un-read what the earlier one already delivered.
+  $t->post_ok("/api/v1/chatrooms/$id/members/sess-r/read" => json => {cursor => 1})
+    ->status_is(200)->json_is('/unread' => 1);
+
+  # Somebody who never joined has read nothing, so `unread` means the room. It is
+  # not an error and it is not a leak: they could have asked for since=0 anyway,
+  # and the URL is the read credential either way.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=nobody")
+    ->status_is(200)->json_is('/count' => 7)->json_is('/unread' => 0);
+};
+
+subtest 'a park can start from where you left off' => sub {
+  my $id = _room(topic => 'parked unread')->{room}{id};
+  _join($id, session_id => 'sess-u', name => 'watcher', about => 'unread park');
+  # Catch up so the park below genuinely has nothing waiting for it.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u");
+
+  Mojo::IOLoop->timer(0.3 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-u', body => 'arrived while parked') });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u&wait=10")
+    ->status_is(200)->json_is('/count' => 1)
+    ->json_is('/events/0/body' => 'arrived while parked');
+
+  # And the park advanced the stored cursor too, so re-arming is not a re-read.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u")
+    ->status_is(200)->json_is('/count' => 0);
+};
+
 done_testing;

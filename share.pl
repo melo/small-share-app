@@ -823,7 +823,19 @@ my $read_events = sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
   $chat->touch_member($room, scalar $c->param('session_id'));
 
-  my $since = $c->param('since');
+  my $since   = $c->param('since');
+  my $session = scalar $c->param('session_id');
+
+  # "Give me what I have not read." A watcher LOSES its own cursor — every
+  # re-invocation, every fresh session — and `since` omitted means "the last
+  # hundred", which is how catching up quietly became re-reading everything.
+  #
+  # Only this form advances the stored cursor. A caller that passed a number is
+  # carrying its own position, and overwriting it would be the server deciding it
+  # knows better.
+  my $by_cursor = defined $since && $since eq 'unread';
+  $since = $chat->read_cursor($room, $session) // 0 if $by_cursor;
+
   my %query = (since => $since, limit => scalar $c->param('limit'), q => scalar $c->param('q'));
 
   # A search waits for nothing: `q` asks about what has already been said.
@@ -837,11 +849,15 @@ my $read_events = sub ($c) {
   # nothing here, but over MCP it is the difference between one JSON body and an
   # SSE stream — see the tool in Share::MCP — and the two sides should behave the
   # same way for the same request.
-  return _chat_messages_json($c, $room, $chat->messages($room, %query), $since) unless $wait;
+  my $answer = sub ($rows, %opt) {
+    $chat->mark_read($room, $session, $rows->[-1]{id}) if $by_cursor && @$rows;
+    return _chat_messages_json($c, $room, $rows, $since, %opt, session => $session);
+  };
+
+  return $answer->($chat->messages($room, %query)) unless $wait;
 
   $c->render_later;
-  $c->chat_await($room, \%query, $wait)
-    ->then(sub ($rows) { _chat_messages_json($c, $room, $rows, $since, waited => 1) });
+  $c->chat_await($room, \%query, $wait)->then(sub ($rows) { $answer->($rows, waited => 1) });
 };
 
 # One event in full, for a caller reading headers that decided it wants the body
@@ -851,6 +867,22 @@ $api->get('/chatrooms/<room:id>/events/<event>' => sub ($c) {
   my $row = $chat->event($room, $c->stash('event'))
     or return _api_error($c, 404, 'no such event in this room');
   $c->render(json => {event => $chat->event_public($row)});
+});
+
+# "I have processed up to here." Separate from reading, because a watcher that
+# crashes between reading and acting should be able to come back to the work it
+# had not finished rather than to the messages it had merely received.
+$api->post('/chatrooms/<room:id>/members/<session>/read' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $args = eval { _chat_args($c, qw(cursor)) };
+  return _api_error($c, 400, $@) if $@;
+
+  my $session = $c->stash('session');
+  $chat->mark_read($room, $session, $args->{cursor});
+  $c->render(json => {
+    cursor => $chat->read_cursor($room, $session) // 0,
+    unread => $chat->unread_count($room, $session),
+  });
 });
 
 $api->get('/chatrooms/<room:id>/events'   => $read_events);
@@ -1186,6 +1218,9 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
     # filter matched nothing, or because the caller never asked to wait at all.
     # A re-arming watcher has to tell those apart, and `count == 0` cannot.
     timed_out => ($opt{waited} && !@messages) ? \1 : \0,
+    # How far behind this caller still is. One integer, and it answers the
+    # question that previously took re-reading the room and reasoning about it.
+    unread   => $chat->unread_count($room, $opt{session}),
     messages => \@messages,
   });
 }
