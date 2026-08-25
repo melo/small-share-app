@@ -58,6 +58,10 @@ has preview_chars => 160;
 # How long after a member was last seen the room stops calling them present.
 has presence_grace => 120;
 
+# How long before a room's expiry it says so. Two hours is enough to move
+# something that matters and short enough that the warning still means "now".
+has expiry_warning => 7200;
+
 # What can happen in a room.
 #
 # The sequence is the whole interface — "everything since <id>" has to mean
@@ -135,19 +139,43 @@ DROP TABLE chat_rooms;
 -- the room's own death answer the same "what since <id>?" question on the same
 -- cursor -- and it is what makes an edit visible to a reader that is caching,
 -- which no number of extra endpoints would have done.
-ALTER TABLE chat_messages RENAME TO chat_events;
-ALTER TABLE chat_events RENAME COLUMN kind TO type;
+-- Rebuilt rather than altered, because `session_id` has to become nullable and
+-- SQLite cannot drop a NOT NULL in place. The two events a room produces on its
+-- own behalf -- it is about to expire, it has been destroyed -- have no member
+-- behind them, and writing some sentinel string there instead would be a member
+-- id that is not a member id, waiting for somebody to join a room and pick that
+-- name.
+CREATE TABLE chat_events (
+  id         INTEGER PRIMARY KEY,
+  room_id    INTEGER NOT NULL,
+  -- Null for a system event. See EVENT_TYPES.
+  session_id TEXT,
+  -- What the author was called when they wrote it. Denormalised on purpose: a
+  -- transcript should read the way it read at the time, not get rewritten
+  -- underneath everyone because somebody renamed themselves an hour later.
+  name       TEXT    NOT NULL,
+  type       TEXT    NOT NULL,
+  body       TEXT    NOT NULL,
+  created_at INTEGER NOT NULL,
+  -- What this event is about, when it is about another event: an edit, a
+  -- delete, a pin. Null for everything that stands on its own.
+  target_id  INTEGER
+);
 
 -- The old vocabulary was message | join | system, and `system` was only ever
 -- written by the rename path in join_room. Map both, so a room that has been
 -- running for a fortnight still reads correctly after the upgrade.
-UPDATE chat_events SET type = 'member.joined'  WHERE type = 'join';
-UPDATE chat_events SET type = 'member.renamed' WHERE type = 'system';
+INSERT INTO chat_events (id, room_id, session_id, name, type, body, created_at)
+  SELECT id, room_id, session_id, name,
+         CASE kind WHEN 'join' THEN 'member.joined'
+                   WHEN 'system' THEN 'member.renamed'
+                   ELSE kind END,
+         body, created_at
+    FROM chat_messages;
 
--- What an event is about, when it is about another event: an edit, a delete, a
--- pin. Null for everything that stands on its own.
-ALTER TABLE chat_events ADD COLUMN target_id INTEGER;
+DROP TABLE chat_messages;
 
+CREATE INDEX chat_events_room_idx ON chat_events (room_id, id);
 CREATE INDEX chat_events_type_idx ON chat_events (room_id, type, id);
 
 -- Where this member has read to. The cursor used to be the caller's alone to
@@ -186,8 +214,26 @@ CREATE INDEX chat_mentions_member_idx ON chat_mentions (member_id, event_id);
 
 -- 2 down
 DROP TABLE chat_mentions;
-ALTER TABLE chat_events RENAME COLUMN type TO kind;
-ALTER TABLE chat_events RENAME TO chat_messages;
+CREATE TABLE chat_messages (
+  id         INTEGER PRIMARY KEY,
+  room_id    INTEGER NOT NULL,
+  session_id TEXT    NOT NULL,
+  name       TEXT    NOT NULL,
+  kind       TEXT    NOT NULL,
+  body       TEXT    NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- The system events have no member behind them and there is nowhere to put them
+-- in a schema that insists on one, so going back drops them.
+INSERT INTO chat_messages (id, room_id, session_id, name, kind, body, created_at)
+  SELECT id, room_id, session_id, name,
+         CASE type WHEN 'member.joined' THEN 'join'
+                   WHEN 'message' THEN 'message'
+                   ELSE 'system' END,
+         body, created_at
+    FROM chat_events WHERE session_id IS NOT NULL;
+DROP TABLE chat_events;
+CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
 SQL
 
 # A migrations object of our own rather than $sql->migrations, which is shared
@@ -691,6 +737,63 @@ sub stats ($self) {
     'SELECT COUNT(*) AS messages FROM chat_events WHERE room_id IN '
       . '(SELECT id FROM chat_rooms WHERE expires_at > ?)', $now)->hash;
   return {rooms => $r->{rooms}, messages => $m->{messages}};
+}
+
+# The only warning anybody gets that a fortnight of coordination is about to be
+# reaped.
+#
+# Written once — `warned_at` is the guard — by the same hourly pass that does the
+# deleting, so there is no second timer and no second worker. And written while
+# the room is still standing, which is the whole point: a room that only
+# announces itself by disappearing has told you nothing you can act on.
+sub warn_expiring ($self, $now = time) {
+  my $rooms = $self->sql->db->query(
+    'SELECT * FROM chat_rooms WHERE warned_at IS NULL AND expires_at > ? AND expires_at <= ?',
+    $now, $now + $self->expiry_warning)->hashes->to_array;
+
+  for my $room (@$rooms) {
+    $self->_write($room, undef, 'system', 'room.expiring' => sprintf
+        'This room, its roster and every message in it are **deleted in %s** (%s). '
+      . 'Anything worth keeping should be moved somewhere that outlives it.',
+      human_duration($room->{expires_at} - $now), iso8601($room->{expires_at}));
+    $self->sql->db->query('UPDATE chat_rooms SET warned_at = ? WHERE id = ?',
+      $now, $room->{id});
+  }
+  return scalar @$rooms;
+}
+
+# The one event that is never read from the stored sequence, because by
+# definition the sequence it would belong to is being deleted in the same breath.
+#
+# Synthesized at delivery, and only for a caller that was demonstrably here while
+# the room still was — a parked reader. A cold read of a dead id still gets a
+# 404, because we cannot tell "destroyed an hour ago" from "never existed" and
+# saying otherwise would be inventing knowledge we do not have.
+# Live, expired, or gone entirely. find_room answers undef for the last two
+# because from a caller's point of view they are the same thing -- but a parked
+# reader is owed the difference, and it cannot be read off the room hashref it
+# started with, which still says what it said fifteen minutes ago.
+sub room_state ($self, $secret) {
+  my $row = $self->sql->db->query('SELECT expires_at FROM chat_rooms WHERE secret = ?',
+    $secret)->hash;
+  return 'closed' unless $row;
+  return $row->{expires_at} <= time ? 'expired' : 'live';
+}
+
+sub destroyed_event ($self, $why) {
+  return {
+    id         => 0,
+    type       => 'room.destroyed',
+    kind       => 'room.destroyed',
+    session_id => undef,
+    name       => 'system',
+    why        => $why,
+    mentions   => [],
+    created_at => iso8601(time),
+    body       => $why eq 'expired'
+      ? 'This room reached its expiry. Everything in it has been deleted.'
+      : 'This room was closed. Everything in it has been deleted.',
+  };
 }
 
 # Called from the file reaper's hourly pass, once it has won the claim, so there

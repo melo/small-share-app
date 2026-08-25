@@ -530,7 +530,19 @@ sub _tools ($server) {
       $wait = $max if $wait > $max;
       $wait = 0    if $wait < 0;
 
-      my $answer = sub ($rows) {
+      my $answer = sub ($rows, $closed = undef) {
+        # The room went while this call was parked on it. Same answer the REST
+        # endpoint gives, and for the same reason: the last thing anybody reads
+        # from a room is the room saying it is over.
+        if ($closed) {
+          my $event = $c->chat->destroyed_event($closed);
+          return $tool->structured_result({
+            closed => \1, count => 1, cursor => 0 + ($since // 0),
+            timed_out => \0, missed => \0, unread => 0,
+            events => [$event], messages => [$event],
+          });
+        }
+
         $c->chat->mark_read($room, $args->{session_id}, $rows->[-1]{id})
           if $by_cursor && @$rows;
 

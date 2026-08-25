@@ -114,6 +114,9 @@ my %CFG = (
   # cuts long responses lowers this in .env, and does not go back to asking in a
   # loop.
   chat_max_wait => _number(SHARE_CHAT_MAX_WAIT => 900),
+
+  # How long before a room's expiry it says so, in the room, once.
+  chat_expiry_warning => _number(SHARE_CHAT_EXPIRY_WARNING => 7200),
 );
 
 sub _decoded ($value) {
@@ -174,6 +177,7 @@ my $chat = Share::Chat->new(
   max_ttl_days      => $CFG{ttl_days},
   max_message_bytes => $CFG{chat_max_message_bytes},
   max_messages      => $CFG{chat_max_messages},
+  expiry_warning    => $CFG{chat_expiry_warning},
 )->init;
 
 # Signs the identity cookie a person gets when they join a room — the one piece
@@ -243,6 +247,10 @@ my $reap = sub {
   # the worker that won the hour does all of the deleting, and a room and a file
   # that expire in the same minute go in the same pass.
   return unless $result->{claimed};
+  # Warned on one pass and reaped on a later one, never both in the same breath:
+  # a warning nobody could have read is not a warning.
+  eval { $chat->warn_expiring; 1 } or app->log->error("chat expiry warning failed: $@");
+
   my $rooms = eval { $chat->reap };
   return app->log->error("chat reaper failed: $@") unless $rooms;
   app->log->info(sprintf 'reaped %d chat room(s), %d message(s)',
@@ -872,9 +880,9 @@ my $read_events = sub ($c) {
   $chat->hold($room, $session, $wait);
 
   $c->render_later;
-  $c->chat_await($room, \%query, $wait)->then(sub ($rows) {
-    $chat->release($room, $session);
-    $answer->($rows, waited => 1);
+  $c->chat_await($room, \%query, $wait)->then(sub ($rows, $closed = undef) {
+    $chat->release($room, $session) unless $closed;
+    $answer->($rows, waited => 1, closed => $closed);
   });
 };
 
@@ -1135,25 +1143,52 @@ helper chat_await => sub ($c, $room, $query, $wait) {
   my $rows = eval { $chat->messages($room, %$query) } // [];
   return $promise->resolve($rows) if @$rows || !$wait;
 
-  my $deadline = time + $wait;
+  my $started  = time;
+  my $deadline = $started + $wait;
   my ($settled, $timer) = (0, undef);
 
-  my $settle = sub ($found) {
+  my $settle = sub ($found, $closed = undef) {
     return if $settled++;
     Mojo::IOLoop->remove($timer) if defined $timer;
-    $promise->resolve($found);
+    $promise->resolve($found, $closed);
   };
 
-  $timer = Mojo::IOLoop->recurring(
-    0.5 => sub {
-      my $found = eval { $chat->messages($room, %$query) };
-      # A failed poll is logged and retried until the deadline: the store going
-      # briefly read-only is not a reason to hang up on somebody waiting.
-      return $c->app->log->warn("chat: poll failed: $@") unless $found;
-      return $settle->($found) if @$found;
-      $settle->([]) if time >= $deadline;
-    }
-  );
+  # 0.5s while somebody might still be watching a page, then out to five. A
+  # browser still feels instant; an agent parked for a quarter of an hour costs
+  # about two hundred lookups instead of eighteen hundred. Tidiness rather than
+  # necessity — the arithmetic says even the naive version is noise against a
+  # database that does a hundred thousand indexed reads a second — but a constant
+  # that scales with the wait is one less thing to come back to.
+  my $tick;
+  $tick = sub {
+    my $elapsed = time - $started;
+    Mojo::IOLoop->remove($timer) if defined $timer;
+    $timer = Mojo::IOLoop->recurring(
+      ($elapsed < 5 ? 0.5 : $elapsed < 60 ? 2 : 5) => sub {
+        # The room may have gone while this caller was parked on it. Before this
+        # check the poll went on asking a room that no longer existed and settled
+        # empty AT THE DEADLINE — invisible at sixty seconds, a held connection
+        # doing nothing for a quarter of an hour at nine hundred.
+        #
+        # find_room treats an expired room as absent from the moment it expires,
+        # an hour or so before the reaper physically deletes it, so a waiter is
+        # released at the true expiry rather than at the next reaper pass.
+        my $live = eval { $chat->find_room($room->{secret}) };
+        # Asked of the database, not of the room hashref this park started with,
+        # which still says whatever it said a quarter of an hour ago.
+        return $settle->([], $chat->room_state($room->{secret})) unless $live;
+
+        my $found = eval { $chat->messages($room, %$query) };
+        # A failed poll is logged and retried until the deadline: the store going
+        # briefly read-only is not a reason to hang up on somebody waiting.
+        return $c->app->log->warn("chat: poll failed: $@") unless $found;
+        return $settle->($found) if @$found;
+        return $settle->([])     if time >= $deadline;
+        $tick->() if $elapsed < 60 && time - $started >= 5;
+      }
+    );
+  };
+  $tick->();
 
   # Somebody who hangs up — a curl interrupted, an agent that gave up — should
   # not leave a timer running to the deadline for nobody.
@@ -1244,6 +1279,25 @@ sub _chat_view ($c, $row) {
 sub _chat_markup ($c, $row) { return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row)) }
 
 sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
+  # The room went while this caller was parked on it. The last thing anyone ever
+  # reads from a room is the room saying it is over — which is the same shape as
+  # everything else they ever read from it, and is why this is an event and not
+  # an error code.
+  if (my $why = $opt{closed}) {
+    my $event = $chat->destroyed_event($why);
+    return $c->render(json => {
+      room     => {id => $room->{secret}, topic => $room->{topic}},
+      closed   => \1,
+      count    => 1,
+      cursor   => 0 + ($since // 0),
+      timed_out => \0,
+      missed   => \0,
+      unread   => 0,
+      events   => [$event],
+      messages => [$event],
+    });
+  }
+
   my $markup  = $c->param('html') ? 1 : 0;
   my $headers = ($c->param('format') // '') eq 'headers';
 

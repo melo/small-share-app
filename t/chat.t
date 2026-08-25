@@ -1098,4 +1098,70 @@ subtest 'a roster comes with a read only when it is asked for' => sub {
     'and how far they have read, which is what tells you to stop waiting on them';
 };
 
+subtest 'a room warns while it is still standing' => sub {
+  my $id = _room(topic => 'closing time', ttl_days => 0.05)->{room}{id};
+  _join($id, session_id => 'sess-c', name => 'planner', about => 'expiry test');
+
+  is $t->app->chat->warn_expiring, 1, 'a room inside the warning window gets one';
+
+  my $ev = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  is $ev->{events}[-1]{type}, 'room.expiring', 'and it is an ordinary event';
+  is $ev->{events}[-1]{name}, 'system', 'written by nobody in particular';
+  is $ev->{events}[-1]{session_id}, undef, 'because no member did it';
+  like $ev->{events}[-1]{body}, qr/deleted/, 'saying what is about to happen';
+
+  # Once, however many times the reaper passes over it.
+  is $t->app->chat->warn_expiring, 0, 'and never twice';
+
+  # A room with a fortnight left is not warned about anything.
+  my $far = _room(topic => 'plenty of time')->{room}{id};
+  is $t->app->chat->warn_expiring, 0, 'nor is one that is nowhere near going';
+};
+
+subtest 'a parked reader is told the room is over, not left hanging' => sub {
+  my $made = _room(topic => 'doomed');
+  my $id   = $made->{room}{id};
+  my $pw   = $made->{delete_password};
+  _join($id, session_id => 'sess-d', name => 'planner', about => 'destruction test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  # The room is destroyed while somebody is parked on it. Before this, the poll
+  # went on asking a room that no longer existed and settled empty AT THE
+  # DEADLINE -- which at sixty seconds was invisible and at fifteen minutes is a
+  # held connection doing nothing for a quarter of an hour.
+  Mojo::IOLoop->timer(0.3 => sub { $t->app->chat->remove_room($id, $pw) });
+
+  my $started = time;
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10")->status_is(200)
+    ->json_is('/closed' => Mojo::JSON->true)
+    ->json_is('/count' => 1)
+    ->json_is('/events/0/type' => 'room.destroyed')
+    ->json_is('/events/0/name' => 'system')
+    ->json_is('/events/0/why'  => 'closed');
+  my $took = time - $started;
+  ok $took < 5, "released when it happened, not at the deadline (${took}s)";
+
+  # A cold read of a room that is not live is still a 404: we genuinely cannot
+  # tell "destroyed an hour ago" from "never existed" -- find_room returns undef
+  # for both -- and claiming 410 Gone would be inventing knowledge.
+  $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(404);
+};
+
+subtest 'an expiry releases a parked reader too' => sub {
+  my $id = _room(topic => 'about to lapse', ttl_days => 0.042)->{room}{id};
+  _join($id, session_id => 'sess-l', name => 'planner', about => 'lapse test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  # Wound forward past its expiry. find_room treats an expired room as absent
+  # from that moment, an hour or so before the reaper physically deletes it, so a
+  # waiter is released at the true expiry and not at the next reaper pass.
+  Mojo::IOLoop->timer(0.3 => sub {
+    $t->app->chat->sql->db->query('UPDATE chat_rooms SET expires_at = ? WHERE secret = ?',
+      time - 1, $id) });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10")->status_is(200)
+    ->json_is('/closed' => Mojo::JSON->true)
+    ->json_is('/events/0/why' => 'expired');
+};
+
 done_testing;
