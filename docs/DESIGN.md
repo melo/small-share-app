@@ -191,6 +191,24 @@ inventing knowledge we do not have.
 `/messages` still answers, with the list under both names. It already returned
 arrivals and renames alongside speech, so nothing about its behaviour moved.
 
+A live room upgrades into this in place, and **keeps its ids**. That is not
+tidiness either: an id is a cursor, and there are agents holding one right now.
+Renumbering would silently rewind or skip every watcher in every open room.
+
+Two things the migration could not do in SQL, so `init` does them once, guarded
+on the schema version it found before migrating. Mentions are backfilled by
+running the same matcher over the bodies that are already there — without it an
+upgraded room answers "has anyone ever addressed me?" with an empty list, which
+reads exactly like "no". And each member's read cursor is seeded from the last
+thing they said, which is the only record the old schema kept of where anybody
+had got to; starting everyone at zero would hand every upgraded session the whole
+room as unread on its first `since=unread`, which is the expensive re-read this
+release exists to stop.
+
+Nobody has a member token after an upgrade, and one cannot be granted out of
+band — the plaintext exists for a single moment. So reconnecting issues one, and
+reconnecting is what an agent does.
+
 ### Waiting is a timer over SQLite, and there is still no bus
 
 `?wait=900` holds the request open until somebody posts. No worker sits still for

@@ -241,9 +241,56 @@ SQL
 # with Share::Store: setting a name on that one would change which set the
 # automatic migration on first use runs.
 sub init ($self) {
-  Mojo::SQLite::Migrations->new(sqlite => $self->sql)->name('share_chat')
-    ->from_string(MIGRATIONS)->migrate;
+  my $migrations = Mojo::SQLite::Migrations->new(sqlite => $self->sql)->name('share_chat')
+    ->from_string(MIGRATIONS);
+
+  # Asked BEFORE migrating, because it is the only moment that can tell a fresh
+  # install from a live one being upgraded. Zero means there was nothing here;
+  # anything else means there are rooms with history in them, and history is the
+  # part worth keeping.
+  my $was = $migrations->active;
+  $migrations->migrate;
+  $self->_backfill_v2 if $was && $was < 2;
+
   return $self;
+}
+
+# What SQL could not do for the rooms that already existed.
+#
+# The schema half of the upgrade is a straight copy: same ids, same words, the
+# old vocabulary mapped onto the new one. But two of the new features are derived
+# from message text and from who was present, and a migration written in SQL
+# cannot derive either. Without this an upgraded room answers "has anyone ever
+# addressed me?" with an empty list, which reads exactly like "no".
+sub _backfill_v2 ($self) {
+  my $db    = $self->sql->db;
+  my $rooms = $db->query('SELECT * FROM chat_rooms')->hashes->to_array;
+
+  for my $room (@$rooms) {
+    # Mentions, from the bodies that are already there. Same matcher as a new
+    # message gets, against the roster as it stands, so history answers the same
+    # questions the present does.
+    my $events = $db->query(
+      "SELECT * FROM chat_events WHERE room_id = ? AND type IN ('message', 'file') ORDER BY id",
+      $room->{id})->hashes->to_array;
+    $self->_record_mentions($room, $_) for @$events;
+
+    # A read position, seeded from the last thing each member said. It is the one
+    # thing the old schema recorded about where somebody had got to, and it is
+    # the same rule posting follows now: saying something proves you were here.
+    # The alternative is starting everyone at zero, which would hand every
+    # upgraded session the entire room as unread on its first `since=unread` —
+    # exactly the expensive re-read this release exists to stop.
+    $db->query(
+      'UPDATE chat_members SET read_cursor = COALESCE((
+         SELECT MAX(e.id) FROM chat_events e
+          WHERE e.room_id = chat_members.room_id AND e.session_id = chat_members.session_id
+       ), 0) WHERE room_id = ?', $room->{id});
+  }
+
+  $self->log->info(sprintf 'chat: upgraded %d room(s) to the event schema', scalar @$rooms)
+    if $self->log && @$rooms;
+  return;
 }
 
 # ---------------------------------------------------------------- rooms ------
@@ -397,10 +444,17 @@ sub join_room ($self, $room, %args) {
   );
 
   my $member = $self->member($room, $session_id);
-  return ($member, undef) if $existing->{name} eq $name;
+
+  # A member who joined before this instance issued tokens has none, and cannot
+  # be given one out of band — the plaintext exists for exactly one moment. So
+  # reconnecting is the upgrade path, and reconnecting is what an agent does.
+  my $token = defined $existing->{token_hash} ? undef : $self->issue_token($member);
+
+  return ($member, undef, $token) if $existing->{name} eq $name;
   return ($member,
     $self->_write($room, $session_id, $name,
-      'member.renamed' => "$existing->{name} is now **$name**"));
+      'member.renamed' => "$existing->{name} is now **$name**"),
+    $token);
 }
 
 # A write credential, issued once, on the same terms as a room's delete

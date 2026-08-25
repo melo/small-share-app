@@ -21,6 +21,8 @@ use Mojo::IOLoop ();
 # from_json, not decode_json: anything read out of an MCP result has already
 # been decoded from the response and is characters. See t/share.t.
 use Mojo::JSON  qw(from_json);
+use Mojo::SQLite ();
+use Share::Chat  ();
 use Test::Mojo  ();
 use Test::More;
 
@@ -1305,6 +1307,123 @@ subtest 'the MCP instructions answer what nobody could find out by trying' => su
   like $text, qr/mermaid/i,  'and mermaid is not, which none of them said either';
   like $text, qr/16 ?KB|16384|16 kilobytes/i, 'and how long a message may be';
   like $text, qr/\@agents/,  'and how one message reaches the fleet';
+};
+
+# ------------------------------------------------- upgrading a live room -----
+
+# Everything above runs migration 1 and migration 2 together, against a database
+# that never held a v1 row. That proves the schema is reachable; it does NOT
+# prove that a room which has been running for a fortnight survives the upgrade,
+# which is the case that actually matters -- there are rooms out there with
+# history in them, and the whole point of migrating rather than starting over is
+# that the history is the valuable part.
+#
+# So: build a real v1 database, with v1 rows in it, and open it with today's
+# code. A plain Share::Chat over its own SQLite file, which is not the app
+# singleton and so needs no second Test::Mojo.
+subtest 'a room that has been running for a fortnight survives the upgrade' => sub {
+  my $file = "$tmp/legacy.db";
+  my $sql  = Mojo::SQLite->new("sqlite:$file");
+  my $db   = $sql->db;
+
+  $db->query($_) for split /;\s*\n/, <<'V1';
+CREATE TABLE chat_rooms (
+  id INTEGER PRIMARY KEY, secret TEXT NOT NULL UNIQUE, topic TEXT NOT NULL,
+  purpose TEXT, created_by TEXT, created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL, pruned_to INTEGER NOT NULL DEFAULT 0,
+  delete_salt TEXT, delete_hash TEXT
+);
+CREATE TABLE chat_members (
+  id INTEGER PRIMARY KEY, room_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+  name TEXT NOT NULL, name_key TEXT NOT NULL, about TEXT, kind TEXT NOT NULL,
+  joined_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL
+);
+CREATE TABLE chat_messages (
+  id INTEGER PRIMARY KEY, room_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+  name TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
+CREATE TABLE mojo_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL)
+V1
+
+  # Where migration 1 left off, so init() runs migration 2 and only that.
+  $db->query(q{INSERT INTO mojo_migrations VALUES ('share_chat', 1)});
+
+  my $now = time;
+  $db->query('INSERT INTO chat_rooms (id, secret, topic, created_at, expires_at) '
+      . 'VALUES (1, ?, ?, ?, ?)', 'a' x 32, 'the Drac coordination run', $now - 86400,
+    $now + 86400);
+  $db->query('INSERT INTO chat_members (id, room_id, session_id, name, name_key, about, '
+      . 'kind, joined_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?,?)', @$_)
+    for ([1, 1, 'sess-drac', 'claude-drac', 'claude-drac', 'the deploy system', 'agent',
+        $now - 86400, $now - 3600],
+      [2, 1, 'sess-e1', 'DRAC-E1', 'drac-e1', 'the monorepo', 'agent', $now - 86000, $now - 90],
+      [3, 1, 'sess-melo', 'melo', 'melo', undef, 'human', $now - 85000, $now - 60]);
+
+  # v1 vocabulary, including the empty-bodied join a human's arrival produces.
+  $db->query('INSERT INTO chat_messages (id, room_id, session_id, name, kind, body, '
+      . 'created_at) VALUES (?,?,?,?,?,?,?)', @$_)
+    for ([10, 1, 'sess-drac', 'claude-drac', 'join', 'the deploy system', $now - 86400],
+      [11, 1, 'sess-e1', 'DRAC-E1', 'join', 'the monorepo', $now - 86000],
+      [12, 1, 'sess-melo', 'melo', 'join', '', $now - 85000],
+      [13, 1, 'sess-drac', 'claude-drac', 'message',
+        'compose dir, compose file, service name? @DRAC-E1', $now - 84000],
+      [14, 1, 'sess-e1', 'DRAC-E1', 'system', 'DRAC-E1 is now **E1**', $now - 83000],
+      [15, 1, 'sess-melo', 'melo', 'message', 'is everyone still alive?', $now - 3600]);
+
+  my $chat = Share::Chat->new(sql => $sql, log => $t->app->log)->init;
+  my $room = $chat->find_room('a' x 32);
+  ok $room, 'the room is still there';
+  is $room->{topic}, 'the Drac coordination run', 'under the name it had';
+
+  my $events = $chat->messages($room);
+  is scalar @$events, 6, 'with every message it ever held';
+
+  # The ids are the cursors agents are carrying RIGHT NOW. Renumbering them would
+  # silently rewind or skip every watcher in every live room.
+  is_deeply [map { $_->{id} } @$events], [10, 11, 12, 13, 14, 15],
+    'and the same ids, because those are cursors somebody is holding';
+
+  is_deeply [map { $_->{type} } @$events],
+    [qw(member.joined member.joined member.joined message member.renamed message)],
+    'in the new vocabulary';
+  is $events->[3]{body}, 'compose dir, compose file, service name? @DRAC-E1',
+    'and the words are untouched';
+
+  # Backfilled, so history answers the new questions too. An agent upgrading into
+  # a running room can ask "what was ever addressed to me?" and get the truth
+  # rather than an empty list that looks like the same thing.
+  my $mentions = $chat->mentions_for($room, [map { $_->{id} } @$events]);
+  is_deeply $mentions->{13}, ['DRAC-E1'], 'mentions in old messages are found';
+
+  my $me = $chat->member($room, 'sess-e1');
+  is_deeply $chat->messages($room, mentions_me => $me->{id}), [$events->[3]],
+    'and are filterable, the same as a new one';
+
+  # Seeded from what each member last said, which is the one thing the old schema
+  # recorded about where they had got to. Starting everyone at zero would hand
+  # every upgraded session the whole room as "unread".
+  is $chat->read_cursor($room, 'sess-drac'), 13, 'a read cursor is seeded from your last post';
+  is $chat->read_cursor($room, 'sess-melo'), 15, 'for everyone who ever said anything';
+  is $chat->unread_count($room, 'sess-drac'), 2, 'so only what came after is unread';
+
+  # Presence works off columns that did not exist an hour ago.
+  is $chat->presence($chat->member($room, 'sess-melo')), 'idle', 'somebody seen a minute ago';
+  is $chat->presence($chat->member($room, 'sess-drac')), 'away', 'and somebody seen an hour ago';
+
+  # Nobody has a write credential yet, and rejoining is what issues one -- which
+  # is what every agent does when it reconnects.
+  ok !$chat->token_ok($room, 'sess-e1', 'anything'), 'no token survives the upgrade';
+  my (undef, undef, $token) = $chat->join_room($room,
+    session_id => 'sess-e1', name => 'E1', about => 'the monorepo', kind => 'agent');
+  ok length($token // ''), 'and rejoining issues one to a member who has none';
+  ok $chat->token_ok($room, 'sess-e1', $token), 'which then works';
+
+  # Idempotent: init runs on every startup and must not backfill twice.
+  Share::Chat->new(sql => $sql, log => $t->app->log)->init;
+  is_deeply $chat->mentions_for($room, [13])->{13}, ['E1'],
+    'a second startup does not double the backfill';
 };
 
 done_testing;
