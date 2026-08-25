@@ -463,8 +463,10 @@ sub _tools ($server) {
             . '"cursor" from your last call.'},
         limit => {type => 'integer', description => 'At most this many, up to 500. '
             . 'Default 100.'},
-        wait => {type => 'integer', description => 'Seconds to wait for the next message '
-            . 'before answering with nothing. Up to 60. Default 0, which answers at once.'},
+        wait => {type => 'integer', description => 'Seconds to HOLD the call open '
+            . 'waiting for the next thing to happen, up to 900. Default 0, which answers '
+            . 'at once. The answer carries "timed_out" so a loop can tell a quiet room '
+            . 'from a room that said something.'},
         session_id => _str('Your session id, so the room can show you as still here.'),
       },
     },
@@ -478,14 +480,23 @@ sub _tools ($server) {
       my $since = $args->{since};
       my %query = (since => $since, limit => $args->{limit});
       my $wait  = $args->{wait} // 0;
-      $wait = 60 if $wait > 60;
-      $wait = 0  if $wait < 0;
+      # The SECOND ceiling. share.pl has its own, and for a long time this one
+      # sat here quietly holding every MCP caller to sixty seconds no matter what
+      # that one said. Both come from the same configured number now, and a test
+      # drives that number down and checks this call honours it.
+      my $max = $c->app->config->{chat_max_wait};
+      $wait = $max if $wait > $max;
+      $wait = 0    if $wait < 0;
 
       my $answer = sub ($rows) {
         $tool->structured_result({
           count    => scalar @$rows,
           cursor   => $c->chat->cursor($room, $rows, $since),
           missed   => $c->chat->missed($room, $since) ? \1 : \0,
+          # Same reason as the REST endpoint: a loop that re-arms itself must be
+          # able to tell "the room was quiet" from "I never waited" without
+          # inspecting a count that means neither on its own.
+          timed_out => ($wait && !@$rows) ? \1 : \0,
           messages => [map { $c->chat->message_public($_) } @$rows],
         });
       };

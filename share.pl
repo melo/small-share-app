@@ -101,6 +101,19 @@ my %CFG = (
   chat_max_messages      => _number(SHARE_CHAT_MAX_MESSAGES      => 5000),
   chat_rate_per_second   => _number(SHARE_CHAT_RATE_PER_SECOND   => 5),
   chat_rate_per_minute   => _number(SHARE_CHAT_RATE_PER_MINUTE   => 60),
+
+  # The longest a caller may park on a room waiting for the next thing to
+  # happen. Sixty seconds was chosen so that "a proxy in front of this — and
+  # every MCP client's own patience — is still comfortably inside its own
+  # timeout", and NEITHER of those assumptions was ever tested.
+  #
+  # Fifteen minutes is what turns a backgrounded curl into a wake-up instead of a
+  # poll: the agent works, and the moment the room needs it the command exits
+  # with the delta in hand. It is configuration rather than a constant precisely
+  # because the untested assumption is still untested — a deployment whose proxy
+  # cuts long responses lowers this in .env, and does not go back to asking in a
+  # loop.
+  chat_max_wait => _number(SHARE_CHAT_MAX_WAIT => 900),
 );
 
 sub _decoded ($value) {
@@ -822,7 +835,7 @@ $api->get('/chatrooms/<room:id>/messages' => sub ($c) {
 
   $c->render_later;
   $c->chat_await($room, \%query, $wait)
-    ->then(sub ($rows) { _chat_messages_json($c, $room, $rows, $since) });
+    ->then(sub ($rows) { _chat_messages_json($c, $room, $rows, $since, waited => 1) });
 });
 
 $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
@@ -996,16 +1009,11 @@ sub _rate_limited ($c) {
 
 # ------------------------------------------------------- chat room helpers ---
 
-# The longest a caller may park on a room waiting for the next message. Long
-# enough to be worth doing instead of asking again in a loop, short enough that
-# a proxy in front of this — and every MCP client's own patience — is still
-# comfortably inside its own timeout.
-use constant CHAT_MAX_WAIT => 60;
-
 sub _chat_wait_seconds ($c) {
   my $wait = $c->param('wait') // 0;
   return 0 unless $wait =~ /\A\d+\z/;
-  return $wait > CHAT_MAX_WAIT ? CHAT_MAX_WAIT : 0 + $wait;
+  my $max = $c->app->config->{chat_max_wait};
+  return $wait > $max ? $max : 0 + $wait;
 }
 
 # Wait for the next thing said in a room, without a worker sitting still for it.
@@ -1135,7 +1143,7 @@ sub _chat_view ($c, $row) {
 # would be a second thing to keep in step and a second thing to get wrong.
 sub _chat_markup ($c, $row) { return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row)) }
 
-sub _chat_messages_json ($c, $room, $rows, $since) {
+sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
   my $markup = $c->param('html') ? 1 : 0;
   my @messages = map {
     my $info = $chat->message_public($_);
@@ -1150,6 +1158,10 @@ sub _chat_messages_json ($c, $room, $rows, $since) {
     # has already dropped. It missed some, and being told is the difference
     # between a gap it can react to and one it cannot see.
     missed   => $chat->missed($room, $since) ? \1 : \0,
+    # Whether this answer is empty because the room was quiet, or because a
+    # filter matched nothing, or because the caller never asked to wait at all.
+    # A re-arming watcher has to tell those apart, and `count == 0` cannot.
+    timed_out => ($opt{waited} && !@messages) ? \1 : \0,
     messages => \@messages,
   });
 }

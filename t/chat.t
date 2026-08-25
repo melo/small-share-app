@@ -695,4 +695,63 @@ subtest 'the sequence is events, and the old rows kept their meaning' => sub {
     ->array, 'chat_mentions exists';
 };
 
+subtest 'a park that ends in silence says so' => sub {
+  my $id = _room(topic => 'patience')->{room}{id};
+  _join($id, session_id => 'sess-w', name => 'watcher', about => 'wait test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/messages")->tx->res->json->{cursor};
+
+  # Nothing happens, so the answer says why it is empty. A re-arming loop must
+  # never have to infer this from count == 0 -- which is indistinguishable from
+  # a filter that matched nothing.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=1")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->true)
+    ->json_is('/count' => 0)
+    ->json_is('/cursor' => $cursor);
+
+  Mojo::IOLoop->timer(0.2 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id), session_id => 'sess-w', body => 'oi') });
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=10")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->false)
+    ->json_is('/count' => 1);
+
+  # An immediate read never waited, so it did not time out either.
+  $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->false);
+};
+
+subtest 'both wait ceilings move together' => sub {
+  # There are TWO, and they are independent: share.pl has its own constant and
+  # lib/Share/MCP.pm clamps again on the way past. Changing one and shipping was
+  # the bug this exists to prevent -- and it cannot be caught by posting into the
+  # park, because a write at 0.3s returns quickly whichever ceiling applied.
+  #
+  # So the ceiling is driven DOWN instead, and the park is left to expire. If the
+  # MCP tool is still clamping to its own hard-coded sixty, this takes a minute
+  # rather than three seconds.
+  is $t->app->config->{chat_max_wait}, 900, 'the HTTP ceiling is configuration now';
+
+  local $t->app->config->{chat_max_wait} = 3;
+
+  my $id = _room(topic => 'mcp patience')->{room}{id};
+  _call(join_chatroom => {room => $id, session_id => 'sess-mw',
+    name => 'mcpwatcher', about => 'ceiling test'});
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/messages")->tx->res->json->{cursor};
+
+  my $started = time;
+  my $out = _call(get_chat_messages =>
+    {room => $id, session_id => 'sess-mw', since => $cursor, wait => 600})
+    ->{structuredContent};
+  my $took = time - $started;
+
+  is $out->{count}, 0, 'nothing was said';
+  is $out->{timed_out}, Mojo::JSON->true, 'and the park reports that it expired';
+  ok $took < 20, "the tool honoured the configured ceiling, not its own (${took}s)";
+
+  # The plain endpoint honours the same number.
+  $started = time;
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=600")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->true);
+  ok time - $started < 20, 'and so does the HTTP endpoint';
+};
+
 done_testing;
