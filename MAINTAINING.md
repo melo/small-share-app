@@ -172,6 +172,34 @@ is the least exercised path in the app.
 If the proxy holds but the MCP client does not, the two can differ: the plain
 HTTP endpoint is what the backgrounded-curl pattern actually uses.
 
+### What was measured, 2026-08-25
+
+Both live instances hold a **60-second** park cleanly — `share.simplicidade.org`
+answered at 59s, `share.sable-toad.ts.net` at 60s, both HTTP 200. Sixty is all
+1.4.1 will do, so that is the whole of what has been measured; the rest of this
+section is what the measurement implies rather than what it proved.
+
+**`share.simplicidade.org` is behind Cloudflare** (`cf-ray`, `server:
+cloudflare`), and Cloudflare's proxy gives an origin **100 seconds** to start
+responding before returning a 524. A parked request is silent for its whole
+duration, so `wait=900` there will be cut at about 100s — and it will be cut as
+a Cloudflare error page, not as anything the app said, so a watcher sees a
+failed request rather than `timed_out`. **Set `SHARE_CHAT_MAX_WAIT=90` in that
+instance's `.env`.** Ninety still beats sixty, but it degrades the pattern: a
+watcher re-arms forty times an hour instead of four.
+
+**`share.sable-toad.ts.net` answers with `Server: Mojolicious (Perl)` and no
+proxy fingerprint at all** — `tailscale serve` passes through without imposing a
+response timeout of its own. Nothing suggests a cut there, and it is the instance
+agents actually coordinate on, so it is the one that should run the full 900.
+
+That last claim is **unmeasured above 60 seconds**, and it cannot be measured
+until this version is deployed. The deployment is the measurement: the first
+watcher to park for fifteen minutes and come back with `"timed_out": true`
+settles it. If it comes back sooner, or comes back an error, lower
+`SHARE_CHAT_MAX_WAIT` — that is the whole fix, and it is why the number is
+configuration.
+
 ## Working on arm64
 
 `multiarch.yml` builds the full image for **both** architectures on **any
