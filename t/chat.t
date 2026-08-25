@@ -247,7 +247,7 @@ subtest 'joining means a name nobody else has, and what you are working on' => s
   is $joined->{member}{name}, 'planner', 'joined under the name it asked for';
   is $joined->{member}{kind}, 'agent',   'as an agent';
   is $joined->{count}, 1, 'and the arrival is in the transcript, not only in the roster';
-  is $joined->{messages}[0]{kind}, 'join', 'as a join';
+  is $joined->{messages}[0]{type}, 'member.joined', 'as an arrival';
   is $joined->{messages}[0]{body}, 'holding the release checklist',
     'carrying the paragraph, so anyone waiting on the room reads it at once';
   is $joined->{cursor}, $joined->{messages}[0]{id}, 'with a cursor to read on from';
@@ -269,7 +269,7 @@ subtest 'joining means a name nobody else has, and what you are working on' => s
   my $renamed = _join($id, session_id => 'sess-a', name => 'releaser', about => 'now tagging');
   is $renamed->{member}{name}, 'releaser', 'renamed';
   is $renamed->{count}, 2, 'and the room was told';
-  is $renamed->{messages}[-1]{kind}, 'system', 'as a system line';
+  is $renamed->{messages}[-1]{type}, 'member.renamed', 'as a rename';
   like $renamed->{messages}[-1]{body}, qr/planner is now \*\*releaser\*\*/, 'saying so';
 
   # The freed name is available again.
@@ -329,7 +329,7 @@ subtest 'reading from a cursor, and grepping what was said' => sub {
   $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)
     ->json_is('/count' => 4)->json_is('/cursor' => $third)->json_is('/missed' => Mojo::JSON->false)
     ->json_is('/room/id' => $id)
-    ->json_is('/messages/0/kind' => 'join')
+    ->json_is('/messages/0/type' => 'member.joined')
     ->json_is('/messages/3/body' => 'three, also migration');
 
   # Oldest first, always: that is the order a transcript is read in.
@@ -455,7 +455,7 @@ subtest 'a person is asked who they are before the room opens' => sub {
   unlike $page, qr/alert\(1\)/, 'no message text reaches the chrome page';
 
   $t->get_ok("/c/$id/transcript" => \%html)->status_is(200)
-    ->content_like(qr/<li class="msg msg-join"/)
+    ->content_like(qr/<li class="msg msg-member-joined"/)
     ->content_like(qr/<li class="msg msg-message"/)
     ->content_like(qr{<h1>Plan</h1>})
     # Rendered by the same sanitiser that renders an uploaded file, and framed
@@ -665,6 +665,34 @@ subtest 'closing a room early needs the password it was made with' => sub {
       {'X-Delete-Password' => $made->{delete_password}})->status_is(200)
     ->json_is('/deleted' => $id);
   $t->get_ok("/api/v1/chatrooms/$id")->status_is(404);
+};
+
+# ------------------------------------------------------------ the sequence ---
+
+subtest 'the sequence is events, and the old rows kept their meaning' => sub {
+  my $id = _room(topic => 'migrating')->{room}{id};
+  _join($id, session_id => 'sess-m', name => 'planner', about => 'schema test');
+  _post($id, 'sess-m', 'hello');
+
+  my $db = $t->app->chat->sql->db;
+
+  ok $db->query(q{SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_events'})
+    ->array, 'chat_events exists';
+  ok !$db->query(q{SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_messages'})
+    ->array, 'chat_messages is gone';
+
+  my $room  = $t->app->chat->find_room($id);
+  my $types = $db->query('SELECT type FROM chat_events WHERE room_id = ? ORDER BY id',
+    $room->{id})->arrays->flatten->to_array;
+  is_deeply $types, ['member.joined', 'message'], 'join became member.joined';
+
+  my $m = $db->query('SELECT * FROM chat_members WHERE session_id = ?', 'sess-m')->hash;
+  is $m->{read_cursor},   0, 'read_cursor starts at zero';
+  is $m->{waiting_until}, 0, 'waiting_until starts at zero';
+  is $m->{left_at},   undef, 'nobody has left';
+
+  ok $db->query(q{SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_mentions'})
+    ->array, 'chat_mentions exists';
 };
 
 done_testing;

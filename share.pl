@@ -1816,12 +1816,16 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 %# One message, rendered here and only here. The API hands this same markup to
 %# the browser for a message that arrives while the page is open, so a live
 %# conversation and a reloaded one are built by the same template.
-<li class="msg msg-<%= $m->{kind} %>" data-id="<%= $m->{id} %>"
+%# One class naming the event exactly, plus msg-system for the thin structural
+%# lines. member.joined is deliberately NOT one of those: it carries the
+%# paragraph saying what the arrival is working on, which is the single most
+%# useful thing in a room and is read, not skimmed past.
+<li class="msg msg-<%= $m->{type} =~ s/\./-/gr %><%= $m->{type} =~ /\A(?:member\.(?:left|renamed|presence)|room\.)/ ? ' msg-system' : '' %>" data-id="<%= $m->{id} %>"
   data-session="<%= $m->{session_id} %>">
   <div class="msg-head">
     <span class="msg-name"><%= $m->{name} %></span>
     <span class="msg-session" title="<%= $m->{session_id} %>"><%= $m->{session_id} %></span>
-    % if ($m->{kind} eq 'join') {
+    % if ($m->{type} eq 'member.joined') {
     <span class="msg-tag">joined</span>
     % }
     <time datetime="<%= $m->{created_at} %>"><%= $m->{created_at} =~ s/T/ /r =~ s/Z/ UTC/r %></time>

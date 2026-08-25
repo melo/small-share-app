@@ -50,6 +50,24 @@ has max_message_bytes => 16 * 1024;
 # handed a shorter conversation than it asked for.
 has max_messages => 5000;
 
+# What can happen in a room.
+#
+# The sequence is the whole interface — "everything since <id>" has to mean
+# EVERYTHING, or a client is left guessing at what it was not told — so anything
+# the server does to a room ends up here rather than in a side channel a caller
+# has to know to ask about. It is also what makes a later edit or deletion
+# visible to a reader that is caching: without it, a watcher holding message 40
+# has no way to learn that 40 has changed.
+#
+# Two of these have no member behind them, and carry `session_id` null with the
+# name `system`. See warn_expiring and destroyed_event.
+use constant EVENT_TYPES => [qw(
+  message file
+  member.joined member.left member.renamed member.presence
+  room.renamed room.expiring room.destroyed
+  message.edited message.deleted message.pinned
+)];
+
 # --------------------------------------------------------------- schema ------
 
 use constant MIGRATIONS => <<'SQL';
@@ -102,6 +120,66 @@ CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
 DROP TABLE chat_messages;
 DROP TABLE chat_members;
 DROP TABLE chat_rooms;
+
+-- 2 up
+-- A message was always one kind of thing that happens in a room; the table just
+-- did not say so. Renaming it is what lets an arrival, a departure, a rename and
+-- the room's own death answer the same "what since <id>?" question on the same
+-- cursor -- and it is what makes an edit visible to a reader that is caching,
+-- which no number of extra endpoints would have done.
+ALTER TABLE chat_messages RENAME TO chat_events;
+ALTER TABLE chat_events RENAME COLUMN kind TO type;
+
+-- The old vocabulary was message | join | system, and `system` was only ever
+-- written by the rename path in join_room. Map both, so a room that has been
+-- running for a fortnight still reads correctly after the upgrade.
+UPDATE chat_events SET type = 'member.joined'  WHERE type = 'join';
+UPDATE chat_events SET type = 'member.renamed' WHERE type = 'system';
+
+-- What an event is about, when it is about another event: an edit, a delete, a
+-- pin. Null for everything that stands on its own.
+ALTER TABLE chat_events ADD COLUMN target_id INTEGER;
+
+CREATE INDEX chat_events_type_idx ON chat_events (room_id, type, id);
+
+-- Where this member has read to. The cursor used to be the caller's alone to
+-- carry, and a watcher LOSES it: every re-invocation, every fresh session, and
+-- `since` omitted means "the last hundred" -- i.e. read everything again.
+ALTER TABLE chat_members ADD COLUMN read_cursor INTEGER NOT NULL DEFAULT 0;
+
+-- "I will be here until T". last_seen_at already means "last touched the room in
+-- any way" -- touch_member fires on reads as well as posts -- which was always a
+-- better presence signal than it was given credit for. It stops being enough the
+-- moment a poll can park for fifteen minutes: the member is silent that whole
+-- time while genuinely listening, and any grace window short enough to spot a
+-- dead session would mark a live listener away.
+ALTER TABLE chat_members ADD COLUMN waiting_until INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE chat_members ADD COLUMN left_at INTEGER;
+
+-- Issued once at join, on the same terms as a room's delete password. The room
+-- URL stays the READ credential; this is what makes "your own message" mean
+-- something when somebody edits or deletes one.
+ALTER TABLE chat_members ADD COLUMN token_salt TEXT;
+ALTER TABLE chat_members ADD COLUMN token_hash TEXT;
+
+-- room.expiring is written once, and only once, however many times the reaper
+-- passes over a room in its last couple of hours.
+ALTER TABLE chat_rooms ADD COLUMN warned_at INTEGER;
+
+-- Mentions bind to the MEMBER, not to the literal text, so renaming yourself
+-- does not orphan every message that ever addressed you.
+CREATE TABLE chat_mentions (
+  event_id  INTEGER NOT NULL,
+  member_id INTEGER NOT NULL,
+  room_id   INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX chat_mentions_pair_idx ON chat_mentions (event_id, member_id);
+CREATE INDEX chat_mentions_member_idx ON chat_mentions (member_id, event_id);
+
+-- 2 down
+DROP TABLE chat_mentions;
+ALTER TABLE chat_events RENAME COLUMN type TO kind;
+ALTER TABLE chat_events RENAME TO chat_messages;
 SQL
 
 # A migrations object of our own rather than $sql->migrations, which is shared
@@ -170,7 +248,7 @@ sub remove_room ($self, $secret, $password = undef) {
 
 sub _purge_room ($self, $room) {
   my $db = $self->sql->db;
-  $db->delete('chat_messages', {room_id => $room->{id}});
+  $db->delete('chat_events', {room_id => $room->{id}});
   $db->delete('chat_members',  {room_id => $room->{id}});
   $db->delete('chat_rooms',    {id      => $room->{id}});
   return;
@@ -243,7 +321,7 @@ sub join_room ($self, $room, %args) {
     # The arrival goes into the transcript rather than only into the roster, so
     # anyone waiting on the room finds out that someone turned up, and what
     # they said they were doing, without polling a second endpoint for it.
-    return ($member, $self->_write($room, $session_id, $name, join => $about // ''));
+    return ($member, $self->_write($room, $session_id, $name, 'member.joined' => $about // ''));
   }
 
   $db->update(
@@ -259,7 +337,8 @@ sub join_room ($self, $room, %args) {
   my $member = $self->member($room, $session_id);
   return ($member, undef) if $existing->{name} eq $name;
   return ($member,
-    $self->_write($room, $session_id, $name, system => "$existing->{name} is now **$name**"));
+    $self->_write($room, $session_id, $name,
+      'member.renamed' => "$existing->{name} is now **$name**"));
 }
 
 sub member ($self, $room, $session_id) {
@@ -316,21 +395,24 @@ sub post ($self, $room, %args) {
   return $self->_write($room, $session_id, $member->{name}, message => $body);
 }
 
-sub _write ($self, $room, $session_id, $name, $kind, $body) {
+sub _write ($self, $room, $session_id, $name, $type, $body, %extra) {
   my $db = $self->sql->db;
   $db->insert(
-    'chat_messages',
+    'chat_events',
     { room_id    => $room->{id},
+      # Null for the two events a room produces on its own behalf. A room ends
+      # whether or not anybody made it happen.
       session_id => $session_id,
       name       => $name,
-      kind       => $kind,
+      type       => $type,
       body       => $body,
       created_at => time,
+      (defined $extra{target_id} ? (target_id => $extra{target_id}) : ()),
     }
   );
 
   my $id  = $db->dbh->sqlite_last_insert_rowid;
-  my $row = $db->query('SELECT * FROM chat_messages WHERE id = ?', $id)->hash;
+  my $row = $db->query('SELECT * FROM chat_events WHERE id = ?', $id)->hash;
   $self->_prune($room);
   return $row;
 }
@@ -342,16 +424,16 @@ sub _prune ($self, $room) {
   my $cap = $self->max_messages or return;
   my $db  = $self->sql->db;
 
-  my $count = $db->query('SELECT COUNT(*) FROM chat_messages WHERE room_id = ?', $room->{id})
+  my $count = $db->query('SELECT COUNT(*) FROM chat_events WHERE room_id = ?', $room->{id})
     ->array->[0];
   return if $count <= $cap;
 
   my $cut = $db->query(
-    'SELECT id FROM chat_messages WHERE room_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?',
+    'SELECT id FROM chat_events WHERE room_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?',
     $room->{id}, $cap)->array->[0];
   return unless defined $cut;
 
-  $db->query('DELETE FROM chat_messages WHERE room_id = ? AND id <= ?', $room->{id}, $cut);
+  $db->query('DELETE FROM chat_events WHERE room_id = ? AND id <= ?', $room->{id}, $cut);
   # Remembered so that a caller polling from an id that has since been dropped
   # can be told it missed something, instead of being handed a gap it has no way
   # to notice.
@@ -393,7 +475,7 @@ sub messages ($self, $room, %opt) {
     push @bind,  $opt{q};
   }
 
-  my $sql = 'SELECT * FROM chat_messages WHERE ' . join(' AND ', @where);
+  my $sql = 'SELECT * FROM chat_events WHERE ' . join(' AND ', @where);
 
   # With a cursor the caller wants the NEXT hundred; without one it wants the
   # LAST hundred. Same query, opposite ends, reversed back on the way out.
@@ -419,7 +501,7 @@ sub cursor ($self, $room, $rows, $since = undef) {
 }
 
 sub last_id ($self, $room) {
-  return $self->sql->db->query('SELECT COALESCE(MAX(id), 0) FROM chat_messages WHERE room_id = ?',
+  return $self->sql->db->query('SELECT COALESCE(MAX(id), 0) FROM chat_events WHERE room_id = ?',
     $room->{id})->array->[0];
 }
 
@@ -436,7 +518,7 @@ sub stats ($self) {
   my $r   = $self->sql->db->query(
     'SELECT COUNT(*) AS rooms FROM chat_rooms WHERE expires_at > ?', $now)->hash;
   my $m = $self->sql->db->query(
-    'SELECT COUNT(*) AS messages FROM chat_messages WHERE room_id IN '
+    'SELECT COUNT(*) AS messages FROM chat_events WHERE room_id IN '
       . '(SELECT id FROM chat_rooms WHERE expires_at > ?)', $now)->hash;
   return {rooms => $r->{rooms}, messages => $m->{messages}};
 }
@@ -448,7 +530,7 @@ sub reap ($self, $now = time) {
     ->hashes->to_array;
   my $messages = 0;
   for my $room (@$rooms) {
-    $messages += $self->sql->db->query('SELECT COUNT(*) FROM chat_messages WHERE room_id = ?',
+    $messages += $self->sql->db->query('SELECT COUNT(*) FROM chat_events WHERE room_id = ?',
       $room->{id})->array->[0];
     $self->_purge_room($room);
   }
@@ -487,16 +569,25 @@ sub member_public ($self, $member) {
   };
 }
 
-sub message_public ($self, $row) {
+sub event_public ($self, $row) {
   return {
     id         => 0 + $row->{id},
     session_id => $row->{session_id},
     name       => $row->{name},
-    kind       => $row->{kind},
+    type       => $row->{type},
+    # The name this field had before a room had an event stream. It costs one key
+    # on the wire, and it is the whole reason /messages can go on meaning what it
+    # meant yesterday — assets/chat.js switches on it, and so does every caller
+    # written against the shape this endpoint had last week.
+    kind       => $row->{type},
     body       => $row->{body},
     created_at => iso8601($row->{created_at}),
+    (defined $row->{target_id} ? (target_id => 0 + $row->{target_id}) : ()),
   };
 }
+
+# The name the rest of the app still calls it by.
+sub message_public ($self, $row) { return $self->event_public($row) }
 
 # ------------------------------------------------------------- briefing ------
 

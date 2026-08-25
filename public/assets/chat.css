@@ -94,8 +94,8 @@ body {
 
 /* An arrival, and the paragraph that came with it: set apart, because it is the
  * room telling you something rather than somebody saying it. */
-.msg-join, .msg-system { color: var(--fg-muted); }
-.msg-join .msg-body, .msg-system .msg-body { font-size: 0.9rem; }
+.msg-member-joined, .msg-system { color: var(--fg-muted); }
+.msg-member-joined .msg-body, .msg-system .msg-body { font-size: 0.9rem; }
 .msg-system .msg-body { font-style: italic; }
 
 /* Your own messages, marked by the frame's script once it knows who is reading.
