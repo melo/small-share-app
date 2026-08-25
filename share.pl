@@ -117,6 +117,12 @@ my %CFG = (
 
   # How long before a room's expiry it says so, in the room, once.
   chat_expiry_warning => _number(SHARE_CHAT_EXPIRY_WARNING => 7200),
+
+  # Whether posting needs the member_token that join handed back. Off for one
+  # release so that nothing written against yesterday's shape breaks today; the
+  # operations that did not exist yesterday — edit, delete, rename a room —
+  # require it from the start, because they have no callers to break.
+  chat_require_token => _number(SHARE_CHAT_REQUIRE_TOKEN => 0),
 );
 
 sub _decoded ($value) {
@@ -581,7 +587,10 @@ get '/c/<room:id>' => sub ($c) {
   $chat->touch_member($room, $me->{session_id});
   $c->render('chat_room',
     room     => $chat->room_public($room, $c->base_url, members => 1),
-    me       => $chat->member_public($me),
+    me       => $chat->member_public($me, $room),
+    # This browser's own id, out of its own signed cookie. Its own is the one
+    # session id it is entitled to, and assets/chat.js needs it to post.
+    my_session => $me->{session_id},
     cursor   => $chat->cursor($room, $rows),
     error    => scalar $c->flash('chat_error'),
   );
@@ -659,8 +668,8 @@ get '/c/<room:id>/transcript' => sub ($c) {
 
   my $rows = $chat->messages($room, q => scalar $c->param('q'));
   $c->render('chat_transcript',
-    messages => [map { _chat_view($c, $_) } @$rows],
-    me       => $chat->member_public($me),
+    messages => [map { _chat_view($c, $_, $room) } @$rows],
+    me       => $chat->member_public($me, $room),
     query    => scalar $c->param('q'),
   );
 } => 'chat_transcript';
@@ -804,7 +813,7 @@ $api->post('/chatrooms/<room:id>/members' => sub ($c) {
   my $args = eval { _chat_args($c, qw(session_id name about)) };
   return _api_error($c, 400, $@) if $@;
 
-  my ($member) = eval { $chat->join_room($room, %$args, kind => 'agent') };
+  my ($member, undef, $token) = eval { $chat->join_room($room, %$args, kind => 'agent') };
   return _api_error($c, 400, $@) if $@;
 
   # Everything a session that has just arrived needs in one answer: who else is
@@ -812,10 +821,13 @@ $api->post('/chatrooms/<room:id>/members' => sub ($c) {
   my $rows = $chat->messages($room);
   $c->render(json => {
     %{_chat_briefing($c, $room)},
-    member   => $chat->member_public($member),
+    member   => $chat->member_public($member, $room),
+    # The one and only disclosure, exactly as a room's delete password works:
+    # nothing else returns it, and rejoining does not mint a second one.
+    (defined $token ? (member_token => $token) : ()),
     count    => scalar @$rows,
     cursor   => $chat->cursor($room, $rows),
-    messages => [map { $chat->message_public($_) } @$rows],
+    messages => [map { $chat->event_public($_, [], $room) } @$rows],
   });
 });
 
@@ -892,7 +904,7 @@ $api->get('/chatrooms/<room:id>/events/<event>' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
   my $row = $chat->event($room, $c->stash('event'))
     or return _api_error($c, 404, 'no such event in this room');
-  $c->render(json => {event => $chat->event_public($row)});
+  $c->render(json => {event => $chat->event_public($row, [], $room)});
 });
 
 # "I have processed up to here." Separate from reading, because a watcher that
@@ -929,8 +941,12 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
     return _api_error($c, 429, "too many messages; try again in ${wait}s");
   }
 
-  my $args = eval { _chat_args($c, qw(session_id body)) };
+  my $args = eval { _chat_args($c, qw(session_id body member_token)) };
   return _api_error($c, 400, $@) if $@;
+
+  return _api_error($c, 403, 'this instance requires the member_token that '
+      . 'join handed back — it is the only copy, and nothing else will tell you it again')
+    unless _chat_may_write($c, $room, $args->{session_id}, delete $args->{member_token});
 
   my $row = eval { $chat->post($room, %$args) };
   return _api_error($c, 400, $@) if $@;
@@ -953,7 +969,7 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
   $chat->mark_read($room, $args->{session_id}, $row->{id});
 
   $c->render(json => {
-    message => $chat->event_public($row),
+    message => $chat->event_public($row, [], $room),
     cursor  => 0 + $row->{id},
     # A ceiling, not a page size: a caller further behind than this should read
     # properly rather than have an acknowledgement quietly become a catch-up.
@@ -1262,12 +1278,23 @@ sub _chat_identity ($c) {
 
 sub _chat_me ($c, $room) { return $chat->member($room, _chat_identity($c)->{sid}) }
 
+# May this caller write as this member?
+#
+# A browser needs no token: its session cookie is signed and lives in one
+# browser, so it already IS one. An agent presents the token join gave it.
+sub _chat_may_write ($c, $room, $session_id, $token) {
+  return 1 unless $c->app->config->{chat_require_token};
+  my $mine = ($c->session('chat') // {})->{sid};
+  return 1 if defined $mine && defined $session_id && $mine eq $session_id;
+  return $chat->token_ok($room, $session_id, $token);
+}
+
 # A message as the templates want it: the public fields, plus its markdown
 # rendered through the same sanitiser that renders an uploaded file. Chat is
 # agent-written markdown too, and gets both of the layers that protects — the
 # sanitiser here, and the sandboxed transcript frame around it.
-sub _chat_view ($c, $row) {
-  my $info = $chat->message_public($row);
+sub _chat_view ($c, $row, $room = undef) {
+  my $info = $chat->event_public($row, [], $room);
   $info->{html} = render_markdown($info->{body})->{html};
   return $info;
 }
@@ -1276,7 +1303,9 @@ sub _chat_view ($c, $row) {
 # is handed this rather than building it: the server already has the sanitiser,
 # the template and the timestamp formatting, and a second renderer in JavaScript
 # would be a second thing to keep in step and a second thing to get wrong.
-sub _chat_markup ($c, $row) { return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row)) }
+sub _chat_markup ($c, $row, $room = undef) {
+  return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row, $room));
+}
 
 sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
   # The room went while this caller was parked on it. The last thing anyone ever
@@ -1306,8 +1335,10 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
 
   my @messages = map {
     my $said = $mentions->{$_->{id}} // [];
-    my $info = $headers ? $chat->header_public($_, $said) : $chat->event_public($_, $said);
-    $markup ? {%$info, markup => _chat_markup($c, $_)} : $info;
+    my $info = $headers
+      ? $chat->header_public($_, $said)
+      : $chat->event_public($_, $said, $room);
+    $markup ? {%$info, markup => _chat_markup($c, $_, $room)} : $info;
   } @$rows;
 
   return $c->render(json => {
@@ -1337,7 +1368,7 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
     # arrivals arrive as events, so a member that joined is kept current by the
     # sequence. This is for wanting a fresh snapshot without rejoining.
     ($c->param('roster')
-      ? (members => [map { $chat->member_public($_) } @{$chat->members($room)}]) : ()),
+      ? (members => [map { $chat->member_public($_, $room) } @{$chat->members($room)}]) : ()),
     messages => \@messages,
   });
 }
@@ -1939,7 +1970,8 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 %# and for the same reason — the messages are markdown written by agents, so
 %# they render in a sandboxed frame that cannot reach this page or its cookie.
 <div class="room" data-room="<%= $room->{id} %>" data-cursor="<%= $cursor %>"
-  data-api="<%= $room->{api_url} %>" data-me="<%= $me->{session_id} %>">
+  data-api="<%= $room->{api_url} %>" data-me="<%= $my_session %>"
+  data-author="<%= $me->{author} %>">
 
   <input class="roomhead-toggle" type="checkbox" id="roomhead-toggle">
   <header class="roomhead">
@@ -1990,8 +2022,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     <textarea name="body" rows="2" required
       placeholder="Markdown. No attachments — upload the file and paste its URL."></textarea>
     <div class="composer-actions">
-      <span class="composer-me">You are <strong><%= $me->{name} %></strong>
-        <code><%= $me->{session_id} %></code></span>
+      <span class="composer-me">You are <strong><%= $me->{name} %></strong></span>
       %# Shown only once assets/chat.js is running, because with scripting off
       %# the keyboard shortcut it describes does not exist.
       <span class="composer-hint" hidden>⌘/Ctrl-Enter posts</span>
@@ -2009,10 +2040,16 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 %# paragraph saying what the arrival is working on, which is the single most
 %# useful thing in a room and is read, not skimmed past.
 <li class="msg msg-<%= $m->{type} =~ s/\./-/gr %><%= $m->{type} =~ /\A(?:member\.(?:left|renamed|presence)|room\.)/ ? ' msg-system' : '' %>" data-id="<%= $m->{id} %>"
-  data-session="<%= $m->{session_id} %>">
+  data-author="<%= $m->{author} %>">
   <div class="msg-head">
     <span class="msg-name"><%= $m->{name} %></span>
-    <span class="msg-session" title="<%= $m->{session_id} %>"><%= $m->{session_id} %></span>
+    %# The session id used to be printed here. It is the string that identifies
+    %# the author to the API, and putting it on the wall let anyone who could read
+    %# the room post as anybody in it. The name is who they are; the id was never
+    %# for readers.
+    % if (defined $m->{mentions} && @{$m->{mentions}}) {
+    <span class="msg-to">to <%= join ', ', @{$m->{mentions}} %></span>
+    % }
     % if ($m->{type} eq 'member.joined') {
     <span class="msg-tag">joined</span>
     % }
@@ -2041,7 +2078,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     <p class="searching">Messages matching “<%= $query %>”
       — <%= scalar @$messages %> of them, oldest first.</p>
     % }
-    <ol class="messages" id="messages" data-me="<%= $me->{session_id} %>"
+    <ol class="messages" id="messages" data-me="<%= $me->{author} %>"
       data-live="<%= defined $query ? 0 : 1 %>">
       % for my $m (@$messages) {
         %= include 'chat_message', m => $m

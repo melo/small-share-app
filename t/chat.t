@@ -305,7 +305,11 @@ subtest 'posting is for members, and a message is markdown and nothing else' => 
   my $said = _post($id, 'sess-a', "**staging is green**\n\n- ran the migration");
   $t->status_is(201);
   is $said->{message}{name}, 'planner', 'the message carries the name at the time';
-  is $said->{message}{session_id}, 'sess-a', 'and the session that sent it';
+  # NOT the session id: that is what authenticates a write, and publishing it on
+  # every message let anyone who could read the room post as anybody in it. The
+  # author key is derived from it, is stable within one room, and is useless.
+  ok !exists $said->{message}{session_id}, 'and never the session that sent it';
+  like $said->{message}{author}, qr/\A[0-9a-f]{12}\z/, 'but a handle for who did';
   like $said->{message}{created_at}, qr/\AZ?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/, 'and a timestamp';
   is $said->{cursor}, $said->{message}{id}, 'and the cursor is its id';
 
@@ -489,7 +493,7 @@ subtest 'a person is asked who they are before the room opens' => sub {
   # is open is the same template — one renderer, not two.
   $t->get_ok("/api/v1/chatrooms/$id/messages?html=1&limit=1")->status_is(200)
     ->json_like('/messages/0/markup' => qr/<li class="msg msg-/)
-    ->json_like('/messages/0/markup' => qr/data-session=/);
+    ->json_like('/messages/0/markup' => qr/data-author=/);
   $t->get_ok("/api/v1/chatrooms/$id/messages?limit=1")->status_is(200);
   ok !exists $t->tx->res->json->{messages}[0]{markup},
     'and an agent asking for the same messages is not sent HTML it has no use for';
@@ -1162,6 +1166,59 @@ subtest 'an expiry releases a parked reader too' => sub {
   $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10")->status_is(200)
     ->json_is('/closed' => Mojo::JSON->true)
     ->json_is('/events/0/why' => 'expired');
+};
+
+subtest 'a member gets a credential, once, and the wall stops handing it out' => sub {
+  my $id  = _room(topic => 'identity')->{room}{id};
+  my $me  = _join($id, session_id => 'sess-t', name => 'planner', about => 'token test');
+  my $tok = $me->{member_token};
+  ok length($tok // ''), 'join hands one over';
+
+  # The only disclosure, on the same terms as a room's delete password.
+  my $again = _join($id, session_id => 'sess-t', name => 'planner', about => 'token test');
+  ok !length($again->{member_token} // ''), 'and never again';
+
+  my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  ok !grep({ length($_->{member_token} // '') } @{$room->{members}}),
+    'the roster never carries it';
+
+  my $r = $t->app->chat->find_room($id);
+  ok $t->app->chat->token_ok($r, 'sess-t', $tok),  'the right token checks out';
+  ok !$t->app->chat->token_ok($r, 'sess-t', 'no'), 'and a wrong one does not';
+  ok !$t->app->chat->token_ok($r, 'nobody', $tok), 'and it is not a skeleton key';
+
+  # A session id was a claim, not a credential, and it was printed on the wall
+  # for anyone reading the room to copy.
+  _post($id, 'sess-t', 'something');
+  my $markup = $t->get_ok("/api/v1/chatrooms/$id/messages?html=1")->status_is(200)
+    ->tx->res->json->{messages}[-1]{markup};
+  like $markup, qr/planner/, 'the transcript names the author';
+  unlike $markup, qr/sess-t/, 'and no longer prints the string that authenticates them';
+};
+
+subtest 'writing can be made to require the token' => sub {
+  my $id  = _room(topic => 'guarded')->{room}{id};
+  my $tok = _join($id, session_id => 'sess-q', name => 'planner', about => 'guard test')
+    ->{member_token};
+
+  # Off by default for one release, so nothing written last week breaks today.
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'no token, and that is fine for now'})
+    ->status_is(201);
+
+  local $t->app->config->{chat_require_token} = 1;
+
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'no token'})->status_is(403)
+    ->json_like('/error' => qr/member_token/);
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'wrong token', member_token => 'nope'})->status_is(403);
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'with token', member_token => $tok})->status_is(201);
+
+  # Reading is not affected: the URL is still the read credential, which is what
+  # a room URL has always meant.
+  $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200);
 };
 
 done_testing;

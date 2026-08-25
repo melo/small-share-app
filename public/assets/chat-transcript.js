@@ -37,8 +37,12 @@
   // Whose message is whose. Done here rather than in the template because the
   // answer depends on who is reading, and the markup for one message is handed
   // to everyone in the room unchanged.
+  //
+  // Compared on an author key rather than on a session id: the session id is
+  // what authenticates a write, and putting it on every message let anyone who
+  // could read the room post as anybody in it.
   function markMine(node) {
-    if (me && node.getAttribute('data-session') === me) node.classList.add('is-me');
+    if (me && node.getAttribute('data-author') === me) node.classList.add('is-me');
   }
 
   // Every id this transcript already holds. A message can arrive twice — the

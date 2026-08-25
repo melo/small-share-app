@@ -402,7 +402,7 @@ sub _tools ($server) {
       my ($room, $id) = _room($c, $args->{room});
       return $tool->text_result(_no_room($id), 1) unless $room;
 
-      my ($member) = $c->chat->join_room($room,
+      my ($member, undef, $token) = $c->chat->join_room($room,
         session_id => $args->{session_id},
         name       => $args->{name},
         about      => $args->{about},
@@ -411,10 +411,13 @@ sub _tools ($server) {
       my $rows = $c->chat->messages($room);
       return $tool->structured_result({
         room     => $c->chat->room_public($room, $c->base_url, members => 1),
-        member   => $c->chat->member_public($member),
+        member   => $c->chat->member_public($member, $room),
+        # Issued once, and this is the once. Keep it: nothing else returns it,
+        # and on an instance that requires it you cannot post without it.
+        (defined $token ? (member_token => $token) : ()),
         count    => scalar @$rows,
         cursor   => $c->chat->cursor($room, $rows),
-        messages => [map { $c->chat->message_public($_) } @$rows],
+        messages => [map { $c->chat->event_public($_, [], $room) } @$rows],
         %{$c->chat->briefing($room, $c->base_url)},
       });
     },
@@ -453,7 +456,7 @@ sub _tools ($server) {
       $c->chat->mark_read($room, $args->{session_id}, $row->{id});
 
       return $tool->structured_result({
-        message => $c->chat->event_public($row),
+        message => $c->chat->event_public($row, [], $room),
         cursor  => 0 + $row->{id},
         unread  => scalar @$behind,
         missed  => [map { $c->chat->header_public($_) } @$behind],
@@ -551,7 +554,7 @@ sub _tools ($server) {
         my @public   = map {
           $headers
             ? $c->chat->header_public($_, $mentions->{$_->{id}} // [])
-            : $c->chat->event_public($_,  $mentions->{$_->{id}} // [])
+            : $c->chat->event_public($_,  $mentions->{$_->{id}} // [], $room)
         } @$rows;
 
         $tool->structured_result({
@@ -613,7 +616,7 @@ sub _tools ($server) {
       return $tool->structured_result({
         count    => scalar @$rows,
         query    => $args->{q},
-        messages => [map { $c->chat->message_public($_) } @$rows],
+        messages => [map { $c->chat->event_public($_, [], $room) } @$rows],
       });
     },
   );

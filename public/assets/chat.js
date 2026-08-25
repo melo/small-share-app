@@ -28,7 +28,13 @@
   var search = document.querySelector('form.roomsearch');
   var roster = document.querySelector('.roomhead .roster');
 
+  // Two different things, deliberately. `me` is this browser's own session id,
+  // out of its own signed cookie, and it is what the API wants when posting.
+  // `author` is the per-room handle everyone else sees, and it is what messages
+  // and roster entries are compared against — no other member's session id is
+  // published any more, and this page has no business knowing one.
   var me = root.getAttribute('data-me');
+  var author = root.getAttribute('data-author');
   var cursor = parseInt(root.getAttribute('data-cursor'), 10) || 0;
 
   // Built here rather than taken from the room's api_url, which is absolute and
@@ -96,7 +102,7 @@
         var list = document.createDocumentFragment();
         data.room.members.forEach(function (member) {
           var li = document.createElement('li');
-          if (member.session_id === me) li.className = 'is-me';
+          if (member.author === author) li.className = 'is-me';
           li.appendChild(cell('roster-name', member.name));
           li.appendChild(cell('roster-kind', member.kind));
           if (member.about) li.appendChild(cell('roster-about', member.about));

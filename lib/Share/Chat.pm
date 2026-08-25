@@ -28,6 +28,7 @@ package Share::Chat;
 use Mojo::Base -base, -signatures;
 use utf8;
 
+use Digest::SHA             ();
 use Exporter                qw(import);
 use Mojo::SQLite::Migrations ();
 use Share::Store            qw(human_duration iso8601 password_hash password_ok token);
@@ -372,10 +373,14 @@ sub join_room ($self, $room, %args) {
       }
     );
     my $member = $self->member($room, $session_id);
+    # A third value, not a field on the member, so that member_public — which is
+    # what the roster is built from — has no way to leak it even by accident.
+    my $token = $self->issue_token($member);
     # The arrival goes into the transcript rather than only into the roster, so
     # anyone waiting on the room finds out that someone turned up, and what
     # they said they were doing, without polling a second endpoint for it.
-    return ($member, $self->_write($room, $session_id, $name, 'member.joined' => $about // ''));
+    return ($member, $self->_write($room, $session_id, $name, 'member.joined' => $about // ''),
+      $token);
   }
 
   $db->update(
@@ -396,6 +401,29 @@ sub join_room ($self, $room, %args) {
   return ($member,
     $self->_write($room, $session_id, $name,
       'member.renamed' => "$existing->{name} is now **$name**"));
+}
+
+# A write credential, issued once, on the same terms as a room's delete
+# password: this is the only moment the plaintext exists outside the caller's
+# hand.
+#
+# The room URL stays the READ credential — anyone holding it can read the room,
+# which is what a room URL has always meant. What this adds is the other half,
+# because "your own message" has to mean something before anybody can edit or
+# delete one. Until now a session id was a claim, and it was rendered on every
+# message in the transcript for anyone reading the room to copy.
+sub issue_token ($self, $member) {
+  my $token = token(24);
+  my ($salt, $hash) = password_hash($token);
+  $self->sql->db->query('UPDATE chat_members SET token_salt = ?, token_hash = ? WHERE id = ?',
+    $salt, $hash, $member->{id});
+  return $token;
+}
+
+sub token_ok ($self, $room, $session_id, $token) {
+  my $member = $self->member($room, $session_id) or return 0;
+  return 0 unless defined $member->{token_hash};
+  return password_ok($token, $member->{token_salt}, $member->{token_hash}) ? 1 : 0;
 }
 
 sub member ($self, $room, $session_id) {
@@ -827,14 +855,15 @@ sub room_public ($self, $room, $base_url, %opt) {
     created_at => iso8601($room->{created_at}),
     expires_at => iso8601($room->{expires_at}),
     expires_in => human_duration($left),
-    ($opt{members} ? (members => [map { $self->member_public($_) } @{$self->members($room)}]) : ()),
+    ($opt{members}
+      ? (members => [map { $self->member_public($_, $room) } @{$self->members($room)}]) : ()),
   };
 }
 
-sub member_public ($self, $member) {
+sub member_public ($self, $member, $room = undef) {
   my $presence = $self->presence($member);
   return {
-    session_id   => $member->{session_id},
+    author       => $room ? $self->author_key($room, $member->{session_id}) : undef,
     name         => $member->{name},
     about        => $member->{about},
     kind         => $member->{kind},
@@ -849,10 +878,23 @@ sub member_public ($self, $member) {
   };
 }
 
-sub event_public ($self, $row, $mentions = []) {
+# A stable per-room handle for whoever wrote something, which is NOT their
+# session id.
+#
+# The session id is what authenticates a write, and it was rendered on every
+# message and returned with every event — so anyone who could read a room could
+# read an id off the wall and post as its owner. It is derived rather than
+# stored so that nothing had to migrate, and it is salted with the room secret so
+# the same session in two rooms does not link them.
+sub author_key ($self, $room, $session_id) {
+  return undef unless defined $session_id;
+  return substr Digest::SHA::sha256_hex("$room->{secret}\0$session_id"), 0, 12;
+}
+
+sub event_public ($self, $row, $mentions = [], $room = undef) {
   return {
     id         => 0 + $row->{id},
-    session_id => $row->{session_id},
+    author     => $room ? $self->author_key($room, $row->{session_id}) : undef,
     name       => $row->{name},
     type       => $row->{type},
     # The name this field had before a room had an event stream. It costs one key
