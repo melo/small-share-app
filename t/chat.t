@@ -21,6 +21,8 @@ use Mojo::IOLoop ();
 # from_json, not decode_json: anything read out of an MCP result has already
 # been decoded from the response and is characters. See t/share.t.
 use Mojo::JSON  qw(from_json);
+use Mojo::SQLite ();
+use Share::Chat  ();
 use Test::Mojo  ();
 use Test::More;
 
@@ -102,6 +104,18 @@ sub _post ($id, $session, $body) {
   return $t->tx->res->json;
 }
 
+# A person in the room. The API deliberately will not make one -- it hardcodes
+# kind => 'agent', because the paragraph saying what you are working on is
+# required of an agent and optional for somebody who has just opened the page --
+# so a human arrives the way a human really does, through the model behind the
+# browser's join form.
+sub _human ($id, $session, $name) {
+  my $room = $t->app->chat->find_room($id);
+  my ($member) = $t->app->chat->join_room($room,
+    session_id => $session, name => $name, kind => 'human');
+  return $member;
+}
+
 # ------------------------------------------------------------ the briefing ---
 
 subtest 'a room is one URL, and the URL explains itself to whoever fetches it' => sub {
@@ -118,7 +132,7 @@ subtest 'a room is one URL, and the URL explains itself to whoever fetches it' =
   # The whole protocol, in the answer, because the agent on the other end of
   # this URL may have no MCP server registered and nothing else to read.
   like $made->{how_to}, qr/JOIN FIRST/,               'the briefing says to join first';
-  like $made->{how_to}, qr/wait=30/,                  'and that waiting beats polling';
+  like $made->{how_to}, qr/wait=900/, 'and that parking beats polling';
   like $made->{how_to}, qr/case-insensitive\s+substring/s, 'and what grep means here';
   like $made->{how_to}, qr/NO ATTACHMENTS/,           'and that files go through the file side';
   like $made->{how_to}, qr{https://share\.example\.test/api/v1/files},
@@ -130,7 +144,7 @@ subtest 'a room is one URL, and the URL explains itself to whoever fetches it' =
   # the same briefing. This is the path an agent takes when a person pastes the
   # URL into its conversation.
   $t->get_ok("/c/$id")->status_is(200)->content_type_like(qr{application/json})
-    ->json_is('/room/id' => $id)->json_has('/how_to')->json_has('/endpoints/wait')
+    ->json_is('/room/id' => $id)->json_has('/how_to')->json_has('/endpoints/watch')
     ->json_has('/curl/post');
 
   # …and it does NOT carry the delete password, which was disclosed once.
@@ -247,7 +261,7 @@ subtest 'joining means a name nobody else has, and what you are working on' => s
   is $joined->{member}{name}, 'planner', 'joined under the name it asked for';
   is $joined->{member}{kind}, 'agent',   'as an agent';
   is $joined->{count}, 1, 'and the arrival is in the transcript, not only in the roster';
-  is $joined->{messages}[0]{kind}, 'join', 'as a join';
+  is $joined->{messages}[0]{type}, 'member.joined', 'as an arrival';
   is $joined->{messages}[0]{body}, 'holding the release checklist',
     'carrying the paragraph, so anyone waiting on the room reads it at once';
   is $joined->{cursor}, $joined->{messages}[0]{id}, 'with a cursor to read on from';
@@ -269,7 +283,7 @@ subtest 'joining means a name nobody else has, and what you are working on' => s
   my $renamed = _join($id, session_id => 'sess-a', name => 'releaser', about => 'now tagging');
   is $renamed->{member}{name}, 'releaser', 'renamed';
   is $renamed->{count}, 2, 'and the room was told';
-  is $renamed->{messages}[-1]{kind}, 'system', 'as a system line';
+  is $renamed->{messages}[-1]{type}, 'member.renamed', 'as a rename';
   like $renamed->{messages}[-1]{body}, qr/planner is now \*\*releaser\*\*/, 'saying so';
 
   # The freed name is available again.
@@ -293,7 +307,11 @@ subtest 'posting is for members, and a message is markdown and nothing else' => 
   my $said = _post($id, 'sess-a', "**staging is green**\n\n- ran the migration");
   $t->status_is(201);
   is $said->{message}{name}, 'planner', 'the message carries the name at the time';
-  is $said->{message}{session_id}, 'sess-a', 'and the session that sent it';
+  # NOT the session id: that is what authenticates a write, and publishing it on
+  # every message let anyone who could read the room post as anybody in it. The
+  # author key is derived from it, is stable within one room, and is useless.
+  ok !exists $said->{message}{session_id}, 'and never the session that sent it';
+  like $said->{message}{author}, qr/\A[0-9a-f]{12}\z/, 'but a handle for who did';
   like $said->{message}{created_at}, qr/\AZ?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/, 'and a timestamp';
   is $said->{cursor}, $said->{message}{id}, 'and the cursor is its id';
 
@@ -329,7 +347,7 @@ subtest 'reading from a cursor, and grepping what was said' => sub {
   $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)
     ->json_is('/count' => 4)->json_is('/cursor' => $third)->json_is('/missed' => Mojo::JSON->false)
     ->json_is('/room/id' => $id)
-    ->json_is('/messages/0/kind' => 'join')
+    ->json_is('/messages/0/type' => 'member.joined')
     ->json_is('/messages/3/body' => 'three, also migration');
 
   # Oldest first, always: that is the order a transcript is read in.
@@ -455,7 +473,7 @@ subtest 'a person is asked who they are before the room opens' => sub {
   unlike $page, qr/alert\(1\)/, 'no message text reaches the chrome page';
 
   $t->get_ok("/c/$id/transcript" => \%html)->status_is(200)
-    ->content_like(qr/<li class="msg msg-join"/)
+    ->content_like(qr/<li class="msg msg-member-joined"/)
     ->content_like(qr/<li class="msg msg-message"/)
     ->content_like(qr{<h1>Plan</h1>})
     # Rendered by the same sanitiser that renders an uploaded file, and framed
@@ -477,7 +495,7 @@ subtest 'a person is asked who they are before the room opens' => sub {
   # is open is the same template — one renderer, not two.
   $t->get_ok("/api/v1/chatrooms/$id/messages?html=1&limit=1")->status_is(200)
     ->json_like('/messages/0/markup' => qr/<li class="msg msg-/)
-    ->json_like('/messages/0/markup' => qr/data-session=/);
+    ->json_like('/messages/0/markup' => qr/data-author=/);
   $t->get_ok("/api/v1/chatrooms/$id/messages?limit=1")->status_is(200);
   ok !exists $t->tx->res->json->{messages}[0]{markup},
     'and an agent asking for the same messages is not sent HTML it has no use for';
@@ -538,7 +556,7 @@ subtest 'MCP: the room tools are there, and they are about coordination' => sub 
     search_chat_messages delete_chatroom);
 
   like $tools{create_chatroom}{description}, qr/other sessions/, 'create says what it is for';
-  like $tools{get_chat_messages}{description}, qr/HOLDS until/, 'and reading says it can wait';
+  like $tools{get_chat_messages}{description}, qr/HOLDS for up to/, 'and reading says it can wait';
   like $tools{post_chat_message}{description}, qr/No attachments/,
     'and posting says where a file goes';
 
@@ -665,6 +683,747 @@ subtest 'closing a room early needs the password it was made with' => sub {
       {'X-Delete-Password' => $made->{delete_password}})->status_is(200)
     ->json_is('/deleted' => $id);
   $t->get_ok("/api/v1/chatrooms/$id")->status_is(404);
+};
+
+# ------------------------------------------------------------ the sequence ---
+
+subtest 'the sequence is events, and the old rows kept their meaning' => sub {
+  my $id = _room(topic => 'migrating')->{room}{id};
+  _join($id, session_id => 'sess-m', name => 'planner', about => 'schema test');
+  _post($id, 'sess-m', 'hello');
+
+  my $db = $t->app->chat->sql->db;
+
+  ok $db->query(q{SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_events'})
+    ->array, 'chat_events exists';
+  ok !$db->query(q{SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_messages'})
+    ->array, 'chat_messages is gone';
+
+  my $room  = $t->app->chat->find_room($id);
+  my $types = $db->query('SELECT type FROM chat_events WHERE room_id = ? ORDER BY id',
+    $room->{id})->arrays->flatten->to_array;
+  is_deeply $types, ['member.joined', 'message'], 'join became member.joined';
+
+  # A member who has only arrived: posting is what moves a read cursor, and
+  # sess-m has posted.
+  _join($id, session_id => 'sess-m2', name => 'lurker', about => 'joined and said nothing');
+  my $m = $db->query('SELECT * FROM chat_members WHERE session_id = ?', 'sess-m2')->hash;
+  is $m->{read_cursor},   0, 'read_cursor starts at zero';
+  is $m->{waiting_until}, 0, 'waiting_until starts at zero';
+  is $m->{left_at},   undef, 'nobody has left';
+
+  ok $db->query(q{SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_mentions'})
+    ->array, 'chat_mentions exists';
+};
+
+subtest 'a park that ends in silence says so' => sub {
+  my $id = _room(topic => 'patience')->{room}{id};
+  _join($id, session_id => 'sess-w', name => 'watcher', about => 'wait test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/messages")->tx->res->json->{cursor};
+
+  # Nothing happens, so the answer says why it is empty. A re-arming loop must
+  # never have to infer this from count == 0 -- which is indistinguishable from
+  # a filter that matched nothing.
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=1")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->true)
+    ->json_is('/count' => 0)
+    ->json_is('/cursor' => $cursor);
+
+  Mojo::IOLoop->timer(0.2 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id), session_id => 'sess-w', body => 'oi') });
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=10")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->false)
+    ->json_is('/count' => 1);
+
+  # An immediate read never waited, so it did not time out either.
+  $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->false);
+};
+
+subtest 'both wait ceilings move together' => sub {
+  # There are TWO, and they are independent: share.pl has its own constant and
+  # lib/Share/MCP.pm clamps again on the way past. Changing one and shipping was
+  # the bug this exists to prevent -- and it cannot be caught by posting into the
+  # park, because a write at 0.3s returns quickly whichever ceiling applied.
+  #
+  # So the ceiling is driven DOWN instead, and the park is left to expire. If the
+  # MCP tool is still clamping to its own hard-coded sixty, this takes a minute
+  # rather than three seconds.
+  is $t->app->config->{chat_max_wait}, 900, 'the HTTP ceiling is configuration now';
+
+  local $t->app->config->{chat_max_wait} = 3;
+
+  my $id = _room(topic => 'mcp patience')->{room}{id};
+  _call(join_chatroom => {room => $id, session_id => 'sess-mw',
+    name => 'mcpwatcher', about => 'ceiling test'});
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/messages")->tx->res->json->{cursor};
+
+  my $started = time;
+  my $out = _call(get_chat_messages =>
+    {room => $id, session_id => 'sess-mw', since => $cursor, wait => 600})
+    ->{structuredContent};
+  my $took = time - $started;
+
+  is $out->{count}, 0, 'nothing was said';
+  is $out->{timed_out}, Mojo::JSON->true, 'and the park reports that it expired';
+  ok $took < 20, "the tool honoured the configured ceiling, not its own (${took}s)";
+
+  # The plain endpoint honours the same number.
+  $started = time;
+  $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=600")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->true);
+  ok time - $started < 20, 'and so does the HTTP endpoint';
+};
+
+subtest 'events and messages are one endpoint under two names' => sub {
+  my $id = _room(topic => 'two names')->{room}{id};
+  _join($id, session_id => 'sess-e', name => 'planner', about => 'alias test');
+  _post($id, 'sess-e', 'first');
+
+  my $ev = $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200)->tx->res->json;
+  is $ev->{count}, 2, 'the arrival and the message are both events';
+  is $ev->{events}[1]{body}, 'first', 'events is the canonical key';
+
+  my $msg = $t->get_ok("/api/v1/chatrooms/$id/messages")->status_is(200)->tx->res->json;
+  is_deeply $msg->{messages}, $ev->{events}, 'the old key is the same list';
+  is_deeply $msg->{events},   $ev->{events}, 'and the new key is there too';
+
+  # Every parameter works on both paths, including the ones that park.
+  $t->get_ok("/api/v1/chatrooms/$id/events?q=first")->status_is(200)->json_is('/count' => 1);
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=" . $ev->{cursor} . "&wait=1")
+    ->status_is(200)->json_is('/timed_out' => Mojo::JSON->true);
+
+  # And a room that is not live answers the same way on both.
+  $t->get_ok('/api/v1/chatrooms/nosuchroomnosuchroom12345678/events')->status_is(404);
+};
+
+subtest 'a catch-up can cost hundreds of tokens instead of thousands' => sub {
+  my $id = _room(topic => 'headers')->{room}{id};
+  _join($id, session_id => 'sess-h', name => 'planner', about => 'headers test');
+
+  my $long = 'x' x 4000;
+  my $ev   = _post($id, 'sess-h', "the first line\n\n$long")->{message}{id};
+
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?format=headers")->status_is(200)
+    ->tx->res->json;
+  my ($head) = grep { $_->{id} == $ev } @{$got->{events}};
+
+  ok !exists $head->{body}, 'a header carries no body';
+  ok length($head->{preview}) <= 160, 'the preview is bounded';
+  like $head->{preview}, qr/^the first line/, 'and it is the top of the message';
+  is $head->{truncated}, Mojo::JSON->true, 'which it says, so nobody acts on half a sentence';
+  is $head->{bytes}, length("the first line\n\n$long"), 'and says how much it did not send';
+  is $head->{name}, 'planner', 'the author is a header field, not a body field';
+  is $head->{type}, 'message', 'and so is the kind of thing it was';
+
+  # The whole point, in one number: headers are an order of magnitude smaller.
+  my $full = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  ok length(Mojo::JSON::encode_json($got)) * 5 < length(Mojo::JSON::encode_json($full)),
+    'and the answer really is much smaller than the bodies it stands for';
+
+  # The body is one call away when it turns out to matter.
+  $t->get_ok("/api/v1/chatrooms/$id/events/$ev")->status_is(200)
+    ->json_is('/event/body' => "the first line\n\n$long")
+    ->json_is('/event/type' => 'message');
+
+  my $short = _post($id, 'sess-h', 'brief')->{message}{id};
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?format=headers&since=" . ($short - 1))
+    ->tx->res->json;
+  is $got->{events}[0]{truncated}, Mojo::JSON->false, 'nothing was cut';
+  is $got->{events}[0]{preview}, 'brief', 'so the preview is the whole of it';
+
+  # An event id that is not in this room is not readable through it.
+  $t->get_ok("/api/v1/chatrooms/$id/events/999999")->status_is(404);
+};
+
+subtest 'the server keeps your place, but only when you ask it to' => sub {
+  my $id = _room(topic => 'cursors')->{room}{id};
+  _join($id, session_id => 'sess-r', name => 'reader',  about => 'cursor test');
+  _join($id, session_id => 'sess-p', name => 'speaker', about => 'cursor test');
+  _post($id, 'sess-p', 'one');
+  _post($id, 'sess-p', 'two');
+
+  # A watcher that remembers nothing asks for what it has not read.
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+    ->status_is(200)->tx->res->json;
+  is $got->{count}, 4, 'two arrivals and two messages';
+  is $got->{unread}, 0, 'and it is now caught up';
+
+  # Asking again gets nothing, because the server advanced the cursor.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+    ->status_is(200)->json_is('/count' => 0);
+
+  # An explicit cursor does NOT move the stored one: the caller is carrying its
+  # own position and the server has no business overwriting it.
+  _post($id, 'sess-p', 'three');
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=0&session_id=sess-r")->status_is(200)
+    ->json_is('/count' => 5);
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+    ->status_is(200)->json_is('/count' => 1)->json_is('/events/0/body' => 'three');
+
+  # A watcher that reads with its OWN cursor acknowledges separately, and can
+  # acknowledge only as far as it actually got. That is the whole reason the two
+  # are different calls: a session that dies between reading and acting should
+  # come back to the work it did not finish, not to the messages it merely
+  # received.
+  _post($id, 'sess-p', 'four');
+  _post($id, 'sess-p', 'five');
+  my $mine = $t->app->chat->read_cursor($t->app->chat->find_room($id), 'sess-r');
+  my $back = $t->get_ok("/api/v1/chatrooms/$id/events?since=$mine&session_id=sess-r")
+    ->tx->res->json;
+  is $back->{count},  2, 'two more arrived';
+  is $back->{unread}, 2, 'and an explicit read did not silently mark them read';
+
+  $t->post_ok("/api/v1/chatrooms/$id/members/sess-r/read" => json =>
+      {cursor => $back->{events}[0]{id}})->status_is(200)->json_is('/unread' => 1);
+
+  # A cursor never goes backwards: two reads can overlap, and the later one
+  # landing first must not un-read what the earlier one already delivered.
+  $t->post_ok("/api/v1/chatrooms/$id/members/sess-r/read" => json => {cursor => 1})
+    ->status_is(200)->json_is('/unread' => 1);
+
+  # Somebody who never joined has read nothing, so `unread` means the room. It is
+  # not an error and it is not a leak: they could have asked for since=0 anyway,
+  # and the URL is the read credential either way.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=nobody")
+    ->status_is(200)->json_is('/count' => 7)->json_is('/unread' => 0);
+};
+
+subtest 'a park can start from where you left off' => sub {
+  my $id = _room(topic => 'parked unread')->{room}{id};
+  _join($id, session_id => 'sess-u', name => 'watcher', about => 'unread park');
+  # Catch up so the park below genuinely has nothing waiting for it.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u");
+
+  Mojo::IOLoop->timer(0.3 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-u', body => 'arrived while parked') });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u&wait=10")
+    ->status_is(200)->json_is('/count' => 1)
+    ->json_is('/events/0/body' => 'arrived while parked');
+
+  # And the park advanced the stored cursor too, so re-arming is not a re-read.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u")
+    ->status_is(200)->json_is('/count' => 0);
+};
+
+subtest 'the moment you post is the moment you are provably listening' => sub {
+  my $id = _room(topic => 'crossing')->{room}{id};
+  _join($id, session_id => 'sess-x', name => 'talker', about => 'gap test');
+  _join($id, session_id => 'sess-y', name => 'other',  about => 'gap test');
+
+  # Catch up, so the gap below is unambiguous.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-x");
+
+  # Two things are said while sess-x is not looking. This is the exact failure
+  # from the field: a cursor that went 11 -> 15 -> 21 and never said why.
+  _post($id, 'sess-y', 'you missed this');
+  _post($id, 'sess-y', 'and this');
+
+  my $res = _post($id, 'sess-x', 'saying my piece');
+  is $res->{unread}, 2, 'the acknowledgement says how far behind you were';
+  is scalar @{$res->{missed}}, 2, 'and hands the gap over';
+  is $res->{missed}[0]{preview}, 'you missed this', 'as headers, not as bodies';
+  ok !exists $res->{missed}[0]{body}, 'because the whole point was to be cheap';
+  ok !grep({ $_->{id} == $res->{message}{id} } @{$res->{missed}}),
+    'and never the message just posted, which is in the answer already';
+
+  # Posting caught you up, so the next one has nothing to report.
+  my $next = _post($id, 'sess-x', 'again');
+  is $next->{unread}, 0, 'posting marks you current';
+  is_deeply $next->{missed}, [], 'so there is nothing to hand back';
+};
+
+subtest 'a mention is data, and an at-sign was decoration' => sub {
+  my $id = _room(topic => 'mentions')->{room}{id};
+  _join($id, session_id => 'sess-1', name => 'planner',  about => 'mention test');
+  _join($id, session_id => 'sess-2', name => 'DRAC-E1',  about => 'mention test');
+  _join($id, session_id => 'sess-d', name => 'drac',     about => 'the shorter name');
+  _human($id, 'sess-3', 'melo');
+
+  _post($id, 'sess-1', 'nothing for anybody here');
+  my $direct = _post($id, 'sess-1', 'can @DRAC-E1 confirm the compose file?');
+
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=" . ($direct->{message}{id} - 1))
+    ->tx->res->json;
+  is_deeply $got->{events}[0]{mentions}, ['DRAC-E1'], 'the mention is a field, not prose';
+
+  # "@drac" must not be found inside "@DRAC-E1". A hyphen is a word character as
+  # far as a name is concerned, and treating it as a boundary addresses the
+  # wrong agent -- quietly, and in a room where that is the whole point.
+  ok !grep({ $_ eq 'drac' } @{$got->{events}[0]{mentions}}), 'and it is the whole name';
+
+  # Case-insensitive, because nobody types a name back exactly.
+  _post($id, 'sess-1', 'and @drac-e1 again');
+
+  my $noise = _post($id, 'sess-1', 'ping @nobody-here');
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=" . ($noise->{message}{id} - 1))
+    ->tx->res->json;
+  is_deeply $got->{events}[0]{mentions}, [], 'an at-sign that matches nobody is just an at-sign';
+
+  # "Has anyone addressed me?" is one call.
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&since=0")
+    ->status_is(200)->tx->res->json;
+  is $got->{count}, 2, 'both, and none of the others';
+
+  # A rename does not orphan what was already addressed to you: the row binds to
+  # the member, and the name is looked up when it is asked for.
+  _join($id, session_id => 'sess-2', name => 'E1', about => 'renamed mid-run');
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&since=0")
+    ->tx->res->json;
+  is $got->{count}, 2, 'still both';
+  is_deeply $got->{events}[0]{mentions}, ['E1'], 'under the name they go by now';
+
+  # Headers carry them too, which is the combination a watcher actually uses.
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2"
+      . "&since=0&format=headers")->tx->res->json;
+  is_deeply $got->{events}[0]{mentions}, ['E1'], 'in headers as well as in full';
+};
+
+subtest 'one message can reach the whole fleet, and no human' => sub {
+  my $id = _room(topic => 'broadcast')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'alpha', about => 'fleet test');
+  _join($id, session_id => 'sess-b', name => 'bravo', about => 'fleet test');
+  _human($id, 'sess-h', 'melo');
+
+  my $all = _post($id, 'sess-h', '@agents stop what you are doing and read BOB-6');
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=" . ($all->{message}{id} - 1))
+    ->tx->res->json;
+  is_deeply [sort @{$got->{events}[0]{mentions}}], ['alpha', 'bravo'],
+    'every agent in the room';
+
+  # Not the person who sent it, and not any other person. Steering the fleet
+  # should not ping the people who are reading anyway -- that is the difference
+  # between a broadcast and a megaphone.
+  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-h&since=0")
+    ->json_is('/count' => 0);
+  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-a&since=0")
+    ->json_is('/count' => 1);
+};
+
+subtest 'a park on being wanted is not woken by ordinary chatter' => sub {
+  my $id = _room(topic => 'selective')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'alpha', about => 'park test');
+  _join($id, session_id => 'sess-b', name => 'bravo', about => 'park test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  # Chatter first, then the thing that actually concerns bravo. If the filter is
+  # applied to the read but not to the PARK, the first post ends the wait and
+  # this comes back with the wrong message -- which is the difference between a
+  # watcher an agent leaves running and one it turns off.
+  Mojo::IOLoop->timer(0.2 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-a', body => 'unrelated noise') });
+  Mojo::IOLoop->timer(0.6 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-a', body => 'over to you @bravo') });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10"
+      . "&mentions_me=1&session_id=sess-b")->status_is(200)
+    ->json_is('/count' => 1)
+    ->json_is('/events/0/body' => 'over to you @bravo');
+};
+
+subtest 'leaving is a call, and the roster stops lying about it' => sub {
+  my $id = _room(topic => 'presence')->{room}{id};
+  _join($id, session_id => 'sess-s', name => 'stayer', about => 'presence test');
+  _join($id, session_id => 'sess-g', name => 'goer',   about => 'presence test');
+  _post($id, 'sess-g', 'something worth keeping');
+
+  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-g")->status_is(200)
+    ->json_is('/left' => 'goer');
+
+  my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  my ($gone) = grep { $_->{name} eq 'goer' } @{$room->{members}};
+  is $gone->{presence}, 'gone', 'the roster says so instead of leaving everyone to guess';
+  is $gone->{online}, Mojo::JSON->false, 'and is plainly not here';
+
+  # The departure is an event, so a parked watcher learns about it.
+  my $ev = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  is $ev->{events}[-1]{type}, 'member.left', 'and it is in the sequence like everything else';
+
+  # Their words stay. The author's name is denormalised onto every row precisely
+  # so a transcript reads the way it read at the time.
+  ok scalar(grep { ($_->{body} // '') eq 'something worth keeping' } @{$ev->{events}}),
+    'what they said outlives them';
+
+  # Leaving twice is not two events.
+  my $before = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{count};
+  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-g")->status_is(200);
+  is $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{count}, $before,
+    'saying goodbye twice is still one goodbye';
+
+  # Coming back clears it rather than making a second member.
+  _join($id, session_id => 'sess-g', name => 'goer', about => 'back again');
+  $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  ($gone) = grep { $_->{name} eq 'goer' } @{$room->{members}};
+  isnt $gone->{presence}, 'gone', 'rejoining is not resurrection, it is just being here';
+  is scalar @{$room->{members}}, 2, 'and it is still two people';
+
+  # Somebody who was never here cannot leave.
+  $t->delete_ok("/api/v1/chatrooms/$id/members/never-here")->status_is(404);
+};
+
+subtest 'holding a poll is what says you are listening' => sub {
+  my $id = _room(topic => 'listening')->{room}{id};
+  _join($id, session_id => 'sess-l', name => 'listener', about => 'poll presence');
+
+  # Parked, with nothing to find, so the park is genuinely open while the roster
+  # is read from underneath it.
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+  my $seen;
+  Mojo::IOLoop->timer(0.4 => sub {
+    my $room = $t->app->chat->find_room($id);
+    my ($me) = grep { $_->{session_id} eq 'sess-l' } @{$t->app->chat->members($room)};
+    $seen = $t->app->chat->presence($me);
+  });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=2&session_id=sess-l")
+    ->status_is(200);
+  is $seen, 'listening', 'an open poll is the presence signal, with nobody saying anything';
+
+  # And letting go of it stops the claim, rather than leaving it standing until
+  # a deadline that can now be fifteen minutes away.
+  my $room = $t->app->chat->find_room($id);
+  my ($me) = grep { $_->{session_id} eq 'sess-l' } @{$t->app->chat->members($room)};
+  is $t->app->chat->presence($me), 'idle', 'and the claim ends when the poll does';
+};
+
+subtest 'a roster comes with a read only when it is asked for' => sub {
+  my $id = _room(topic => 'roster on reads')->{room}{id};
+  _join($id, session_id => 'sess-o', name => 'planner', about => 'roster test');
+
+  my $bare = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  ok !exists $bare->{members}, 'off by default, because headers exist to be cheap';
+
+  my $with = $t->get_ok("/api/v1/chatrooms/$id/events?roster=1")->tx->res->json;
+  is $with->{members}[0]{name}, 'planner', 'and on request it is the roster you know';
+  is $with->{members}[0]{presence}, 'idle', 'with presence on it';
+  ok exists $with->{members}[0]{read_cursor},
+    'and how far they have read, which is what tells you to stop waiting on them';
+};
+
+subtest 'a room warns while it is still standing' => sub {
+  my $id = _room(topic => 'closing time', ttl_days => 0.05)->{room}{id};
+  _join($id, session_id => 'sess-c', name => 'planner', about => 'expiry test');
+
+  is $t->app->chat->warn_expiring, 1, 'a room inside the warning window gets one';
+
+  my $ev = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  is $ev->{events}[-1]{type}, 'room.expiring', 'and it is an ordinary event';
+  is $ev->{events}[-1]{name}, 'system', 'written by nobody in particular';
+  is $ev->{events}[-1]{session_id}, undef, 'because no member did it';
+  like $ev->{events}[-1]{body}, qr/deleted/, 'saying what is about to happen';
+
+  # Once, however many times the reaper passes over it.
+  is $t->app->chat->warn_expiring, 0, 'and never twice';
+
+  # A room with a fortnight left is not warned about anything.
+  my $far = _room(topic => 'plenty of time')->{room}{id};
+  is $t->app->chat->warn_expiring, 0, 'nor is one that is nowhere near going';
+};
+
+subtest 'a parked reader is told the room is over, not left hanging' => sub {
+  my $made = _room(topic => 'doomed');
+  my $id   = $made->{room}{id};
+  my $pw   = $made->{delete_password};
+  _join($id, session_id => 'sess-d', name => 'planner', about => 'destruction test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  # The room is destroyed while somebody is parked on it. Before this, the poll
+  # went on asking a room that no longer existed and settled empty AT THE
+  # DEADLINE -- which at sixty seconds was invisible and at fifteen minutes is a
+  # held connection doing nothing for a quarter of an hour.
+  Mojo::IOLoop->timer(0.3 => sub { $t->app->chat->remove_room($id, $pw) });
+
+  my $started = time;
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10")->status_is(200)
+    ->json_is('/closed' => Mojo::JSON->true)
+    ->json_is('/count' => 1)
+    ->json_is('/events/0/type' => 'room.destroyed')
+    ->json_is('/events/0/name' => 'system')
+    ->json_is('/events/0/why'  => 'closed');
+  my $took = time - $started;
+  ok $took < 5, "released when it happened, not at the deadline (${took}s)";
+
+  # A cold read of a room that is not live is still a 404: we genuinely cannot
+  # tell "destroyed an hour ago" from "never existed" -- find_room returns undef
+  # for both -- and claiming 410 Gone would be inventing knowledge.
+  $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(404);
+};
+
+subtest 'an expiry releases a parked reader too' => sub {
+  my $id = _room(topic => 'about to lapse', ttl_days => 0.042)->{room}{id};
+  _join($id, session_id => 'sess-l', name => 'planner', about => 'lapse test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  # Wound forward past its expiry. find_room treats an expired room as absent
+  # from that moment, an hour or so before the reaper physically deletes it, so a
+  # waiter is released at the true expiry and not at the next reaper pass.
+  Mojo::IOLoop->timer(0.3 => sub {
+    $t->app->chat->sql->db->query('UPDATE chat_rooms SET expires_at = ? WHERE secret = ?',
+      time - 1, $id) });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10")->status_is(200)
+    ->json_is('/closed' => Mojo::JSON->true)
+    ->json_is('/events/0/why' => 'expired');
+};
+
+subtest 'a member gets a credential, once, and the wall stops handing it out' => sub {
+  my $id  = _room(topic => 'identity')->{room}{id};
+  my $me  = _join($id, session_id => 'sess-t', name => 'planner', about => 'token test');
+  my $tok = $me->{member_token};
+  ok length($tok // ''), 'join hands one over';
+
+  # The only disclosure, on the same terms as a room's delete password.
+  my $again = _join($id, session_id => 'sess-t', name => 'planner', about => 'token test');
+  ok !length($again->{member_token} // ''), 'and never again';
+
+  my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  ok !grep({ length($_->{member_token} // '') } @{$room->{members}}),
+    'the roster never carries it';
+
+  my $r = $t->app->chat->find_room($id);
+  ok $t->app->chat->token_ok($r, 'sess-t', $tok),  'the right token checks out';
+  ok !$t->app->chat->token_ok($r, 'sess-t', 'no'), 'and a wrong one does not';
+  ok !$t->app->chat->token_ok($r, 'nobody', $tok), 'and it is not a skeleton key';
+
+  # A session id was a claim, not a credential, and it was printed on the wall
+  # for anyone reading the room to copy.
+  _post($id, 'sess-t', 'something');
+  my $markup = $t->get_ok("/api/v1/chatrooms/$id/messages?html=1")->status_is(200)
+    ->tx->res->json->{messages}[-1]{markup};
+  like $markup, qr/planner/, 'the transcript names the author';
+  unlike $markup, qr/sess-t/, 'and no longer prints the string that authenticates them';
+};
+
+subtest 'writing can be made to require the token' => sub {
+  my $id  = _room(topic => 'guarded')->{room}{id};
+  my $tok = _join($id, session_id => 'sess-q', name => 'planner', about => 'guard test')
+    ->{member_token};
+
+  # Off by default for one release, so nothing written last week breaks today.
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'no token, and that is fine for now'})
+    ->status_is(201);
+
+  local $t->app->config->{chat_require_token} = 1;
+
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'no token'})->status_is(403)
+    ->json_like('/error' => qr/member_token/);
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'wrong token', member_token => 'nope'})->status_is(403);
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-q', body => 'with token', member_token => $tok})->status_is(201);
+
+  # Reading is not affected: the URL is still the read credential, which is what
+  # a room URL has always meant.
+  $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200);
+};
+
+subtest 'MCP: the tools an agent needs to be a listener that costs nothing' => sub {
+  my $tools = _mcp('tools/list')->{result}{tools};
+  my %have  = map { $_->{name} => $_ } @$tools;
+
+  ok $have{get_room_events},   'reading the sequence has the name the sequence has';
+  ok $have{get_chat_messages}, 'and the old name still answers, for one release';
+  ok $have{fetch_chat_event},  'a headers reader can get one body';
+  ok $have{leave_chatroom},    'and say when it is done';
+
+  like $have{get_room_events}{description}, qr/900|fifteen minutes/i,
+    'the description says how long it can park, or no agent will park';
+  like $have{get_room_events}{description}, qr/headers/i,
+    'and that a cheap read exists, or nobody will use it';
+  like $have{join_chatroom}{description}, qr/rename/i,
+    'joining says that calling it again renames you, which it always did silently';
+};
+
+subtest 'MCP: park, be woken by a mention, then leave' => sub {
+  my $id = _room(topic => 'mcp watcher')->{room}{id};
+  my $joined = _call(join_chatroom => {room => $id, session_id => 'sess-mcp',
+    name => 'watcher', about => 'mcp test'})->{structuredContent};
+  ok length($joined->{member_token} // ''), 'join issues a token';
+
+  _join($id, session_id => 'sess-mate', name => 'mate', about => 'the other one');
+
+  Mojo::IOLoop->timer(0.2 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-mate', body => 'ignore me') });
+  Mojo::IOLoop->timer(0.6 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-mate', body => 'yours @watcher') });
+
+  my $out = _call(get_room_events => {room => $id, session_id => 'sess-mcp',
+    since => 'unread', wait => 10, mentions_me => 1, format => 'headers'})
+    ->{structuredContent};
+  is $out->{count}, 1, 'woken once, by the one that concerned it';
+  like $out->{events}[0]{preview}, qr/yours/, 'and handed a header, not an essay';
+  ok !exists $out->{events}[0]{body}, 'which is the whole point';
+
+  my $one = _call(fetch_chat_event => {room => $id, id => $out->{events}[0]{id}})
+    ->{structuredContent};
+  is $one->{event}{body}, 'yours @watcher', 'and the body when it turns out to matter';
+
+  my $left = _call(leave_chatroom => {room => $id, session_id => 'sess-mcp'});
+  ok !$left->{isError}, 'leaving is a call now';
+
+  my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  my ($gone) = grep { $_->{name} eq 'watcher' } @{$room->{members}};
+  is $gone->{presence}, 'gone', 'and the roster believes it';
+};
+
+subtest 'the URL still explains the whole of how to take part' => sub {
+  my $id  = _room(topic => 'briefing')->{room}{id};
+  my $how = $t->get_ok("/c/$id" => {Accept => 'application/json'})->status_is(200)
+    ->tx->res->json->{how_to};
+
+  like $how, qr{/events},        'the sequence is named';
+  like $how, qr/wait=900/,       'and how long you may park on it';
+  like $how, qr/timed_out/,      'and how to tell a quiet room from a busy one';
+  like $how, qr/since=unread/,   'and that the server keeps your place';
+  like $how, qr/format=headers/, 'and that a cheap read exists';
+  like $how, qr/\@agents/,       'and how to reach the whole fleet';
+  like $how, qr/mentions_me/,    'and how to be woken only when wanted';
+  like $how, qr/markdown/i,      'and what the person on the other end sees';
+  like $how, qr/mermaid/i,       'and what they do not';
+  like $how, qr/member_token/,   'and the credential it just handed out';
+  # BOB-3's closing note: the room carried key fingerprints and host names, and
+  # the URL that opens it is a bearer token being pasted between sessions.
+  like $how, qr/bearer|anyone who holds/i, 'and that the URL is the secret';
+
+  # An agent that arrived through a tool reads the same text as one that curled
+  # the URL -- that is the whole reason there is one briefing and not three.
+  my $viatool = _call(create_chatroom => {topic => 'same words'})->{structuredContent};
+  is $viatool->{how_to}, $t->get_ok('/c/' . $viatool->{room}{id} => {Accept => 'application/json'})
+    ->tx->res->json->{how_to}, 'and both doors hand over the same words';
+};
+
+subtest 'the MCP instructions answer what nobody could find out by trying' => sub {
+  my $text = _mcp('server/discover')->{result}{instructions} // '';
+
+  like $text, qr/markdown/i, 'markdown is rendered, which no description said';
+  like $text, qr/mermaid/i,  'and mermaid is not, which none of them said either';
+  like $text, qr/16 ?KB|16384|16 kilobytes/i, 'and how long a message may be';
+  like $text, qr/\@agents/,  'and how one message reaches the fleet';
+};
+
+# ------------------------------------------------- upgrading a live room -----
+
+# Everything above runs migration 1 and migration 2 together, against a database
+# that never held a v1 row. That proves the schema is reachable; it does NOT
+# prove that a room which has been running for a fortnight survives the upgrade,
+# which is the case that actually matters -- there are rooms out there with
+# history in them, and the whole point of migrating rather than starting over is
+# that the history is the valuable part.
+#
+# So: build a real v1 database, with v1 rows in it, and open it with today's
+# code. A plain Share::Chat over its own SQLite file, which is not the app
+# singleton and so needs no second Test::Mojo.
+subtest 'a room that has been running for a fortnight survives the upgrade' => sub {
+  my $file = "$tmp/legacy.db";
+  my $sql  = Mojo::SQLite->new("sqlite:$file");
+  my $db   = $sql->db;
+
+  $db->query($_) for split /;\s*\n/, <<'V1';
+CREATE TABLE chat_rooms (
+  id INTEGER PRIMARY KEY, secret TEXT NOT NULL UNIQUE, topic TEXT NOT NULL,
+  purpose TEXT, created_by TEXT, created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL, pruned_to INTEGER NOT NULL DEFAULT 0,
+  delete_salt TEXT, delete_hash TEXT
+);
+CREATE TABLE chat_members (
+  id INTEGER PRIMARY KEY, room_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+  name TEXT NOT NULL, name_key TEXT NOT NULL, about TEXT, kind TEXT NOT NULL,
+  joined_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL
+);
+CREATE TABLE chat_messages (
+  id INTEGER PRIMARY KEY, room_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+  name TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
+CREATE TABLE mojo_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL)
+V1
+
+  # Where migration 1 left off, so init() runs migration 2 and only that.
+  $db->query(q{INSERT INTO mojo_migrations VALUES ('share_chat', 1)});
+
+  my $now = time;
+  $db->query('INSERT INTO chat_rooms (id, secret, topic, created_at, expires_at) '
+      . 'VALUES (1, ?, ?, ?, ?)', 'a' x 32, 'the Drac coordination run', $now - 86400,
+    $now + 86400);
+  $db->query('INSERT INTO chat_members (id, room_id, session_id, name, name_key, about, '
+      . 'kind, joined_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?,?)', @$_)
+    for ([1, 1, 'sess-drac', 'claude-drac', 'claude-drac', 'the deploy system', 'agent',
+        $now - 86400, $now - 3600],
+      [2, 1, 'sess-e1', 'DRAC-E1', 'drac-e1', 'the monorepo', 'agent', $now - 86000, $now - 90],
+      [3, 1, 'sess-melo', 'melo', 'melo', undef, 'human', $now - 85000, $now - 60]);
+
+  # v1 vocabulary, including the empty-bodied join a human's arrival produces.
+  $db->query('INSERT INTO chat_messages (id, room_id, session_id, name, kind, body, '
+      . 'created_at) VALUES (?,?,?,?,?,?,?)', @$_)
+    for ([10, 1, 'sess-drac', 'claude-drac', 'join', 'the deploy system', $now - 86400],
+      [11, 1, 'sess-e1', 'DRAC-E1', 'join', 'the monorepo', $now - 86000],
+      [12, 1, 'sess-melo', 'melo', 'join', '', $now - 85000],
+      [13, 1, 'sess-drac', 'claude-drac', 'message',
+        'compose dir, compose file, service name? @DRAC-E1', $now - 84000],
+      [14, 1, 'sess-e1', 'DRAC-E1', 'system', 'DRAC-E1 is now **E1**', $now - 83000],
+      [15, 1, 'sess-melo', 'melo', 'message', 'is everyone still alive?', $now - 3600]);
+
+  my $chat = Share::Chat->new(sql => $sql, log => $t->app->log)->init;
+  my $room = $chat->find_room('a' x 32);
+  ok $room, 'the room is still there';
+  is $room->{topic}, 'the Drac coordination run', 'under the name it had';
+
+  my $events = $chat->messages($room);
+  is scalar @$events, 6, 'with every message it ever held';
+
+  # The ids are the cursors agents are carrying RIGHT NOW. Renumbering them would
+  # silently rewind or skip every watcher in every live room.
+  is_deeply [map { $_->{id} } @$events], [10, 11, 12, 13, 14, 15],
+    'and the same ids, because those are cursors somebody is holding';
+
+  is_deeply [map { $_->{type} } @$events],
+    [qw(member.joined member.joined member.joined message member.renamed message)],
+    'in the new vocabulary';
+  is $events->[3]{body}, 'compose dir, compose file, service name? @DRAC-E1',
+    'and the words are untouched';
+
+  # Backfilled, so history answers the new questions too. An agent upgrading into
+  # a running room can ask "what was ever addressed to me?" and get the truth
+  # rather than an empty list that looks like the same thing.
+  my $mentions = $chat->mentions_for($room, [map { $_->{id} } @$events]);
+  is_deeply $mentions->{13}, ['DRAC-E1'], 'mentions in old messages are found';
+
+  my $me = $chat->member($room, 'sess-e1');
+  is_deeply $chat->messages($room, mentions_me => $me->{id}), [$events->[3]],
+    'and are filterable, the same as a new one';
+
+  # Seeded from what each member last said, which is the one thing the old schema
+  # recorded about where they had got to. Starting everyone at zero would hand
+  # every upgraded session the whole room as "unread".
+  is $chat->read_cursor($room, 'sess-drac'), 13, 'a read cursor is seeded from your last post';
+  is $chat->read_cursor($room, 'sess-melo'), 15, 'for everyone who ever said anything';
+  is $chat->unread_count($room, 'sess-drac'), 2, 'so only what came after is unread';
+
+  # Presence works off columns that did not exist an hour ago.
+  is $chat->presence($chat->member($room, 'sess-melo')), 'idle', 'somebody seen a minute ago';
+  is $chat->presence($chat->member($room, 'sess-drac')), 'away', 'and somebody seen an hour ago';
+
+  # Nobody has a write credential yet, and rejoining is what issues one -- which
+  # is what every agent does when it reconnects.
+  ok !$chat->token_ok($room, 'sess-e1', 'anything'), 'no token survives the upgrade';
+  my (undef, undef, $token) = $chat->join_room($room,
+    session_id => 'sess-e1', name => 'E1', about => 'the monorepo', kind => 'agent');
+  ok length($token // ''), 'and rejoining issues one to a member who has none';
+  ok $chat->token_ok($room, 'sess-e1', $token), 'which then works';
+
+  # Idempotent: init runs on every startup and must not backfill twice.
+  Share::Chat->new(sql => $sql, log => $t->app->log)->init;
+  is_deeply $chat->mentions_for($room, [13])->{13}, ['E1'],
+    'a second startup does not double the backfill';
 };
 
 done_testing;

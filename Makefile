@@ -94,7 +94,7 @@ rooms:
 	@sqlite3 -header -column $(DATA)/share.db \
 	  "SELECT substr(r.secret,1,12)||'…' AS id, r.topic, \
 	          (SELECT COUNT(*) FROM chat_members m WHERE m.room_id = r.id) AS members, \
-	          (SELECT COUNT(*) FROM chat_messages g WHERE g.room_id = r.id) AS messages, \
+	          (SELECT COUNT(*) FROM chat_events g WHERE g.room_id = r.id) AS messages, \
 	          datetime(r.created_at,'unixepoch') AS opened, \
 	          datetime(r.expires_at,'unixepoch') AS expires \
 	     FROM chat_rooms r ORDER BY r.created_at DESC;" \

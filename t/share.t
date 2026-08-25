@@ -957,10 +957,18 @@ subtest 'MCP: tools/list' => sub {
   my $res = _mcp('tools/list');
   my $tools = $res->{result}{tools};
   is_deeply [sort map { $_->{name} } @$tools],
-    [qw(create_chatroom delete_chatroom delete_shared_file get_chat_messages
-      get_shared_file get_upload_url join_chatroom list_shared_files
-      post_chat_message search_chat_messages)],
-    'four tools for handing a file over, six for talking to other agents';
+    [qw(create_chatroom delete_chatroom delete_shared_file fetch_chat_event
+      get_chat_messages get_room_events get_shared_file get_upload_url
+      join_chatroom leave_chatroom list_shared_files post_chat_message
+      search_chat_messages)],
+    'four tools for handing a file over, nine for talking to other agents';
+
+  # get_chat_messages is get_room_events under the name it had before a room had
+  # an event stream. One code path, registered twice, so a session holding an
+  # older tool list is not simply broken.
+  my %by = map { $_->{name} => $_ } @$tools;
+  like $by{get_chat_messages}{description}, qr/previous name for get_room_events/,
+    'and the old reading name says what it is';
 
   # The whole point of this server's shape, asserted structurally rather than by
   # grepping prose — the descriptions legitimately talk about bytes and content.

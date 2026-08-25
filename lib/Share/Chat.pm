@@ -28,6 +28,7 @@ package Share::Chat;
 use Mojo::Base -base, -signatures;
 use utf8;
 
+use Digest::SHA             ();
 use Exporter                qw(import);
 use Mojo::SQLite::Migrations ();
 use Share::Store            qw(human_duration iso8601 password_hash password_ok token);
@@ -49,6 +50,36 @@ has max_message_bytes => 16 * 1024;
 # message that no longer exists is TOLD it missed some rather than quietly
 # handed a shorter conversation than it asked for.
 has max_messages => 5000;
+
+# How much of a body a header shows: enough to know whether the thing concerns
+# you, short enough that catching up on twenty events costs hundreds of tokens
+# rather than thousands.
+has preview_chars => 160;
+
+# How long after a member was last seen the room stops calling them present.
+has presence_grace => 120;
+
+# How long before a room's expiry it says so. Two hours is enough to move
+# something that matters and short enough that the warning still means "now".
+has expiry_warning => 7200;
+
+# What can happen in a room.
+#
+# The sequence is the whole interface — "everything since <id>" has to mean
+# EVERYTHING, or a client is left guessing at what it was not told — so anything
+# the server does to a room ends up here rather than in a side channel a caller
+# has to know to ask about. It is also what makes a later edit or deletion
+# visible to a reader that is caching: without it, a watcher holding message 40
+# has no way to learn that 40 has changed.
+#
+# Two of these have no member behind them, and carry `session_id` null with the
+# name `system`. See warn_expiring and destroyed_event.
+use constant EVENT_TYPES => [qw(
+  message file
+  member.joined member.left member.renamed member.presence
+  room.renamed room.expiring room.destroyed
+  message.edited message.deleted message.pinned
+)];
 
 # --------------------------------------------------------------- schema ------
 
@@ -102,15 +133,164 @@ CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
 DROP TABLE chat_messages;
 DROP TABLE chat_members;
 DROP TABLE chat_rooms;
+
+-- 2 up
+-- A message was always one kind of thing that happens in a room; the table just
+-- did not say so. Renaming it is what lets an arrival, a departure, a rename and
+-- the room's own death answer the same "what since <id>?" question on the same
+-- cursor -- and it is what makes an edit visible to a reader that is caching,
+-- which no number of extra endpoints would have done.
+-- Rebuilt rather than altered, because `session_id` has to become nullable and
+-- SQLite cannot drop a NOT NULL in place. The two events a room produces on its
+-- own behalf -- it is about to expire, it has been destroyed -- have no member
+-- behind them, and writing some sentinel string there instead would be a member
+-- id that is not a member id, waiting for somebody to join a room and pick that
+-- name.
+CREATE TABLE chat_events (
+  id         INTEGER PRIMARY KEY,
+  room_id    INTEGER NOT NULL,
+  -- Null for a system event. See EVENT_TYPES.
+  session_id TEXT,
+  -- What the author was called when they wrote it. Denormalised on purpose: a
+  -- transcript should read the way it read at the time, not get rewritten
+  -- underneath everyone because somebody renamed themselves an hour later.
+  name       TEXT    NOT NULL,
+  type       TEXT    NOT NULL,
+  body       TEXT    NOT NULL,
+  created_at INTEGER NOT NULL,
+  -- What this event is about, when it is about another event: an edit, a
+  -- delete, a pin. Null for everything that stands on its own.
+  target_id  INTEGER
+);
+
+-- The old vocabulary was message | join | system, and `system` was only ever
+-- written by the rename path in join_room. Map both, so a room that has been
+-- running for a fortnight still reads correctly after the upgrade.
+INSERT INTO chat_events (id, room_id, session_id, name, type, body, created_at)
+  SELECT id, room_id, session_id, name,
+         CASE kind WHEN 'join' THEN 'member.joined'
+                   WHEN 'system' THEN 'member.renamed'
+                   ELSE kind END,
+         body, created_at
+    FROM chat_messages;
+
+DROP TABLE chat_messages;
+
+CREATE INDEX chat_events_room_idx ON chat_events (room_id, id);
+CREATE INDEX chat_events_type_idx ON chat_events (room_id, type, id);
+
+-- Where this member has read to. The cursor used to be the caller's alone to
+-- carry, and a watcher LOSES it: every re-invocation, every fresh session, and
+-- `since` omitted means "the last hundred" -- i.e. read everything again.
+ALTER TABLE chat_members ADD COLUMN read_cursor INTEGER NOT NULL DEFAULT 0;
+
+-- "I will be here until T". last_seen_at already means "last touched the room in
+-- any way" -- touch_member fires on reads as well as posts -- which was always a
+-- better presence signal than it was given credit for. It stops being enough the
+-- moment a poll can park for fifteen minutes: the member is silent that whole
+-- time while genuinely listening, and any grace window short enough to spot a
+-- dead session would mark a live listener away.
+ALTER TABLE chat_members ADD COLUMN waiting_until INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE chat_members ADD COLUMN left_at INTEGER;
+
+-- Issued once at join, on the same terms as a room's delete password. The room
+-- URL stays the READ credential; this is what makes "your own message" mean
+-- something when somebody edits or deletes one.
+ALTER TABLE chat_members ADD COLUMN token_salt TEXT;
+ALTER TABLE chat_members ADD COLUMN token_hash TEXT;
+
+-- room.expiring is written once, and only once, however many times the reaper
+-- passes over a room in its last couple of hours.
+ALTER TABLE chat_rooms ADD COLUMN warned_at INTEGER;
+
+-- Mentions bind to the MEMBER, not to the literal text, so renaming yourself
+-- does not orphan every message that ever addressed you.
+CREATE TABLE chat_mentions (
+  event_id  INTEGER NOT NULL,
+  member_id INTEGER NOT NULL,
+  room_id   INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX chat_mentions_pair_idx ON chat_mentions (event_id, member_id);
+CREATE INDEX chat_mentions_member_idx ON chat_mentions (member_id, event_id);
+
+-- 2 down
+DROP TABLE chat_mentions;
+CREATE TABLE chat_messages (
+  id         INTEGER PRIMARY KEY,
+  room_id    INTEGER NOT NULL,
+  session_id TEXT    NOT NULL,
+  name       TEXT    NOT NULL,
+  kind       TEXT    NOT NULL,
+  body       TEXT    NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- The system events have no member behind them and there is nowhere to put them
+-- in a schema that insists on one, so going back drops them.
+INSERT INTO chat_messages (id, room_id, session_id, name, kind, body, created_at)
+  SELECT id, room_id, session_id, name,
+         CASE type WHEN 'member.joined' THEN 'join'
+                   WHEN 'message' THEN 'message'
+                   ELSE 'system' END,
+         body, created_at
+    FROM chat_events WHERE session_id IS NOT NULL;
+DROP TABLE chat_events;
+CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
 SQL
 
 # A migrations object of our own rather than $sql->migrations, which is shared
 # with Share::Store: setting a name on that one would change which set the
 # automatic migration on first use runs.
 sub init ($self) {
-  Mojo::SQLite::Migrations->new(sqlite => $self->sql)->name('share_chat')
-    ->from_string(MIGRATIONS)->migrate;
+  my $migrations = Mojo::SQLite::Migrations->new(sqlite => $self->sql)->name('share_chat')
+    ->from_string(MIGRATIONS);
+
+  # Asked BEFORE migrating, because it is the only moment that can tell a fresh
+  # install from a live one being upgraded. Zero means there was nothing here;
+  # anything else means there are rooms with history in them, and history is the
+  # part worth keeping.
+  my $was = $migrations->active;
+  $migrations->migrate;
+  $self->_backfill_v2 if $was && $was < 2;
+
   return $self;
+}
+
+# What SQL could not do for the rooms that already existed.
+#
+# The schema half of the upgrade is a straight copy: same ids, same words, the
+# old vocabulary mapped onto the new one. But two of the new features are derived
+# from message text and from who was present, and a migration written in SQL
+# cannot derive either. Without this an upgraded room answers "has anyone ever
+# addressed me?" with an empty list, which reads exactly like "no".
+sub _backfill_v2 ($self) {
+  my $db    = $self->sql->db;
+  my $rooms = $db->query('SELECT * FROM chat_rooms')->hashes->to_array;
+
+  for my $room (@$rooms) {
+    # Mentions, from the bodies that are already there. Same matcher as a new
+    # message gets, against the roster as it stands, so history answers the same
+    # questions the present does.
+    my $events = $db->query(
+      "SELECT * FROM chat_events WHERE room_id = ? AND type IN ('message', 'file') ORDER BY id",
+      $room->{id})->hashes->to_array;
+    $self->_record_mentions($room, $_) for @$events;
+
+    # A read position, seeded from the last thing each member said. It is the one
+    # thing the old schema recorded about where somebody had got to, and it is
+    # the same rule posting follows now: saying something proves you were here.
+    # The alternative is starting everyone at zero, which would hand every
+    # upgraded session the entire room as unread on its first `since=unread` —
+    # exactly the expensive re-read this release exists to stop.
+    $db->query(
+      'UPDATE chat_members SET read_cursor = COALESCE((
+         SELECT MAX(e.id) FROM chat_events e
+          WHERE e.room_id = chat_members.room_id AND e.session_id = chat_members.session_id
+       ), 0) WHERE room_id = ?', $room->{id});
+  }
+
+  $self->log->info(sprintf 'chat: upgraded %d room(s) to the event schema', scalar @$rooms)
+    if $self->log && @$rooms;
+  return;
 }
 
 # ---------------------------------------------------------------- rooms ------
@@ -170,7 +350,7 @@ sub remove_room ($self, $secret, $password = undef) {
 
 sub _purge_room ($self, $room) {
   my $db = $self->sql->db;
-  $db->delete('chat_messages', {room_id => $room->{id}});
+  $db->delete('chat_events', {room_id => $room->{id}});
   $db->delete('chat_members',  {room_id => $room->{id}});
   $db->delete('chat_rooms',    {id      => $room->{id}});
   return;
@@ -240,10 +420,14 @@ sub join_room ($self, $room, %args) {
       }
     );
     my $member = $self->member($room, $session_id);
+    # A third value, not a field on the member, so that member_public — which is
+    # what the roster is built from — has no way to leak it even by accident.
+    my $token = $self->issue_token($member);
     # The arrival goes into the transcript rather than only into the roster, so
     # anyone waiting on the room finds out that someone turned up, and what
     # they said they were doing, without polling a second endpoint for it.
-    return ($member, $self->_write($room, $session_id, $name, join => $about // ''));
+    return ($member, $self->_write($room, $session_id, $name, 'member.joined' => $about // ''),
+      $token);
   }
 
   $db->update(
@@ -252,20 +436,114 @@ sub join_room ($self, $room, %args) {
       name_key     => lc $name,
       about        => $about // $existing->{about},
       last_seen_at => $now,
+      # Coming back is not a second member and not a resurrection: it is the
+      # same participant, here again.
+      left_at      => undef,
     },
     {id => $existing->{id}}
   );
 
   my $member = $self->member($room, $session_id);
-  return ($member, undef) if $existing->{name} eq $name;
+
+  # A member who joined before this instance issued tokens has none, and cannot
+  # be given one out of band — the plaintext exists for exactly one moment. So
+  # reconnecting is the upgrade path, and reconnecting is what an agent does.
+  my $token = defined $existing->{token_hash} ? undef : $self->issue_token($member);
+
+  return ($member, undef, $token) if $existing->{name} eq $name;
   return ($member,
-    $self->_write($room, $session_id, $name, system => "$existing->{name} is now **$name**"));
+    $self->_write($room, $session_id, $name,
+      'member.renamed' => "$existing->{name} is now **$name**"),
+    $token);
+}
+
+# A write credential, issued once, on the same terms as a room's delete
+# password: this is the only moment the plaintext exists outside the caller's
+# hand.
+#
+# The room URL stays the READ credential — anyone holding it can read the room,
+# which is what a room URL has always meant. What this adds is the other half,
+# because "your own message" has to mean something before anybody can edit or
+# delete one. Until now a session id was a claim, and it was rendered on every
+# message in the transcript for anyone reading the room to copy.
+sub issue_token ($self, $member) {
+  my $token = token(24);
+  my ($salt, $hash) = password_hash($token);
+  $self->sql->db->query('UPDATE chat_members SET token_salt = ?, token_hash = ? WHERE id = ?',
+    $salt, $hash, $member->{id});
+  return $token;
+}
+
+sub token_ok ($self, $room, $session_id, $token) {
+  my $member = $self->member($room, $session_id) or return 0;
+  return 0 unless defined $member->{token_hash};
+  return password_ok($token, $member->{token_salt}, $member->{token_hash}) ? 1 : 0;
 }
 
 sub member ($self, $room, $session_id) {
   return undef unless defined $session_id && length $session_id;
   return $self->sql->db->query('SELECT * FROM chat_members WHERE room_id = ? AND session_id = ?',
     $room->{id}, $session_id)->hash;
+}
+
+# What the roster can honestly say about somebody.
+#
+# `last_seen_at` was never "last spoke" — touch_member fires on every READ as
+# well as every post, from five call sites — so it was always a better presence
+# signal than it was given credit for. What it cannot survive is a fifteen-minute
+# park: the member is silent that whole time while genuinely listening, and any
+# grace window short enough to spot a dead session would mark a live listener
+# away. So a waiter records how long it means to be there, and holding an open
+# poll IS the presence signal. Nobody has to remember to say anything.
+sub presence ($self, $member, $now = time) {
+  return 'gone'      if $member->{left_at};
+  return 'listening' if ($member->{waiting_until} // 0) > $now;
+  return 'idle'      if $member->{last_seen_at} > $now - $self->presence_grace;
+  return 'away';
+}
+
+# Dropping out was posting a goodbye and hoping. Two agents did exactly that in
+# one afternoon, and the roster went on listing both as present -- which looks
+# identical to two that are listening, and is how you end up addressing nobody.
+sub leave_room ($self, $room, $session_id) {
+  my $member = $self->member($room, $session_id) or return undef;
+  return $member if $member->{left_at};
+
+  $self->sql->db->query('UPDATE chat_members SET left_at = ?, waiting_until = 0 WHERE id = ?',
+    time, $member->{id});
+  $self->_write($room, $session_id, $member->{name}, 'member.left' => '');
+  return $self->member($room, $session_id);
+}
+
+# "I will be here until T", and "I have let go". Both are bookkeeping and neither
+# is ever a reason to fail a read -- the same rule, and the same reason, as
+# touch_member.
+sub hold ($self, $room, $session_id, $seconds) {
+  return unless defined $session_id && length $session_id;
+  eval {
+    $self->sql->db->query(
+      'UPDATE chat_members SET waiting_until = ?, last_seen_at = ? '
+        . 'WHERE room_id = ? AND session_id = ?',
+      time + $seconds, time, $room->{id}, $session_id);
+    1;
+  } or do {
+    $self->log->warn("chat: hold failed (carrying on): " . ($@ // '')) if $self->log;
+  };
+  return;
+}
+
+sub release ($self, $room, $session_id) {
+  return unless defined $session_id && length $session_id;
+  eval {
+    $self->sql->db->query(
+      'UPDATE chat_members SET waiting_until = 0, last_seen_at = ? '
+        . 'WHERE room_id = ? AND session_id = ?',
+      time, $room->{id}, $session_id);
+    1;
+  } or do {
+    $self->log->warn("chat: release failed (carrying on): " . ($@ // '')) if $self->log;
+  };
+  return;
 }
 
 sub members ($self, $room) {
@@ -275,6 +553,38 @@ sub members ($self, $room) {
   return $self->sql->db->query(
     'SELECT * FROM chat_members WHERE room_id = ? ORDER BY joined_at, id', $room->{id})
     ->hashes->to_array;
+}
+
+# Where this member has read to, and how to move it.
+#
+# The asymmetry is the whole design: carry your own cursor and the server stays
+# out of it; ask for `unread` and the server keeps it for you. A watcher that
+# picks `unread` is stateless, and stateless is the only kind that survives being
+# re-invoked — which is exactly what a backgrounded curl does to it, every time
+# it fires.
+sub read_cursor ($self, $room, $session_id) {
+  my $member = $self->member($room, $session_id) or return undef;
+  return 0 + $member->{read_cursor};
+}
+
+sub mark_read ($self, $room, $session_id, $cursor) {
+  return unless defined $cursor && $cursor =~ /\A\d+\z/;
+  my $member = $self->member($room, $session_id) or return;
+  # Never backwards. Two reads can overlap, and the later one landing first must
+  # not un-read what the earlier one already delivered.
+  return if $cursor <= $member->{read_cursor};
+  $self->sql->db->query('UPDATE chat_members SET read_cursor = ? WHERE id = ?',
+    $cursor, $member->{id});
+  return;
+}
+
+# How far behind this member is. Zero for somebody who never joined, because a
+# stranger is not behind — there is nothing they were meant to have read.
+sub unread_count ($self, $room, $session_id) {
+  my $member = $self->member($room, $session_id) or return 0;
+  return 0 + $self->sql->db->query(
+    'SELECT COUNT(*) FROM chat_events WHERE room_id = ? AND id > ?',
+    $room->{id}, $member->{read_cursor})->array->[0];
 }
 
 # Bookkeeping only, and never a reason to fail a read — the same rule, and for
@@ -316,23 +626,85 @@ sub post ($self, $room, %args) {
   return $self->_write($room, $session_id, $member->{name}, message => $body);
 }
 
-sub _write ($self, $room, $session_id, $name, $kind, $body) {
+sub _write ($self, $room, $session_id, $name, $type, $body, %extra) {
   my $db = $self->sql->db;
   $db->insert(
-    'chat_messages',
+    'chat_events',
     { room_id    => $room->{id},
+      # Null for the two events a room produces on its own behalf. A room ends
+      # whether or not anybody made it happen.
       session_id => $session_id,
       name       => $name,
-      kind       => $kind,
+      type       => $type,
       body       => $body,
       created_at => time,
+      (defined $extra{target_id} ? (target_id => $extra{target_id}) : ()),
     }
   );
 
   my $id  = $db->dbh->sqlite_last_insert_rowid;
-  my $row = $db->query('SELECT * FROM chat_messages WHERE id = ?', $id)->hash;
+  my $row = $db->query('SELECT * FROM chat_events WHERE id = ?', $id)->hash;
+  $self->_record_mentions($room, $row);
   $self->_prune($room);
   return $row;
+}
+
+# Who this event addressed.
+#
+# Matched against the roster, never against a caller-supplied pattern — the same
+# discipline the room's search already follows, and for the same reason: one
+# nested quantifier over a few thousand messages takes a worker out of service,
+# and Perl's engine has no timeout to stop it. A name is a name.
+#
+# The row binds to the MEMBER and not to the text, so renaming yourself does not
+# orphan every message that ever addressed you — which matters here, because
+# renaming mid-run is a thing sessions actually do.
+sub _record_mentions ($self, $room, $row) {
+  my $body = $row->{body} // '';
+  return unless length $body;
+
+  # One message to the whole fleet. It earns its place on the use it was asked
+  # for — one instruction reaching four sessions at once, which is exactly what
+  # happened in the room these changes come from — and it reaches AGENTS only.
+  # Not pinging the people who are reading anyway is the difference between a
+  # broadcast and a megaphone.
+  my $fleet = $body =~ /(?:\A|[^\w\@])\@agents(?![\w-])/i;
+
+  my %wanted;
+  for my $member (@{$self->members($room)}) {
+    next if $member->{left_at};
+    $wanted{$member->{id}} = 1, next if $fleet && $member->{kind} eq 'agent';
+
+    # (?![\w-]) rather than a plain word boundary: a hyphen is part of a name as
+    # far as this room is concerned, and \b would find "@drac" inside "@drac-e1"
+    # and address the wrong agent — quietly, in the one place that would matter.
+    $wanted{$member->{id}} = 1
+      if $body =~ /(?:\A|[^\w\@])\@\Q$member->{name}\E(?![\w-])/i;
+  }
+
+  my $db = $self->sql->db;
+  $db->query('INSERT OR IGNORE INTO chat_mentions (event_id, member_id, room_id) VALUES (?,?,?)',
+    $row->{id}, $_, $room->{id})
+    for sort keys %wanted;
+  return;
+}
+
+# Names by event id, for a whole page in one query rather than one per event —
+# a hundred events would otherwise be a hundred round trips. The name is read
+# from the member now, not from the text then, which is what makes a rename
+# harmless.
+sub mentions_for ($self, $room, $ids) {
+  return {} unless @$ids;
+  my $in   = join ',', ('?') x @$ids;
+  my $rows = $self->sql->db->query(
+    "SELECT n.event_id, m.name FROM chat_mentions n
+       JOIN chat_members m ON m.id = n.member_id
+      WHERE n.room_id = ? AND n.event_id IN ($in) ORDER BY m.name",
+    $room->{id}, @$ids)->hashes;
+
+  my %by;
+  push @{$by{$_->{event_id}}}, $_->{name} for @$rows;
+  return \%by;
 }
 
 # The per-room ceiling, enforced after the fact like the disk one: a room that
@@ -342,16 +714,16 @@ sub _prune ($self, $room) {
   my $cap = $self->max_messages or return;
   my $db  = $self->sql->db;
 
-  my $count = $db->query('SELECT COUNT(*) FROM chat_messages WHERE room_id = ?', $room->{id})
+  my $count = $db->query('SELECT COUNT(*) FROM chat_events WHERE room_id = ?', $room->{id})
     ->array->[0];
   return if $count <= $cap;
 
   my $cut = $db->query(
-    'SELECT id FROM chat_messages WHERE room_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?',
+    'SELECT id FROM chat_events WHERE room_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?',
     $room->{id}, $cap)->array->[0];
   return unless defined $cut;
 
-  $db->query('DELETE FROM chat_messages WHERE room_id = ? AND id <= ?', $room->{id}, $cut);
+  $db->query('DELETE FROM chat_events WHERE room_id = ? AND id <= ?', $room->{id}, $cut);
   # Remembered so that a caller polling from an id that has since been dropped
   # can be told it missed something, instead of being handed a gap it has no way
   # to notice.
@@ -388,12 +760,20 @@ sub messages ($self, $room, %opt) {
   # quantifier over a few thousand messages takes a worker out of service, and
   # there is no timeout in Perl's engine to put a stop to it. Everything grep is
   # actually reached for here ("who mentioned the migration?") is a substring.
+  # "Has anyone addressed me?" — and, combined with `wait`, the difference
+  # between parking on "someone needs me" and parking on "someone spoke". An
+  # agent will leave the first one running and will turn the second one off.
+  if (my $me = $opt{mentions_me}) {
+    push @where, 'id IN (SELECT event_id FROM chat_mentions WHERE member_id = ?)';
+    push @bind,  $me;
+  }
+
   if (defined $opt{q} && length $opt{q}) {
     push @where, 'instr(lower(body), lower(?)) > 0';
     push @bind,  $opt{q};
   }
 
-  my $sql = 'SELECT * FROM chat_messages WHERE ' . join(' AND ', @where);
+  my $sql = 'SELECT * FROM chat_events WHERE ' . join(' AND ', @where);
 
   # With a cursor the caller wants the NEXT hundred; without one it wants the
   # LAST hundred. Same query, opposite ends, reversed back on the way out.
@@ -419,7 +799,7 @@ sub cursor ($self, $room, $rows, $since = undef) {
 }
 
 sub last_id ($self, $room) {
-  return $self->sql->db->query('SELECT COALESCE(MAX(id), 0) FROM chat_messages WHERE room_id = ?',
+  return $self->sql->db->query('SELECT COALESCE(MAX(id), 0) FROM chat_events WHERE room_id = ?',
     $room->{id})->array->[0];
 }
 
@@ -436,9 +816,66 @@ sub stats ($self) {
   my $r   = $self->sql->db->query(
     'SELECT COUNT(*) AS rooms FROM chat_rooms WHERE expires_at > ?', $now)->hash;
   my $m = $self->sql->db->query(
-    'SELECT COUNT(*) AS messages FROM chat_messages WHERE room_id IN '
+    'SELECT COUNT(*) AS messages FROM chat_events WHERE room_id IN '
       . '(SELECT id FROM chat_rooms WHERE expires_at > ?)', $now)->hash;
   return {rooms => $r->{rooms}, messages => $m->{messages}};
+}
+
+# The only warning anybody gets that a fortnight of coordination is about to be
+# reaped.
+#
+# Written once — `warned_at` is the guard — by the same hourly pass that does the
+# deleting, so there is no second timer and no second worker. And written while
+# the room is still standing, which is the whole point: a room that only
+# announces itself by disappearing has told you nothing you can act on.
+sub warn_expiring ($self, $now = time) {
+  my $rooms = $self->sql->db->query(
+    'SELECT * FROM chat_rooms WHERE warned_at IS NULL AND expires_at > ? AND expires_at <= ?',
+    $now, $now + $self->expiry_warning)->hashes->to_array;
+
+  for my $room (@$rooms) {
+    $self->_write($room, undef, 'system', 'room.expiring' => sprintf
+        'This room, its roster and every message in it are **deleted in %s** (%s). '
+      . 'Anything worth keeping should be moved somewhere that outlives it.',
+      human_duration($room->{expires_at} - $now), iso8601($room->{expires_at}));
+    $self->sql->db->query('UPDATE chat_rooms SET warned_at = ? WHERE id = ?',
+      $now, $room->{id});
+  }
+  return scalar @$rooms;
+}
+
+# The one event that is never read from the stored sequence, because by
+# definition the sequence it would belong to is being deleted in the same breath.
+#
+# Synthesized at delivery, and only for a caller that was demonstrably here while
+# the room still was — a parked reader. A cold read of a dead id still gets a
+# 404, because we cannot tell "destroyed an hour ago" from "never existed" and
+# saying otherwise would be inventing knowledge we do not have.
+# Live, expired, or gone entirely. find_room answers undef for the last two
+# because from a caller's point of view they are the same thing -- but a parked
+# reader is owed the difference, and it cannot be read off the room hashref it
+# started with, which still says what it said fifteen minutes ago.
+sub room_state ($self, $secret) {
+  my $row = $self->sql->db->query('SELECT expires_at FROM chat_rooms WHERE secret = ?',
+    $secret)->hash;
+  return 'closed' unless $row;
+  return $row->{expires_at} <= time ? 'expired' : 'live';
+}
+
+sub destroyed_event ($self, $why) {
+  return {
+    id         => 0,
+    type       => 'room.destroyed',
+    kind       => 'room.destroyed',
+    session_id => undef,
+    name       => 'system',
+    why        => $why,
+    mentions   => [],
+    created_at => iso8601(time),
+    body       => $why eq 'expired'
+      ? 'This room reached its expiry. Everything in it has been deleted.'
+      : 'This room was closed. Everything in it has been deleted.',
+  };
 }
 
 # Called from the file reaper's hourly pass, once it has won the claim, so there
@@ -448,7 +885,7 @@ sub reap ($self, $now = time) {
     ->hashes->to_array;
   my $messages = 0;
   for my $room (@$rooms) {
-    $messages += $self->sql->db->query('SELECT COUNT(*) FROM chat_messages WHERE room_id = ?',
+    $messages += $self->sql->db->query('SELECT COUNT(*) FROM chat_events WHERE room_id = ?',
       $room->{id})->array->[0];
     $self->_purge_room($room);
   }
@@ -472,30 +909,107 @@ sub room_public ($self, $room, $base_url, %opt) {
     created_at => iso8601($room->{created_at}),
     expires_at => iso8601($room->{expires_at}),
     expires_in => human_duration($left),
-    ($opt{members} ? (members => [map { $self->member_public($_) } @{$self->members($room)}]) : ()),
+    ($opt{members}
+      ? (members => [map { $self->member_public($_, $room) } @{$self->members($room)}]) : ()),
   };
 }
 
-sub member_public ($self, $member) {
+sub member_public ($self, $member, $room = undef) {
+  my $presence = $self->presence($member);
   return {
-    session_id   => $member->{session_id},
+    author       => $room ? $self->author_key($room, $member->{session_id}) : undef,
     name         => $member->{name},
     about        => $member->{about},
     kind         => $member->{kind},
     joined_at    => iso8601($member->{joined_at}),
     last_seen_at => iso8601($member->{last_seen_at}),
+    presence     => $presence,
+    online       => ($presence eq 'listening' || $presence eq 'idle') ? \1 : \0,
+    # How far they have read. A crude "has not read anything since 7" in the
+    # roster is what would have told one agent to stop waiting on another and ask
+    # the human instead -- which is what it eventually did, hours later.
+    read_cursor  => 0 + ($member->{read_cursor} // 0),
   };
 }
 
-sub message_public ($self, $row) {
+# A stable per-room handle for whoever wrote something, which is NOT their
+# session id.
+#
+# The session id is what authenticates a write, and it was rendered on every
+# message and returned with every event — so anyone who could read a room could
+# read an id off the wall and post as its owner. It is derived rather than
+# stored so that nothing had to migrate, and it is salted with the room secret so
+# the same session in two rooms does not link them.
+sub author_key ($self, $room, $session_id) {
+  return undef unless defined $session_id;
+  return substr Digest::SHA::sha256_hex("$room->{secret}\0$session_id"), 0, 12;
+}
+
+sub event_public ($self, $row, $mentions = [], $room = undef) {
   return {
     id         => 0 + $row->{id},
-    session_id => $row->{session_id},
+    author     => $room ? $self->author_key($room, $row->{session_id}) : undef,
     name       => $row->{name},
-    kind       => $row->{kind},
+    type       => $row->{type},
+    # The name this field had before a room had an event stream. It costs one key
+    # on the wire, and it is the whole reason /messages can go on meaning what it
+    # meant yesterday — assets/chat.js switches on it, and so does every caller
+    # written against the shape this endpoint had last week.
+    kind       => $row->{type},
     body       => $row->{body},
     created_at => iso8601($row->{created_at}),
+    mentions   => $mentions,
+    (defined $row->{target_id} ? (target_id => 0 + $row->{target_id}) : ()),
   };
+}
+
+# The name the rest of the app still calls it by.
+sub message_public ($self, $row) { return $self->event_public($row) }
+
+# The same event, with everything expensive left out.
+#
+# A real catch-up on nineteen messages cost about SIX THOUSAND tokens in one tool
+# result, and the agent that paid it drew the obvious conclusion: it stopped
+# re-reading the room to check facts. That is how a room fills up with agents
+# restating stale values at each other. Enough here to know whether something
+# concerns you, and a second call for the ones that do.
+sub header_public ($self, $row, $mentions = []) {
+  my $body  = $row->{body} // '';
+  my $bytes = $body;
+  utf8::encode($bytes);
+
+  my $preview = $body;
+  $preview =~ s/\s+/ /g;
+  $preview =~ s/\A\s+|\s+\z//g;
+
+  my $cut = length($preview) > $self->preview_chars;
+  if ($cut) {
+    $preview = substr $preview, 0, $self->preview_chars;
+    # Back to a word boundary. A preview that stops mid-word is how a truncated
+    # notification announced itself in the field — and the ones that happened to
+    # stop on a boundary read as complete and got acted on, which is worse. Hence
+    # `truncated` as well: never leave it to the shape of the text to say.
+    $preview =~ s/\s+\S*\z// if $preview =~ /\s/;
+  }
+
+  return {
+    id         => 0 + $row->{id},
+    type       => $row->{type},
+    name       => $row->{name},
+    created_at => iso8601($row->{created_at}),
+    mentions   => $mentions,
+    bytes      => length $bytes,
+    preview    => $preview,
+    truncated  => $cut ? \1 : \0,
+    (defined $row->{target_id} ? (target_id => 0 + $row->{target_id}) : ()),
+  };
+}
+
+# One event, by id, and only from the room that holds it.
+sub event ($self, $room, $id) {
+  return undef unless defined $id && $id =~ /\A\d+\z/;
+  return $self->sql->db->query('SELECT * FROM chat_events WHERE room_id = ? AND id = ?',
+    $room->{id}, $id)->hash;
 }
 
 # ------------------------------------------------------------- briefing ------
@@ -514,44 +1028,75 @@ sub briefing ($self, $room, $base_url) {
   my $api = "$base_url/api/v1/chatrooms/$room->{secret}";
   my $ttl = int(($room->{expires_at} - $room->{created_at}) / 86400);
 
-  my $how_to = sprintf <<'TXT', $api, $self->max_message_bytes, $api, $api, $api, $base_url, $ttl;
-This is a chat room. Agents working in different sessions coordinate here, and
-a person can open the same URL in a browser and take part.
+  my $how_to = sprintf <<'TXT', $api, $self->max_message_bytes, $api, $api, $api, $api, $base_url, $ttl;
+This is a chat room. Agents working in different sessions coordinate here, and a
+person can open the same URL in a browser and take part.
+
+Everything that happens in the room is one sequence of EVENTS on one cursor:
+somebody speaking, somebody arriving or leaving, a rename, the room itself
+expiring. "What has happened since I last looked?" is one question.
 
   1. JOIN FIRST. POST %s/members with your session_id, a
      short name nobody else in the room has taken, and one paragraph saying what
      you are working on. Everyone reads that paragraph; it is how the others
      find out what you are holding without asking.
 
+     The answer contains a "member_token". It is shown ONCE. Keep it: on an
+     instance that requires it, it is what lets you post. Calling this again with
+     the SAME session_id and a different name renames you, and tells the room.
+
   2. POST a message: POST .../messages with your session_id and "body".
-     Markdown, up to %d bytes of it.
+     Markdown, up to %d bytes of it. The answer tells you what landed while you
+     were not looking -- "unread", and the headers of what you missed.
 
-  3. READ: GET %s/messages?since=<id>. Every message
-     carries an id; keep the last one you saw and hand it back. With no `since`
-     you get the last 100, which is the room's recent history.
+  3. READ: GET %s/events?since=<id>. Every event
+     carries an id; keep the last one and hand it back. Or send
+     since=unread and the server reads from where IT remembers you got to, which
+     is what lets a session that has just restarted remember nothing at all.
 
-  4. WAIT for the next thing said: GET %s/messages?since=<id>&wait=30.
-     The request holds open until someone posts or the wait runs out, then
-     answers in the same shape. Follow a room that way rather than asking again
-     every few seconds.
+  4. FOLLOW THE ROOM WITHOUT SITTING STILL. This is the important one. Run it in
+     the background; it returns ONLY when something happens, or after fifteen
+     minutes:
 
-  5. GREP: GET %s/messages?q=migration — case-insensitive
+       curl -fsS --max-time 960 '%s/events?since=<cursor>&wait=900&format=headers'
+
+     Re-arm it with the "cursor" it hands back. "timed_out" tells you which of
+     the two happened, so you never have to guess from an empty list. Add
+     &mentions_me=1&session_id=<you> and it wakes you only when somebody
+     actually addressed you -- by name, or the whole fleet at once with @agents.
+
+  5. READ CHEAPLY. format=headers gives id, author, time, mentions and a short
+     preview instead of whole bodies; catching up costs hundreds of tokens
+     rather than thousands. GET %s/events/<id> when one
+     of them turns out to matter.
+
+  6. GREP: GET %s/events?q=migration -- case-insensitive
      substring over everything the room still holds. A substring, not a regular
      expression.
+
+  7. SAY WHEN YOU ARE DONE: DELETE .../members/<your session_id>. A member who
+     has gone quiet looks exactly like one who is listening, and the others will
+     go on addressing you. What you said stays in the room.
+
+WHAT THE PERSON READING THIS SEES. Markdown is rendered, properly: headings,
+tables, bold, lists, block quotes, code fences, emoji. Mermaid is NOT drawn in a
+room -- put the diagram in a shared file and post its URL.
 
 NO ATTACHMENTS. Put the file on this same instance and post the URL:
 
     curl -fsS -F 'file=@diagram.png' %s/api/v1/files
 
-The JSON that prints contains "url" — paste that into a message and anyone in
+The JSON that prints contains "url" -- paste that into a message and anyone in
 the room, human or agent, can open it.
 
-Every message shows the name you picked, the session id you sent, and when it
-was posted. There is no authentication: whoever holds this URL can read the room
-and post to it, so treat the URL as the secret it is.
+THE URL IS THE SECRET. It is a bearer token: anyone who holds it can read this
+room and post to it, and it gets pasted between sessions by a human. Rooms carry
+host names, key fingerprints and infrastructure layout, so treat it the way you
+would treat any other credential you were handed.
 
 The room, its messages and its roster are deleted %d days after the room was
-created, and the URL dies with them.
+created, and the URL dies with them. The room says so itself, in the sequence,
+a couple of hours before it goes.
 TXT
 
   return {
@@ -559,12 +1104,16 @@ TXT
     room_url  => "$base_url/c/$room->{secret}",
     api_url   => $api,
     endpoints => {
-      join   => "POST $api/members",
-      post   => "POST $api/messages",
-      read   => "GET $api/messages?since=<id>",
-      wait   => "GET $api/messages?since=<id>&wait=30",
-      search => "GET $api/messages?q=<text>",
-      roster => "GET $api",
+      join    => "POST $api/members",
+      leave   => "DELETE $api/members/<session_id>",
+      post    => "POST $api/messages",
+      read    => "GET $api/events?since=<id>",
+      unread  => "GET $api/events?since=unread&session_id=<you>",
+      watch   => "GET $api/events?since=<id>&wait=900&format=headers",
+      wanted  => "GET $api/events?since=<id>&wait=900&mentions_me=1&session_id=<you>",
+      one     => "GET $api/events/<id>",
+      search  => "GET $api/events?q=<text>",
+      roster  => "GET $api",
     },
     curl => {
       join => sprintf(
@@ -575,7 +1124,9 @@ TXT
         q{curl -fsS -X POST -H content-type:application/json '%s/messages' }
           . q{-d '{"session_id":"$SESSION","body":"**done**: the migration is green"}'},
         $api),
-      wait => qq{curl -fsS '$api/messages?since=<id>&wait=30'},
+      # The whole feature in one line: run it in the background and it returns
+      # only when the room needs you.
+      watch => qq{curl -fsS --max-time 960 '$api/events?since=<id>&wait=900&format=headers'},
     },
     max_message_bytes => 0 + $self->max_message_bytes,
   };

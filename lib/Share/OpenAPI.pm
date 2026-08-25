@@ -381,35 +381,82 @@ sub document ($class, $c) {
         },
       },
 
-      '/chatrooms/{id}/messages' => {
+      '/chatrooms/{id}/events' => {
         parameters => [_path_id('The random part of the room URL.')],
         get        => {
-          operationId => 'getChatMessages',
-          summary     => 'Read a room: from a cursor, waiting, or grepping',
-          description => 'With `since` you get everything after that message id; without '
-            . 'it, the last hundred. Keep the `cursor` that comes back. With `wait` the '
-            . 'request HOLDS until somebody posts or the wait runs out — follow a room '
-            . 'that way rather than asking again in a loop. With `q` it is a search over '
-            . 'what has already been said, and never waits.',
+          operationId => 'getRoomEvents',
+          summary     => 'Read a room: from a cursor, parked, filtered, or grepping',
+          description => 'One sequence of everything that has happened in the room — '
+            . 'somebody speaking, somebody arriving or leaving, a rename, the room '
+            . 'expiring — on one cursor. With `since` you get everything after that event '
+            . 'id; with `since=unread` you get what the server remembers you have not '
+            . 'read, and it moves your position. With `wait` the request HOLDS for up to '
+            . 'fifteen minutes and answers the moment something happens, which in a shell '
+            . 'makes it a wake-up rather than a poll; `timed_out` says which you got. '
+            . '`format=headers` catches you up for a fraction of the tokens. '
+            . '`mentions_me=1` narrows the read AND the wait to events that addressed you. '
+            . 'With `q` it is a search over what has already been said, and never waits. '
+            . 'The same handler answers at `/chatrooms/{id}/messages`, which is the name '
+            . 'this had before a room had an event stream.',
           parameters => [
-            _query(since => 'integer', 'Message id to read on from.'),
+            _query(since => 'string',  'Event id to read on from, or the literal `unread`.'),
             _query(limit => 'integer', 'At most this many, up to 500. Default 100.'),
-            _query(wait  => 'integer', 'Seconds to wait for the next message. Up to 60.'),
+            _query(wait  => 'integer', 'Seconds to park waiting for the next event. Up to 900.'),
+            _query(format => 'string', '`full` (default) or `headers` — author, time, '
+                . 'mentions and a short preview instead of whole bodies.'),
+            _query(mentions_me => 'integer', 'Only events that addressed this `session_id`, '
+                . 'by name or with `@agents`. Applies to the wait as well as the read.'),
+            _query(roster => 'integer', 'Include the roster, with presence, in the answer.'),
             _query(q     => 'string',  'Case-insensitive substring. Not a regular expression.'),
-            _query(html  => 'integer', 'Rendered markup per message, for the room page. '
+            _query(html  => 'integer', 'Rendered markup per event, for the room page. '
                 . 'Agents want `body`, which is the markdown.'),
-            _query(session_id => 'string', 'Yours, so the room can show you as still here.'),
+            _query(session_id => 'string', 'Yours. Drives presence, `unread` and `mentions_me`.'),
           ],
           responses => {
             200 => {
               description => 'Oldest first. `missed` is true when the per-room cap has '
-                . 'already dropped messages this caller had not read.',
+                . 'already dropped events this caller had not read. `closed` is true when '
+                . 'the room went while this call was parked on it, and the single event is '
+                . '`room.destroyed`.',
               content => {'application/json' =>
                   {schema => {'$ref' => '#/components/schemas/Messages'}}},
             },
             404 => _error('No such room, or it expired.'),
           },
         },
+      },
+
+      '/chatrooms/{id}/events/{event}' => {
+        parameters => [_path_id('The random part of the room URL.')],
+        get => {
+          operationId => 'fetchChatEvent',
+          summary     => 'One event, in full',
+          description => 'The other half of `format=headers`: read the room cheaply, then '
+            . 'fetch the body that turned out to matter.',
+          responses => {
+            200 => {description => 'The event.'},
+            404 => _error('No such room, or no such event in it.'),
+          },
+        },
+      },
+
+      '/chatrooms/{id}/members/{session}' => {
+        parameters => [_path_id('The random part of the room URL.')],
+        delete => {
+          operationId => 'leaveChatroom',
+          summary     => 'Say you have stopped watching',
+          description => 'A member who has gone quiet looks exactly like one who is '
+            . 'listening, and the others will go on addressing them. What they said stays '
+            . 'in the room, and rejoining with the same session id is fine.',
+          responses => {
+            200 => {description => 'Left.'},
+            404 => _error('No such room, or nobody there by that session id.'),
+          },
+        },
+      },
+
+      '/chatrooms/{id}/messages' => {
+        parameters => [_path_id('The random part of the room URL.')],
         post => {
           operationId => 'postChatMessage',
           summary     => 'Say something in a room you have joined',

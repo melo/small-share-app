@@ -101,6 +101,28 @@ my %CFG = (
   chat_max_messages      => _number(SHARE_CHAT_MAX_MESSAGES      => 5000),
   chat_rate_per_second   => _number(SHARE_CHAT_RATE_PER_SECOND   => 5),
   chat_rate_per_minute   => _number(SHARE_CHAT_RATE_PER_MINUTE   => 60),
+
+  # The longest a caller may park on a room waiting for the next thing to
+  # happen. Sixty seconds was chosen so that "a proxy in front of this — and
+  # every MCP client's own patience — is still comfortably inside its own
+  # timeout", and NEITHER of those assumptions was ever tested.
+  #
+  # Fifteen minutes is what turns a backgrounded curl into a wake-up instead of a
+  # poll: the agent works, and the moment the room needs it the command exits
+  # with the delta in hand. It is configuration rather than a constant precisely
+  # because the untested assumption is still untested — a deployment whose proxy
+  # cuts long responses lowers this in .env, and does not go back to asking in a
+  # loop.
+  chat_max_wait => _number(SHARE_CHAT_MAX_WAIT => 900),
+
+  # How long before a room's expiry it says so, in the room, once.
+  chat_expiry_warning => _number(SHARE_CHAT_EXPIRY_WARNING => 7200),
+
+  # Whether posting needs the member_token that join handed back. Off for one
+  # release so that nothing written against yesterday's shape breaks today; the
+  # operations that did not exist yesterday — edit, delete, rename a room —
+  # require it from the start, because they have no callers to break.
+  chat_require_token => _number(SHARE_CHAT_REQUIRE_TOKEN => 0),
 );
 
 sub _decoded ($value) {
@@ -161,6 +183,7 @@ my $chat = Share::Chat->new(
   max_ttl_days      => $CFG{ttl_days},
   max_message_bytes => $CFG{chat_max_message_bytes},
   max_messages      => $CFG{chat_max_messages},
+  expiry_warning    => $CFG{chat_expiry_warning},
 )->init;
 
 # Signs the identity cookie a person gets when they join a room — the one piece
@@ -230,6 +253,10 @@ my $reap = sub {
   # the worker that won the hour does all of the deleting, and a room and a file
   # that expire in the same minute go in the same pass.
   return unless $result->{claimed};
+  # Warned on one pass and reaped on a later one, never both in the same breath:
+  # a warning nobody could have read is not a warning.
+  eval { $chat->warn_expiring; 1 } or app->log->error("chat expiry warning failed: $@");
+
   my $rooms = eval { $chat->reap };
   return app->log->error("chat reaper failed: $@") unless $rooms;
   app->log->info(sprintf 'reaped %d chat room(s), %d message(s)',
@@ -560,7 +587,10 @@ get '/c/<room:id>' => sub ($c) {
   $chat->touch_member($room, $me->{session_id});
   $c->render('chat_room',
     room     => $chat->room_public($room, $c->base_url, members => 1),
-    me       => $chat->member_public($me),
+    me       => $chat->member_public($me, $room),
+    # This browser's own id, out of its own signed cookie. Its own is the one
+    # session id it is entitled to, and assets/chat.js needs it to post.
+    my_session => $me->{session_id},
     cursor   => $chat->cursor($room, $rows),
     error    => scalar $c->flash('chat_error'),
   );
@@ -638,8 +668,8 @@ get '/c/<room:id>/transcript' => sub ($c) {
 
   my $rows = $chat->messages($room, q => scalar $c->param('q'));
   $c->render('chat_transcript',
-    messages => [map { _chat_view($c, $_) } @$rows],
-    me       => $chat->member_public($me),
+    messages => [map { _chat_view($c, $_, $room) } @$rows],
+    me       => $chat->member_public($me, $room),
     query    => scalar $c->param('q'),
   );
 } => 'chat_transcript';
@@ -783,7 +813,7 @@ $api->post('/chatrooms/<room:id>/members' => sub ($c) {
   my $args = eval { _chat_args($c, qw(session_id name about)) };
   return _api_error($c, 400, $@) if $@;
 
-  my ($member) = eval { $chat->join_room($room, %$args, kind => 'agent') };
+  my ($member, undef, $token) = eval { $chat->join_room($room, %$args, kind => 'agent') };
   return _api_error($c, 400, $@) if $@;
 
   # Everything a session that has just arrived needs in one answer: who else is
@@ -791,21 +821,51 @@ $api->post('/chatrooms/<room:id>/members' => sub ($c) {
   my $rows = $chat->messages($room);
   $c->render(json => {
     %{_chat_briefing($c, $room)},
-    member   => $chat->member_public($member),
+    member   => $chat->member_public($member, $room),
+    # The one and only disclosure, exactly as a room's delete password works:
+    # nothing else returns it, and rejoining does not mint a second one.
+    (defined $token ? (member_token => $token) : ()),
     count    => scalar @$rows,
     cursor   => $chat->cursor($room, $rows),
-    messages => [map { $chat->message_public($_) } @$rows],
+    messages => [map { $chat->event_public($_, [], $room) } @$rows],
   });
 });
 
 # Reading, waiting and grepping are one endpoint, because they are one question
-# asked with different patience.
-$api->get('/chatrooms/<room:id>/messages' => sub ($c) {
+# asked with different patience — and now under two names.
+#
+# `/events` is what this is: one monotonic sequence per room, where a message is
+# one kind of thing that happened and an arrival, a rename and the room's own
+# death are others. `/messages` is what it was called yesterday, and it keeps
+# working unchanged — it already returned arrivals and renames alongside speech,
+# so nothing about its behaviour moves, only the name of the list it hands back.
+my $read_events = sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
   $chat->touch_member($room, scalar $c->param('session_id'));
 
-  my $since = $c->param('since');
+  my $since   = $c->param('since');
+  my $session = scalar $c->param('session_id');
+
+  # "Give me what I have not read." A watcher LOSES its own cursor — every
+  # re-invocation, every fresh session — and `since` omitted means "the last
+  # hundred", which is how catching up quietly became re-reading everything.
+  #
+  # Only this form advances the stored cursor. A caller that passed a number is
+  # carrying its own position, and overwriting it would be the server deciding it
+  # knows better.
+  my $by_cursor = defined $since && $since eq 'unread';
+  $since = $chat->read_cursor($room, $session) // 0 if $by_cursor;
+
   my %query = (since => $since, limit => scalar $c->param('limit'), q => scalar $c->param('q'));
+
+  # Resolved to a member id here and put into the query, which chat_await passes
+  # through verbatim — so the PARK inherits the filter for free. Applying it to
+  # the read but not the wait would wake an agent for every word said in the room
+  # and then hand it nothing, which is worse than not filtering at all.
+  if ($c->param('mentions_me') && defined $session) {
+    my $me = $chat->member($room, $session);
+    $query{mentions_me} = $me ? $me->{id} : -1;
+  }
 
   # A search waits for nothing: `q` asks about what has already been said.
   my $wait = length($query{q} // '') ? 0 : _chat_wait_seconds($c);
@@ -818,12 +878,61 @@ $api->get('/chatrooms/<room:id>/messages' => sub ($c) {
   # nothing here, but over MCP it is the difference between one JSON body and an
   # SSE stream — see the tool in Share::MCP — and the two sides should behave the
   # same way for the same request.
-  return _chat_messages_json($c, $room, $chat->messages($room, %query), $since) unless $wait;
+  my $answer = sub ($rows, %opt) {
+    $chat->mark_read($room, $session, $rows->[-1]{id}) if $by_cursor && @$rows;
+    return _chat_messages_json($c, $room, $rows, $since, %opt, session => $session);
+  };
+
+  return $answer->($chat->messages($room, %query)) unless $wait;
+
+  # An open poll is what says this member is listening, so it is claimed for as
+  # long as the park intends to last and given up the moment it ends -- however
+  # it ends. Leaving the claim standing to its deadline would make a session that
+  # hung up fifteen minutes ago look like the most attentive member in the room.
+  $chat->hold($room, $session, $wait);
 
   $c->render_later;
-  $c->chat_await($room, \%query, $wait)
-    ->then(sub ($rows) { _chat_messages_json($c, $room, $rows, $since) });
+  $c->chat_await($room, \%query, $wait)->then(sub ($rows, $closed = undef) {
+    $chat->release($room, $session) unless $closed;
+    $answer->($rows, waited => 1, closed => $closed);
+  });
+};
+
+# One event in full, for a caller reading headers that decided it wants the body
+# after all. The whole point of a header is that this call is usually not made.
+$api->get('/chatrooms/<room:id>/events/<event>' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $row = $chat->event($room, $c->stash('event'))
+    or return _api_error($c, 404, 'no such event in this room');
+  $c->render(json => {event => $chat->event_public($row, [], $room)});
 });
+
+# "I have processed up to here." Separate from reading, because a watcher that
+# crashes between reading and acting should be able to come back to the work it
+# had not finished rather than to the messages it had merely received.
+# Leaving. A call, not an announcement -- see Share::Chat::leave_room.
+$api->delete('/chatrooms/<room:id>/members/<session>' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $member = $chat->leave_room($room, $c->stash('session'))
+    or return _api_error($c, 404, 'nobody here by that session id');
+  $c->render(json => {left => $member->{name}, room => $room->{secret}});
+});
+
+$api->post('/chatrooms/<room:id>/members/<session>/read' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $args = eval { _chat_args($c, qw(cursor)) };
+  return _api_error($c, 400, $@) if $@;
+
+  my $session = $c->stash('session');
+  $chat->mark_read($room, $session, $args->{cursor});
+  $c->render(json => {
+    cursor => $chat->read_cursor($room, $session) // 0,
+    unread => $chat->unread_count($room, $session),
+  });
+});
+
+$api->get('/chatrooms/<room:id>/events'   => $read_events);
+$api->get('/chatrooms/<room:id>/messages' => $read_events);
 
 $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
@@ -832,14 +941,42 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
     return _api_error($c, 429, "too many messages; try again in ${wait}s");
   }
 
-  my $args = eval { _chat_args($c, qw(session_id body)) };
+  my $args = eval { _chat_args($c, qw(session_id body member_token)) };
   return _api_error($c, 400, $@) if $@;
+
+  return _api_error($c, 403, 'this instance requires the member_token that '
+      . 'join handed back — it is the only copy, and nothing else will tell you it again')
+    unless _chat_may_write($c, $room, $args->{session_id}, delete $args->{member_token});
 
   my $row = eval { $chat->post($room, %$args) };
   return _api_error($c, 400, $@) if $@;
 
-  $c->render(json => {message => $chat->message_public($row), cursor => 0 + $row->{id}},
-    status => 201);
+  # What landed while this caller was not looking.
+  #
+  # The server has known this all along — it has the room and it has the member's
+  # read cursor — and until now the acknowledgement spent that knowledge saying
+  # {"cursor": 9}. Two separate sessions lost work to the silence: one answered a
+  # question that an unread message had already refined, the other had six
+  # questions put to it and did not see them for four and a half hours.
+  #
+  # Posting is the one moment an agent is provably listening. This is the cheapest
+  # possible thing to do with that.
+  my $behind = $chat->messages($room,
+    since => $chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
+  $behind = [grep { $_->{id} != $row->{id} } @$behind];
+
+  # And it catches you up, because you have just been handed the gap.
+  $chat->mark_read($room, $args->{session_id}, $row->{id});
+
+  $c->render(json => {
+    message => $chat->event_public($row, [], $room),
+    cursor  => 0 + $row->{id},
+    # A ceiling, not a page size: a caller further behind than this should read
+    # properly rather than have an acknowledgement quietly become a catch-up.
+    # `unread` is the true count either way, so nothing is hidden.
+    unread  => scalar @$behind,
+    missed  => [map { $chat->header_public($_) } @$behind],
+  }, status => 201);
 });
 
 # ------------------------------------------------------------------- MCP -----
@@ -996,16 +1133,11 @@ sub _rate_limited ($c) {
 
 # ------------------------------------------------------- chat room helpers ---
 
-# The longest a caller may park on a room waiting for the next message. Long
-# enough to be worth doing instead of asking again in a loop, short enough that
-# a proxy in front of this — and every MCP client's own patience — is still
-# comfortably inside its own timeout.
-use constant CHAT_MAX_WAIT => 60;
-
 sub _chat_wait_seconds ($c) {
   my $wait = $c->param('wait') // 0;
   return 0 unless $wait =~ /\A\d+\z/;
-  return $wait > CHAT_MAX_WAIT ? CHAT_MAX_WAIT : 0 + $wait;
+  my $max = $c->app->config->{chat_max_wait};
+  return $wait > $max ? $max : 0 + $wait;
 }
 
 # Wait for the next thing said in a room, without a worker sitting still for it.
@@ -1027,25 +1159,52 @@ helper chat_await => sub ($c, $room, $query, $wait) {
   my $rows = eval { $chat->messages($room, %$query) } // [];
   return $promise->resolve($rows) if @$rows || !$wait;
 
-  my $deadline = time + $wait;
+  my $started  = time;
+  my $deadline = $started + $wait;
   my ($settled, $timer) = (0, undef);
 
-  my $settle = sub ($found) {
+  my $settle = sub ($found, $closed = undef) {
     return if $settled++;
     Mojo::IOLoop->remove($timer) if defined $timer;
-    $promise->resolve($found);
+    $promise->resolve($found, $closed);
   };
 
-  $timer = Mojo::IOLoop->recurring(
-    0.5 => sub {
-      my $found = eval { $chat->messages($room, %$query) };
-      # A failed poll is logged and retried until the deadline: the store going
-      # briefly read-only is not a reason to hang up on somebody waiting.
-      return $c->app->log->warn("chat: poll failed: $@") unless $found;
-      return $settle->($found) if @$found;
-      $settle->([]) if time >= $deadline;
-    }
-  );
+  # 0.5s while somebody might still be watching a page, then out to five. A
+  # browser still feels instant; an agent parked for a quarter of an hour costs
+  # about two hundred lookups instead of eighteen hundred. Tidiness rather than
+  # necessity — the arithmetic says even the naive version is noise against a
+  # database that does a hundred thousand indexed reads a second — but a constant
+  # that scales with the wait is one less thing to come back to.
+  my $tick;
+  $tick = sub {
+    my $elapsed = time - $started;
+    Mojo::IOLoop->remove($timer) if defined $timer;
+    $timer = Mojo::IOLoop->recurring(
+      ($elapsed < 5 ? 0.5 : $elapsed < 60 ? 2 : 5) => sub {
+        # The room may have gone while this caller was parked on it. Before this
+        # check the poll went on asking a room that no longer existed and settled
+        # empty AT THE DEADLINE — invisible at sixty seconds, a held connection
+        # doing nothing for a quarter of an hour at nine hundred.
+        #
+        # find_room treats an expired room as absent from the moment it expires,
+        # an hour or so before the reaper physically deletes it, so a waiter is
+        # released at the true expiry rather than at the next reaper pass.
+        my $live = eval { $chat->find_room($room->{secret}) };
+        # Asked of the database, not of the room hashref this park started with,
+        # which still says whatever it said a quarter of an hour ago.
+        return $settle->([], $chat->room_state($room->{secret})) unless $live;
+
+        my $found = eval { $chat->messages($room, %$query) };
+        # A failed poll is logged and retried until the deadline: the store going
+        # briefly read-only is not a reason to hang up on somebody waiting.
+        return $c->app->log->warn("chat: poll failed: $@") unless $found;
+        return $settle->($found) if @$found;
+        return $settle->([])     if time >= $deadline;
+        $tick->() if $elapsed < 60 && time - $started >= 5;
+      }
+    );
+  };
+  $tick->();
 
   # Somebody who hangs up — a curl interrupted, an agent that gave up — should
   # not leave a timer running to the deadline for nobody.
@@ -1119,12 +1278,23 @@ sub _chat_identity ($c) {
 
 sub _chat_me ($c, $room) { return $chat->member($room, _chat_identity($c)->{sid}) }
 
+# May this caller write as this member?
+#
+# A browser needs no token: its session cookie is signed and lives in one
+# browser, so it already IS one. An agent presents the token join gave it.
+sub _chat_may_write ($c, $room, $session_id, $token) {
+  return 1 unless $c->app->config->{chat_require_token};
+  my $mine = ($c->session('chat') // {})->{sid};
+  return 1 if defined $mine && defined $session_id && $mine eq $session_id;
+  return $chat->token_ok($room, $session_id, $token);
+}
+
 # A message as the templates want it: the public fields, plus its markdown
 # rendered through the same sanitiser that renders an uploaded file. Chat is
 # agent-written markdown too, and gets both of the layers that protects — the
 # sanitiser here, and the sandboxed transcript frame around it.
-sub _chat_view ($c, $row) {
-  my $info = $chat->message_public($row);
+sub _chat_view ($c, $row, $room = undef) {
+  my $info = $chat->event_public($row, [], $room);
   $info->{html} = render_markdown($info->{body})->{html};
   return $info;
 }
@@ -1133,23 +1303,72 @@ sub _chat_view ($c, $row) {
 # is handed this rather than building it: the server already has the sanitiser,
 # the template and the timestamp formatting, and a second renderer in JavaScript
 # would be a second thing to keep in step and a second thing to get wrong.
-sub _chat_markup ($c, $row) { return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row)) }
+sub _chat_markup ($c, $row, $room = undef) {
+  return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row, $room));
+}
 
-sub _chat_messages_json ($c, $room, $rows, $since) {
-  my $markup = $c->param('html') ? 1 : 0;
+sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
+  # The room went while this caller was parked on it. The last thing anyone ever
+  # reads from a room is the room saying it is over — which is the same shape as
+  # everything else they ever read from it, and is why this is an event and not
+  # an error code.
+  if (my $why = $opt{closed}) {
+    my $event = $chat->destroyed_event($why);
+    return $c->render(json => {
+      room     => {id => $room->{secret}, topic => $room->{topic}},
+      closed   => \1,
+      count    => 1,
+      cursor   => 0 + ($since // 0),
+      timed_out => \0,
+      missed   => \0,
+      unread   => 0,
+      events   => [$event],
+      messages => [$event],
+    });
+  }
+
+  my $markup  = $c->param('html') ? 1 : 0;
+  my $headers = ($c->param('format') // '') eq 'headers';
+
+  # One query for the whole page rather than one per event.
+  my $mentions = $chat->mentions_for($room, [map { $_->{id} } @$rows]);
+
   my @messages = map {
-    my $info = $chat->message_public($_);
-    $markup ? {%$info, markup => _chat_markup($c, $_)} : $info;
+    my $said = $mentions->{$_->{id}} // [];
+    my $info = $headers
+      ? $chat->header_public($_, $said)
+      : $chat->event_public($_, $said, $room);
+    $markup ? {%$info, markup => _chat_markup($c, $_, $room)} : $info;
   } @$rows;
 
   return $c->render(json => {
     room     => {id => $room->{secret}, topic => $room->{topic}},
     count    => scalar @messages,
+    # Both names for one list. The old one is what assets/chat.js switches on and
+    # what every caller written before rooms had an event stream reads; it costs
+    # one key on the wire and it is the whole of how /messages keeps its promise.
+    events   => \@messages,
     cursor   => $chat->cursor($room, $rows, $since),
     # True when the caller asked for everything since a message the per-room cap
     # has already dropped. It missed some, and being told is the difference
     # between a gap it can react to and one it cannot see.
     missed   => $chat->missed($room, $since) ? \1 : \0,
+    # Whether this answer is empty because the room was quiet, or because a
+    # filter matched nothing, or because the caller never asked to wait at all.
+    # A re-arming watcher has to tell those apart, and `count == 0` cannot.
+    timed_out => ($opt{waited} && !@messages) ? \1 : \0,
+    # How far behind this caller still is. One integer, and it answers the
+    # question that previously took re-reading the room and reasoning about it.
+    unread   => $chat->unread_count($room, $opt{session}),
+    # Off unless asked for. The roster is one call away and never reaches the
+    # place it is needed, which is a real complaint -- but attaching it to every
+    # answer would undo format=headers, whose entire purpose is that a watcher
+    # re-arming a thousand times pays hundreds of tokens rather than thousands.
+    # Under an event stream it is not needed on every read anyway: departures and
+    # arrivals arrive as events, so a member that joined is kept current by the
+    # sequence. This is for wanting a fresh snapshot without rejoining.
+    ($c->param('roster')
+      ? (members => [map { $chat->member_public($_, $room) } @{$chat->members($room)}]) : ()),
     messages => \@messages,
   });
 }
@@ -1518,12 +1737,21 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
   else in the room has taken and a paragraph about what it is working on. Then
   <code>POST …/messages</code> to say something, and to read:</p>
 
-  <pre><code>curl '<%= $c->base_url %>/api/v1/chatrooms/&lt;id&gt;/messages?since=&lt;cursor&gt;&amp;wait=30'</code></pre>
+  <pre><code>curl --max-time 960 '<%= $c->base_url %>/api/v1/chatrooms/&lt;id&gt;/events?since=&lt;cursor&gt;&amp;wait=900&amp;format=headers'</code></pre>
 
-  <p><code>since</code> is the last message id you saw; <code>wait</code> holds the request
-  open until somebody posts or the seconds run out, which is how to follow a room without
-  asking again in a loop. <code>?q=text</code> greps it instead — a case-insensitive
-  substring, not a regular expression.</p>
+  <p>A room is one sequence of <strong>events</strong> on one cursor — somebody speaking,
+  somebody arriving or leaving, a rename, the room expiring — so “what has happened since I
+  last looked?” is one question. <code>since</code> is the last event id you saw, or the
+  literal <code>unread</code> to read from where the server remembers you got to.
+  <code>wait</code> holds the request open for up to fifteen minutes and answers the moment
+  something happens, which in a shell makes it a wake-up rather than a poll;
+  <code>timed_out</code> tells you which you got. <code>format=headers</code> catches you up
+  for a fraction of the tokens, and <code>&amp;mentions_me=1&amp;session_id=…</code> wakes you
+  only when somebody addressed you — by name, or every agent at once with
+  <code>@agents</code>. <code>?q=text</code> greps instead: a case-insensitive substring, not
+  a regular expression.</p>
+
+  <p><code>/messages</code> still answers, with the same list under its old name.</p>
 
   <p class="hint">No attachments. Share the file the ordinary way and post its URL into the
   room; that way the people reading along can open it too.</p>
@@ -1751,7 +1979,8 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 %# and for the same reason — the messages are markdown written by agents, so
 %# they render in a sandboxed frame that cannot reach this page or its cookie.
 <div class="room" data-room="<%= $room->{id} %>" data-cursor="<%= $cursor %>"
-  data-api="<%= $room->{api_url} %>" data-me="<%= $me->{session_id} %>">
+  data-api="<%= $room->{api_url} %>" data-me="<%= $my_session %>"
+  data-author="<%= $me->{author} %>">
 
   <input class="roomhead-toggle" type="checkbox" id="roomhead-toggle">
   <header class="roomhead">
@@ -1764,7 +1993,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
       </div>
       <ul class="roster">
         % for my $m (@{$room->{members}}) {
-        <li class="<%= $m->{session_id} eq $me->{session_id} ? 'is-me' : '' %>">
+        <li class="<%= ($m->{author} // '') eq ($me->{author} // '') ? 'is-me' : '' %>">
           <span class="roster-name"><%= $m->{name} %></span>
           <span class="roster-kind"><%= $m->{kind} %></span>
           % if (defined $m->{about}) {
@@ -1802,8 +2031,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     <textarea name="body" rows="2" required
       placeholder="Markdown. No attachments — upload the file and paste its URL."></textarea>
     <div class="composer-actions">
-      <span class="composer-me">You are <strong><%= $me->{name} %></strong>
-        <code><%= $me->{session_id} %></code></span>
+      <span class="composer-me">You are <strong><%= $me->{name} %></strong></span>
       %# Shown only once assets/chat.js is running, because with scripting off
       %# the keyboard shortcut it describes does not exist.
       <span class="composer-hint" hidden>⌘/Ctrl-Enter posts</span>
@@ -1816,12 +2044,22 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
 %# One message, rendered here and only here. The API hands this same markup to
 %# the browser for a message that arrives while the page is open, so a live
 %# conversation and a reloaded one are built by the same template.
-<li class="msg msg-<%= $m->{kind} %>" data-id="<%= $m->{id} %>"
-  data-session="<%= $m->{session_id} %>">
+%# One class naming the event exactly, plus msg-system for the thin structural
+%# lines. member.joined is deliberately NOT one of those: it carries the
+%# paragraph saying what the arrival is working on, which is the single most
+%# useful thing in a room and is read, not skimmed past.
+<li class="msg msg-<%= $m->{type} =~ s/\./-/gr %><%= $m->{type} =~ /\A(?:member\.(?:left|renamed|presence)|room\.)/ ? ' msg-system' : '' %>" data-id="<%= $m->{id} %>"
+  data-author="<%= $m->{author} %>">
   <div class="msg-head">
     <span class="msg-name"><%= $m->{name} %></span>
-    <span class="msg-session" title="<%= $m->{session_id} %>"><%= $m->{session_id} %></span>
-    % if ($m->{kind} eq 'join') {
+    %# The session id used to be printed here. It is the string that identifies
+    %# the author to the API, and putting it on the wall let anyone who could read
+    %# the room post as anybody in it. The name is who they are; the id was never
+    %# for readers.
+    % if (defined $m->{mentions} && @{$m->{mentions}}) {
+    <span class="msg-to">to <%= join ', ', @{$m->{mentions}} %></span>
+    % }
+    % if ($m->{type} eq 'member.joined') {
     <span class="msg-tag">joined</span>
     % }
     <time datetime="<%= $m->{created_at} %>"><%= $m->{created_at} =~ s/T/ /r =~ s/Z/ UTC/r %></time>
@@ -1849,7 +2087,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
     <p class="searching">Messages matching “<%= $query %>”
       — <%= scalar @$messages %> of them, oldest first.</p>
     % }
-    <ol class="messages" id="messages" data-me="<%= $me->{session_id} %>"
+    <ol class="messages" id="messages" data-me="<%= $me->{author} %>"
       data-live="<%= defined $query ? 0 : 1 %>">
       % for my $m (@$messages) {
         %= include 'chat_message', m => $m

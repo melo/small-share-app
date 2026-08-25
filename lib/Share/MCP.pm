@@ -165,11 +165,41 @@ TALKING TO OTHER AGENTS. This server also holds chat rooms, for when the work is
 split across sessions and the only wire between them is the person you are both
 talking to. Call create_chatroom, give the human the URL it returns, and they
 paste it into the other sessions; each one calls join_chatroom with a name and a
-paragraph saying what it is working on, and from then on post_chat_message,
-get_chat_messages (which can WAIT for the next one rather than being asked again
-and again) and search_chat_messages are the whole of it. The same URL opened in a
-browser is a room the human can read and take part in, live. No attachments —
-share the file and post its URL.
+paragraph saying what it is working on. The same URL opened in a browser is a
+room the human can read and take part in, live.
+
+A room is ONE SEQUENCE OF EVENTS on one cursor — somebody speaking, somebody
+arriving or leaving, a rename, the room expiring — so "what has happened since I
+last looked?" is a single question with a single answer.
+
+BEING IN A ROOM SHOULD NOT MEAN SITTING IN IT. This is the part agents get
+wrong, at real cost: two sessions in one afternoon went hours without reading a
+room they were in, because reading was expensive and not reading was free. So:
+
+  * get_room_events with `wait` HOLDS for up to fifteen minutes and answers the
+    moment something happens. Better still, run the same thing as a backgrounded
+    shell command — it exits when the room needs you, which makes it a wake-up
+    rather than a poll:
+
+      curl -fsS --max-time 960 '<api_url>/events?since=<cursor>&wait=900&format=headers'
+
+  * `mentions_me` narrows that to events which actually addressed you, so you
+    park on "someone needs me" instead of "someone spoke".
+  * `format: "headers"` catches you up for hundreds of tokens instead of
+    thousands; fetch_chat_event gets the one body that mattered.
+  * `since: "unread"` reads from where the server remembers you got to, so a
+    session that has just been re-invoked need not have remembered anything.
+  * leave_chatroom when you stop watching. A member who has gone quiet looks
+    exactly like one who is listening, and the others will keep addressing you.
+
+WHAT THE PERSON IN THE ROOM SEES. Markdown is rendered properly — headings,
+tables, bold, lists, block quotes, code fences, emoji. Mermaid is NOT drawn in a
+room: put the diagram in a shared file and post its URL. A message may be up to
+16 KB; anything longer is a file. Write @name to address somebody, or @agents to
+address every agent in the room at once and no human.
+
+No attachments — share the file and post its URL. And treat the room URL as the
+secret it is: anyone holding it can read the room and post to it.
 
 Things worth knowing:
 
@@ -383,8 +413,11 @@ sub _tools ($server) {
     description => 'Join a chat room you were given the URL for. Say who you are: a short '
       . 'name the others will see on every message, and one paragraph about what you are '
       . 'working on. You get back the roster, the recent messages and a cursor to read on '
-      . 'from. Do this before posting — a room where nobody says what they are holding is '
-      . 'a room that coordinates nothing.',
+      . 'from, plus a member_token you will only ever be shown once. Do this before '
+      . 'posting — a room where nobody says what they are holding is a room that '
+      . 'coordinates nothing. Call it AGAIN with the same session_id and a different name '
+      . 'to RENAME yourself: the room is told, and you stay one member instead of '
+      . 'becoming two.',
     input_schema => {
       type       => 'object',
       required   => [qw(room session_id name about)],
@@ -392,7 +425,10 @@ sub _tools ($server) {
         room       => _str('The room URL you were given, or just the id out of it.'),
         session_id => _str('Your session id. It is shown on every message you post.'),
         name       => _str('A short name a person would recognise — "planner", '
-            . '"api-refactor". It has to be one nobody else in the room has taken.'),
+            . '"api-refactor". It has to be one nobody else in the room has taken. '
+            . 'Calling join_chatroom again with the SAME session_id and a different name '
+            . 'RENAMES you and tells the room — that is how to keep one identity across a '
+            . 'rename rather than becoming a second member.'),
         about => _str('One paragraph: what you are working on, and what you need from '
             . 'the others. Everyone in the room reads this.'),
       },
@@ -402,7 +438,7 @@ sub _tools ($server) {
       my ($room, $id) = _room($c, $args->{room});
       return $tool->text_result(_no_room($id), 1) unless $room;
 
-      my ($member) = $c->chat->join_room($room,
+      my ($member, undef, $token) = $c->chat->join_room($room,
         session_id => $args->{session_id},
         name       => $args->{name},
         about      => $args->{about},
@@ -411,10 +447,13 @@ sub _tools ($server) {
       my $rows = $c->chat->messages($room);
       return $tool->structured_result({
         room     => $c->chat->room_public($room, $c->base_url, members => 1),
-        member   => $c->chat->member_public($member),
+        member   => $c->chat->member_public($member, $room),
+        # Issued once, and this is the once. Keep it: nothing else returns it,
+        # and on an instance that requires it you cannot post without it.
+        (defined $token ? (member_token => $token) : ()),
         count    => scalar @$rows,
         cursor   => $c->chat->cursor($room, $rows),
-        messages => [map { $c->chat->message_public($_) } @$rows],
+        messages => [map { $c->chat->event_public($_, [], $room) } @$rows],
         %{$c->chat->briefing($room, $c->base_url)},
       });
     },
@@ -423,9 +462,11 @@ sub _tools ($server) {
   _tool(
     $server,
     name        => 'post_chat_message',
-    description => 'Say something in a room you have joined. Markdown. No attachments: '
-      . 'share the file with get_upload_url and put its URL in the message, which is how '
-      . 'the human reading along gets to see it too.',
+    description => 'Say something in a room you have joined. Markdown. The result '
+      . 'tells you what landed while you were not looking — "unread", and the headers '
+      . 'of what you missed — because the moment you post is the one moment you are '
+      . 'provably listening. No attachments: share the file with get_upload_url and put '
+      . 'its URL in the message, which is how the human reading along gets to see it too.',
     input_schema => {
       type       => 'object',
       required   => [qw(room session_id body)],
@@ -441,52 +482,128 @@ sub _tools ($server) {
       return $tool->text_result(_no_room($id), 1) unless $room;
 
       my $row = $c->chat->post($room, session_id => $args->{session_id}, body => $args->{body});
-      return $tool->structured_result(
-        {message => $c->chat->message_public($row), cursor => 0 + $row->{id}});
+
+      # The same gap the REST endpoint hands back, for the same reason: a cursor
+      # that silently jumped is how an agent spends thirty seconds answering a
+      # question a message it had not read already refined.
+      my $behind = $c->chat->messages($room,
+        since => $c->chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
+      $behind = [grep { $_->{id} != $row->{id} } @$behind];
+      $c->chat->mark_read($room, $args->{session_id}, $row->{id});
+
+      return $tool->structured_result({
+        message => $c->chat->event_public($row, [], $room),
+        cursor  => 0 + $row->{id},
+        unread  => scalar @$behind,
+        missed  => [map { $c->chat->header_public($_) } @$behind],
+      });
     },
   );
 
-  _tool(
-    $server,
-    name        => 'get_chat_messages',
-    description => 'Read a room. With "since" you get everything said after that message '
-      . 'id; without it, the last hundred. Keep the "cursor" you get back and hand it in '
-      . 'as "since" next time. Set "wait" and the call HOLDS until somebody posts or the '
-      . 'wait runs out — that is how to follow a conversation, rather than asking again '
-      . 'in a loop.',
-    input_schema => {
+  # One sequence per room, and everything that happens to it is in there:
+  # somebody speaking, somebody arriving or leaving, a rename, the room's own
+  # death. So there is one question — "what since <id>?" — and one cursor.
+  my %read_schema = (
       type       => 'object',
       required   => ['room'],
       properties => {
         room  => _str('The room URL, or its id.'),
-        since => {type => 'integer', description => 'Message id to read on from — the '
-            . '"cursor" from your last call.'},
+        # Either shape, because it is genuinely two things: a number the caller
+        # is carrying, or the word "unread" asking the server for the one it
+        # keeps. Refusing the integer here would break every caller that has ever
+        # handed back a cursor.
+        since => {type => ['integer', 'string'],
+          description => 'Event id to read on from — the "cursor" from your last call. '
+            . 'Or the literal "unread", which reads from where the SERVER remembers you '
+            . 'got to and then moves it, so a session that has just been re-invoked need '
+            . 'not have remembered anything.'},
         limit => {type => 'integer', description => 'At most this many, up to 500. '
             . 'Default 100.'},
-        wait => {type => 'integer', description => 'Seconds to wait for the next message '
-            . 'before answering with nothing. Up to 60. Default 0, which answers at once.'},
-        session_id => _str('Your session id, so the room can show you as still here.'),
+        wait => {type => 'integer', description => 'Seconds to HOLD the call open '
+            . 'waiting for the next thing to happen, up to 900. Default 0, which answers '
+            . 'at once. The answer carries "timed_out" so a loop can tell a quiet room '
+            . 'from a room that said something.'},
+        session_id => _str('Your session id, so the room can show you as still here, '
+            . 'and so "unread" and mentions_me mean anything.'),
+        format => _str('"full" (default) or "headers" — id, author, time, mentions and a '
+            . 'short preview instead of whole bodies. Catching up in headers costs '
+            . 'hundreds of tokens where full bodies cost thousands; fetch_chat_event '
+            . 'gets the one you actually care about.'),
+        # Boolean or 1, because a model writing a tool call produces either and a
+        # schema that accepts only one of them fails the call outright — with a
+        # validation error rather than anything that reads like "wrong shape".
+        mentions_me => {type => ['boolean', 'integer'], description => 'Only events that addressed '
+            . 'you by name, or the whole fleet with @agents. Combined with "wait" this is '
+            . 'how you park on "someone needs me" rather than on "someone spoke".'},
       },
-    },
-    code => sub ($tool, $args) {
+  );
+
+  my $read_code = sub ($tool, $args) {
       my $c = _c($tool);
       my ($room, $id) = _room($c, $args->{room});
       return $tool->text_result(_no_room($id), 1) unless $room;
 
       $c->chat->touch_member($room, $args->{session_id});
 
+      # "unread" reads from the position the server keeps for this member, so a
+      # watcher that has just been re-invoked does not have to have remembered
+      # anything. Only this form advances it; a caller passing a number is
+      # carrying its own place.
       my $since = $args->{since};
-      my %query = (since => $since, limit => $args->{limit});
-      my $wait  = $args->{wait} // 0;
-      $wait = 60 if $wait > 60;
-      $wait = 0  if $wait < 0;
+      my $by_cursor = defined $since && $since eq 'unread';
+      $since = $c->chat->read_cursor($room, $args->{session_id}) // 0 if $by_cursor;
 
-      my $answer = sub ($rows) {
+      my %query = (since => $since, limit => $args->{limit});
+
+      if ($args->{mentions_me} && defined $args->{session_id}) {
+        my $me = $c->chat->member($room, $args->{session_id});
+        $query{mentions_me} = $me ? $me->{id} : -1;
+      }
+      my $wait  = $args->{wait} // 0;
+      # The SECOND ceiling. share.pl has its own, and for a long time this one
+      # sat here quietly holding every MCP caller to sixty seconds no matter what
+      # that one said. Both come from the same configured number now, and a test
+      # drives that number down and checks this call honours it.
+      my $max = $c->app->config->{chat_max_wait};
+      $wait = $max if $wait > $max;
+      $wait = 0    if $wait < 0;
+
+      my $answer = sub ($rows, $closed = undef) {
+        # The room went while this call was parked on it. Same answer the REST
+        # endpoint gives, and for the same reason: the last thing anybody reads
+        # from a room is the room saying it is over.
+        if ($closed) {
+          my $event = $c->chat->destroyed_event($closed);
+          return $tool->structured_result({
+            closed => \1, count => 1, cursor => 0 + ($since // 0),
+            timed_out => \0, missed => \0, unread => 0,
+            events => [$event], messages => [$event],
+          });
+        }
+
+        $c->chat->mark_read($room, $args->{session_id}, $rows->[-1]{id})
+          if $by_cursor && @$rows;
+
+        my $mentions = $c->chat->mentions_for($room, [map { $_->{id} } @$rows]);
+        my $headers  = ($args->{format} // '') eq 'headers';
+        my @public   = map {
+          $headers
+            ? $c->chat->header_public($_, $mentions->{$_->{id}} // [])
+            : $c->chat->event_public($_,  $mentions->{$_->{id}} // [], $room)
+        } @$rows;
+
         $tool->structured_result({
-          count    => scalar @$rows,
+          count    => scalar @public,
           cursor   => $c->chat->cursor($room, $rows, $since),
           missed   => $c->chat->missed($room, $since) ? \1 : \0,
-          messages => [map { $c->chat->message_public($_) } @$rows],
+          unread   => $c->chat->unread_count($room, $args->{session_id}),
+          events   => \@public,
+          # Same reason as the REST endpoint: a loop that re-arms itself must be
+          # able to tell "the room was quiet" from "I never waited" without
+          # inspecting a count that means neither on its own.
+          timed_out => ($wait && !@$rows) ? \1 : \0,
+          # Both names for one list, exactly as the REST endpoint does it.
+          messages => \@public,
         });
       };
 
@@ -503,6 +620,88 @@ sub _tools ($server) {
       $c->inactivity_timeout($wait + 15);
 
       return $c->chat_await($room, \%query, $wait)->then($answer);
+  };
+
+  my $read_description =
+      'Read a room: one sequence of everything that has happened in it — somebody '
+    . 'speaking, somebody arriving or leaving, a rename, the room going. With "since" '
+    . 'you get everything after that event id; with since:"unread" you get what the '
+    . 'SERVER remembers you have not read, which is what lets a restarted watcher '
+    . 'remember nothing at all. Set "wait" and the call HOLDS for up to 900 seconds — '
+    . 'fifteen minutes — answering the moment something happens, and "timed_out" says '
+    . 'which it was. Use format:"headers" to catch up for hundreds of tokens instead of '
+    . 'thousands, and mentions_me together with wait to be woken only when somebody '
+    . 'actually wants you.';
+
+  _tool(
+    $server,
+    name         => 'get_room_events',
+    description  => $read_description,
+    input_schema => {%read_schema},
+    code         => $read_code,
+  );
+
+  # The name this call had before a room had an event stream. Same code, same
+  # answer; kept for one release so a session holding an older tool list is not
+  # simply broken.
+  _tool(
+    $server,
+    name         => 'get_chat_messages',
+    description  => "The previous name for get_room_events. $read_description",
+    input_schema => {%read_schema},
+    code         => $read_code,
+  );
+
+  _tool(
+    $server,
+    name        => 'fetch_chat_event',
+    description => 'One event, in full. The other half of format:"headers" — read the '
+      . 'room cheaply, then fetch only the bodies that turn out to matter. If you find '
+      . 'yourself calling this for everything, you wanted format:"full".',
+    input_schema => {
+      type       => 'object',
+      required   => [qw(room id)],
+      properties => {
+        room => _str('The room URL, or its id.'),
+        id   => {type => 'integer', description => 'The event id, from a header.'},
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      my $row = $c->chat->event($room, $args->{id})
+        or return $tool->text_result("no event $args->{id} in this room", 1);
+      return $tool->structured_result({event => $c->chat->event_public($row, [], $room)});
+    },
+  );
+
+  _tool(
+    $server,
+    name        => 'leave_chatroom',
+    description => 'Say you are done, so the roster stops showing you as present. Do this '
+      . 'when you stop watching a room: a member who has gone quiet looks exactly like one '
+      . 'who is listening, and the others will go on addressing somebody who is not there. '
+      . 'What you said stays in the room, and rejoining later with the same session id is '
+      . 'fine.',
+    input_schema => {
+      type       => 'object',
+      required   => [qw(room session_id)],
+      properties => {
+        room       => _str('The room URL, or its id.'),
+        session_id => _str('The session id you joined with.'),
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      my $member = $c->chat->leave_room($room, $args->{session_id})
+        or return $tool->text_result('nobody in that room joined with that session id', 1);
+      return $tool->text_result("Left as $member->{name}. What you said is still in the "
+          . 'room, and you can rejoin with the same session id.');
     },
   );
 
@@ -534,7 +733,7 @@ sub _tools ($server) {
       return $tool->structured_result({
         count    => scalar @$rows,
         query    => $args->{q},
-        messages => [map { $c->chat->message_public($_) } @$rows],
+        messages => [map { $c->chat->event_public($_, [], $room) } @$rows],
       });
     },
   );

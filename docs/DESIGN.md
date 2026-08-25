@@ -165,9 +165,53 @@ a person who has opened the page is already visibly present. It is posted into
 the transcript rather than only into the roster, so a session parked on `wait`
 finds out that somebody arrived and what they are doing, in one answer.
 
-### Waiting is a timer over SQLite
+### A room is one sequence of events
 
-`?wait=30` holds the request open until somebody posts. No worker sits still for
+A message was always one kind of thing that happens in a room; the table just
+did not say so — `kind` was already `message | join | system`. Making that
+explicit is what lets an arrival, a departure, a rename and the room's own death
+answer the same "what since `<id>`?" question on the same cursor.
+
+The reason is not tidiness. It is that a mutation has to be visible to a reader
+that is caching: a watcher holding message 40 has no way to learn that 40 was
+edited unless the edit is itself an event. No number of extra endpoints fixes
+that, and every side channel added to a room is one more thing a client has to
+know to ask about — which is the same as not being told.
+
+Two events have no member behind them, and carry a null `session_id` with the
+name `system`: `room.expiring`, written once by the reaper a couple of hours out
+while the room is still standing, and `room.destroyed`. That second one is the
+only event never read from the stored sequence, because the sequence it would
+belong to is being deleted in the same breath. It is synthesized for a parked
+reader — somebody demonstrably present while the room still was, and therefore
+owed an explanation. A cold read of a dead id still gets a 404: `find_room`
+cannot tell "destroyed an hour ago" from "never existed", and 410 Gone would be
+inventing knowledge we do not have.
+
+`/messages` still answers, with the list under both names. It already returned
+arrivals and renames alongside speech, so nothing about its behaviour moved.
+
+A live room upgrades into this in place, and **keeps its ids**. That is not
+tidiness either: an id is a cursor, and there are agents holding one right now.
+Renumbering would silently rewind or skip every watcher in every open room.
+
+Two things the migration could not do in SQL, so `init` does them once, guarded
+on the schema version it found before migrating. Mentions are backfilled by
+running the same matcher over the bodies that are already there — without it an
+upgraded room answers "has anyone ever addressed me?" with an empty list, which
+reads exactly like "no". And each member's read cursor is seeded from the last
+thing they said, which is the only record the old schema kept of where anybody
+had got to; starting everyone at zero would hand every upgraded session the whole
+room as unread on its first `since=unread`, which is the expensive re-read this
+release exists to stop.
+
+Nobody has a member token after an upgrade, and one cannot be granted out of
+band — the plaintext exists for a single moment. So reconnecting issues one, and
+reconnecting is what an agent does.
+
+### Waiting is a timer over SQLite, and there is still no bus
+
+`?wait=900` holds the request open until somebody posts. No worker sits still for
 it: the wait is a `Mojo::IOLoop` timer that re-reads one indexed row range twice
 a second and resolves a promise.
 
@@ -184,6 +228,36 @@ query every half second, which is a smaller number than the reconnect storm a
 limiter would cause. Posting is where the writes are, and that is where the
 bucket is — a separate one from uploads, so a busy room never stops anybody
 sharing a file.
+
+The ceiling went from sixty seconds to fifteen minutes, and that is the whole
+feature: a backgrounded `curl --max-time 960` exits when the room needs you,
+which makes it a wake-up rather than a poll. The old sixty was justified by a
+comment saying a proxy in front of this, and every MCP client's own patience, is
+comfortably inside its own timeout — and neither assumption had ever been
+tested. It is configuration now rather than a constant for exactly that reason:
+a deployment that disagrees lowers `SHARE_CHAT_MAX_WAIT` instead of making every
+watcher go back to asking in a loop.
+
+There were **two** ceilings, forty lines apart — one in `share.pl` and one in
+`Share::MCP` — so changing one silently held. Both come from the same number
+now, and a test drives that number down and checks the MCP tool honours it,
+because the obvious test (ask for a long wait, post into it) passes whichever
+ceiling applied.
+
+A shared bus was considered again at fifteen minutes and rejected on the
+arithmetic. One waiter at `wait=900` costs about 1,800 indexed lookups against a
+database that does on the order of 100,000 a second; twenty concurrent waiters
+is roughly 0.04% of one core. A second service and a second code path is a lot
+to pay for noise, against a project whose stated properties are a five-line
+dependency list and one directory holding the whole state. The thresholds that
+would change the answer are visible ones: more than one instance behind a room,
+or hundreds of waiters on one of them.
+
+What the long wait did break, and this is the part worth remembering: a room
+deleted underneath a parked reader used to leave it polling a room that no longer
+existed until its deadline. Invisible at sixty seconds; a held connection doing
+nothing for a quarter of an hour at nine hundred. The poll re-checks the room
+and settles with `room.destroyed`.
 
 One promise, two callers: the REST route renders from it, and the MCP tool
 returns it, which `MCP::Server` awaits. That is the one place this server
