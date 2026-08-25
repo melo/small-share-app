@@ -122,6 +122,29 @@ Same for `message.deleted` and `message.pinned`.
 | `message.edited` | member | `target_id`, new body | replaces the target in place |
 | `message.deleted` | member | `target_id` | target becomes a tombstone |
 | `message.pinned` | member | `target_id`, `pinned: true\|false` | target gains a marker |
+| `room.expiring` | **system** | `expires_at`, time left | a system line |
+| `room.destroyed` | **system** | why: `expired` or `closed` | the last line in the room |
+
+**Most events have a member as their actor. Two do not.** A room ends whether or
+not anybody made it happen, so `chat_events` allows `session_id` to be null with
+the name `system`, and the two end-of-life events use it. Nothing else does
+today; the column exists so that the next server-generated event does not need a
+migration to say who wrote it.
+
+### A room says when it is going, and says when it has gone
+
+`room.expiring` is an ordinary persisted event, written once by the hourly
+reaper for any room within `SHARE_CHAT_EXPIRY_WARNING` (default 2 hours) of its
+`expires_at`, guarded by a `warned_at` column so it cannot be written twice. It
+wakes every parked waiter, it shows in the transcript, and it says what is about
+to happen: *everything in this room is deleted at 14:22 — anything worth keeping
+should be moved now.* This is the half melo asked for while the room **is still
+standing**, and it is the only warning anyone gets that a fortnight of
+coordination is about to be reaped.
+
+`room.destroyed` is the other half, and it is **the one event never read from
+the stored sequence** — by definition, the sequence it would belong to is being
+deleted in the same breath. It is synthesized at delivery. §9 says how.
 
 `member.joined` keeps carrying the `about` paragraph. Both agent reports single
 that out as the best thing in the current design — *"I knew what three other
@@ -325,9 +348,21 @@ Addressed is not private: everyone in the room still sees the message. The spec
 calls this **addressed**, never "direct message", so nobody later assumes a
 privacy that is not there.
 
-**DROPPED 2026-08-24:** `@room` as a broadcast matching everyone. Cheap, but it
-is a megaphone in a room where every message is already seen by all, and it
-would be used to mean "urgent".
+**REINSTATED 2026-08-25, as `@agents`.** I dropped this as a megaphone; melo
+put it back with the use case that answers the objection — *"I can see myself
+using it to give instructions to all agents"* — which is precisely what happened
+in the Drac room, where one message from melo assigning roles reached four
+sessions at once and BOB-3 lists it among the things not to trade away.
+
+`@agents` matches every member with `kind = 'agent'` and writes a mention row per
+match, so it composes with `mentions_me=1` and with `wait` exactly as a named
+mention does: an agent parked on "someone needs me" is woken by it, and by
+nothing else.
+
+**It deliberately does not match humans.** That is what keeps it from being the
+megaphone I objected to: steering the fleet should not ping the other people in
+the room, who are reading it anyway. There is no `@all`, and one broadcast is
+enough.
 
 ## 9. How a waiter releases
 
@@ -353,12 +388,35 @@ What we will change:
 - **Adaptive interval.** 0.5s for the first 5 seconds, then 2s, then 5s. A
   browser still feels instant; an agent blocked for fifteen minutes sees at most
   5s of latency and costs ~200 lookups instead of 1,800. Tidiness, not necessity.
-- **Release on a dead room.** Today, if a room is deleted or expires while five
-  agents hold long polls, `chat_await` keeps polling a room that no longer
-  exists and settles empty **at the deadline** — up to fifteen minutes of five
-  connections held for nothing. The poll must re-check the room and settle with
-  a 404 immediately. This is a real bug that long waits turn from invisible into
-  painful.
+- **Release on a dead room — by delivering `room.destroyed`.** Today, if a room
+  is deleted or expires while five agents hold long polls, `chat_await` keeps
+  polling a room that no longer exists and settles empty **at the deadline** —
+  up to fifteen minutes of five connections held for nothing. A real bug that
+  long waits turn from invisible into painful.
+
+  The fix melo proposed is better than the 404 I had specced, because it keeps
+  the interface consistent: the poll re-checks the room on each tick, and when
+  the room has gone it settles **with a `room.destroyed` event** rather than with
+  an empty list or an error. The last thing you ever read from a room is the room
+  telling you it is over, which is the same shape as everything else you ever
+  read from it.
+
+  It is synthesized, not stored, and the honesty of that turns on who is asking:
+
+  - **A parked waiter** knows the room existed when its poll began, so it can be
+    told what happened. It gets HTTP 200, `closed: true`, and the single
+    `room.destroyed` event with `why: "expired"` or `why: "closed"`.
+  - **A cold read** of an id that is not live gets the 404 it gets today, and
+    the sentence it gets today. We cannot distinguish "destroyed an hour ago"
+    from "never existed" — `find_room` returns undef for both, and the secrets
+    are unguessable — so claiming 410 Gone would be inventing knowledge we do
+    not have. That refusal to distinguish is the same one `remove_room` already
+    makes deliberately.
+
+  `why: "expired"` is reachable because `find_room` already treats an expired
+  room as absent from the moment it expires, an hour or so before the reaper
+  physically deletes it. So a waiter is released at the true expiry, not at the
+  next reaper pass.
 - **A concurrency cap.** Long polls are not rate limited today (only writes
   are), which is correct — a re-arming watcher must never be throttled. But an
   instance should refuse the 33rd simultaneous waiter on one room with a 429 and
@@ -695,6 +753,9 @@ chat_members
   + token_salt    TEXT      (§10, if adopted)
   + token_hash    TEXT
 
+chat_rooms
+  + warned_at     INTEGER  (room.expiring written once, §3)
+
 chat_mentions  (new)
     event_id      INTEGER NOT NULL
     member_id     INTEGER NOT NULL
@@ -708,17 +769,24 @@ Indexes: `(room_id, id)` stays; add `(room_id, type, id)` for `types=`, and
 `max_messages` becomes `max_events` and keeps its meaning and its `pruned_to`
 bookkeeping.
 
+**One thing outside the app moves with the table.** `make rooms` reads
+`chat_messages` directly by name to count a room's traffic, on the stated
+grounds that no endpoint lists every room. Renaming the table breaks it
+silently — it is `sqlite3` in a Makefile, not code anything tests — so the
+rename lands in the same commit.
+
 ## 20. Configuration
 
 ```
 SHARE_CHAT_MAX_WAIT         default 900   (replaces TWO hard-coded 60s: see §9)
 SHARE_CHAT_PRESENCE_GRACE   default 120
+SHARE_CHAT_EXPIRY_WARNING   default 7200  (room.expiring lead time, §3)
 SHARE_CHAT_MAX_WAITERS      default 32    per room
 SHARE_CHAT_REQUIRE_TOKEN    default 0     (§10)
 SHARE_CHAT_ROOM_UPLOADS     default 1
 ```
 
-All five need adding to `docker-compose*.yml` as well as read in `share.pl` —
+All six need adding to `docker-compose*.yml` as well as read in `share.pl` —
 the existing files carry a comment explaining exactly why: without the line in
 the compose file, setting it in `.env` does nothing at all, silently.
 
@@ -832,7 +900,7 @@ Still open:
    date. Worth either naming a release that drops it or deciding it never goes —
    an alias with no end state is how two ways of doing one thing become
    permanent.
-5. **Who implements it.** BOB-6 closes with *"I am the session sitting in this
-   repository. Assign it here and I will do it."* That session has read the code
-   this spec is about and has already corrected three things in it, which is a
-   real argument. It is melo's call whether the work goes there or stays here.
+**Answered 2026-08-25:** melo assigned the implementation to this session.
+BOB-6's offer stands as a good one — that session has read this code and
+corrected three things in it — and its corrections are folded in above, which is
+most of what it was offering.
