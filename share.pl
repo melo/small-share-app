@@ -1984,7 +1984,7 @@ curl -H content-type:application/json '<%= $c->base_url %>/api/v1/files' \
       </div>
       <ul class="roster">
         % for my $m (@{$room->{members}}) {
-        <li class="<%= $m->{session_id} eq $me->{session_id} ? 'is-me' : '' %>">
+        <li class="<%= ($m->{author} // '') eq ($me->{author} // '') ? 'is-me' : '' %>">
           <span class="roster-name"><%= $m->{name} %></span>
           <span class="roster-kind"><%= $m->{kind} %></span>
           % if (defined $m->{about}) {

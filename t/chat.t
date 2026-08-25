@@ -554,7 +554,7 @@ subtest 'MCP: the room tools are there, and they are about coordination' => sub 
     search_chat_messages delete_chatroom);
 
   like $tools{create_chatroom}{description}, qr/other sessions/, 'create says what it is for';
-  like $tools{get_chat_messages}{description}, qr/HOLDS until/, 'and reading says it can wait';
+  like $tools{get_chat_messages}{description}, qr/HOLDS for up to/, 'and reading says it can wait';
   like $tools{post_chat_message}{description}, qr/No attachments/,
     'and posting says where a file goes';
 
@@ -1219,6 +1219,57 @@ subtest 'writing can be made to require the token' => sub {
   # Reading is not affected: the URL is still the read credential, which is what
   # a room URL has always meant.
   $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200);
+};
+
+subtest 'MCP: the tools an agent needs to be a listener that costs nothing' => sub {
+  my $tools = _mcp('tools/list')->{result}{tools};
+  my %have  = map { $_->{name} => $_ } @$tools;
+
+  ok $have{get_room_events},   'reading the sequence has the name the sequence has';
+  ok $have{get_chat_messages}, 'and the old name still answers, for one release';
+  ok $have{fetch_chat_event},  'a headers reader can get one body';
+  ok $have{leave_chatroom},    'and say when it is done';
+
+  like $have{get_room_events}{description}, qr/900|fifteen minutes/i,
+    'the description says how long it can park, or no agent will park';
+  like $have{get_room_events}{description}, qr/headers/i,
+    'and that a cheap read exists, or nobody will use it';
+  like $have{join_chatroom}{description}, qr/rename/i,
+    'joining says that calling it again renames you, which it always did silently';
+};
+
+subtest 'MCP: park, be woken by a mention, then leave' => sub {
+  my $id = _room(topic => 'mcp watcher')->{room}{id};
+  my $joined = _call(join_chatroom => {room => $id, session_id => 'sess-mcp',
+    name => 'watcher', about => 'mcp test'})->{structuredContent};
+  ok length($joined->{member_token} // ''), 'join issues a token';
+
+  _join($id, session_id => 'sess-mate', name => 'mate', about => 'the other one');
+
+  Mojo::IOLoop->timer(0.2 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-mate', body => 'ignore me') });
+  Mojo::IOLoop->timer(0.6 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-mate', body => 'yours @watcher') });
+
+  my $out = _call(get_room_events => {room => $id, session_id => 'sess-mcp',
+    since => 'unread', wait => 10, mentions_me => 1, format => 'headers'})
+    ->{structuredContent};
+  is $out->{count}, 1, 'woken once, by the one that concerned it';
+  like $out->{events}[0]{preview}, qr/yours/, 'and handed a header, not an essay';
+  ok !exists $out->{events}[0]{body}, 'which is the whole point';
+
+  my $one = _call(fetch_chat_event => {room => $id, id => $out->{events}[0]{id}})
+    ->{structuredContent};
+  is $one->{event}{body}, 'yours @watcher', 'and the body when it turns out to matter';
+
+  my $left = _call(leave_chatroom => {room => $id, session_id => 'sess-mcp'});
+  ok !$left->{isError}, 'leaving is a call now';
+
+  my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  my ($gone) = grep { $_->{name} eq 'watcher' } @{$room->{members}};
+  is $gone->{presence}, 'gone', 'and the roster believes it';
 };
 
 done_testing;
