@@ -20,6 +20,37 @@ per-name migrations, `MCP::Server`, `Test::Mojo`. No new runtime dependency.
 §4, §5, §6, §9, §10 and §11 before starting. This plan implements Phase 1 and
 Phase 2 of §23; Phases 3–6 get their own plans.
 
+## Status: done, 2026-08-25
+
+All thirteen tasks are implemented on `chat-events`, one commit each (Tasks 1 and
+2 merged - see below). `make test` and `make coverage` are green: **95.7%
+statement coverage against the 90% floor.** Verified against a running server and
+not only in tests: a backgrounded `curl` with `wait=30&mentions_me=1` woke on the
+mention and not on the chatter, in 536 bytes; `post` handed back the two-message
+gap; a parked reader was released with `room.destroyed` two seconds after the
+room was deleted rather than at its deadline.
+
+Four things this plan got wrong, each found by a failing test rather than by
+reading, and corrected in the commits:
+
+1. **Tasks 1 and 2 cannot be separated.** Renaming `kind` to `type` forces
+   `_write` onto the new column in the same breath; a `_write` still inserting
+   `kind` fails against a table that no longer has one.
+2. **The migration rebuilds `chat_events` rather than altering it.** `session_id`
+   has to become nullable and SQLite will not drop a `NOT NULL` in place.
+3. **`since=unread` auto-advances, so an explicit ack can only move forward.**
+   Task 6's test acknowledged a lower id after an `unread` read, which is a no-op
+   by design. The ack belongs with an explicit-cursor read.
+4. **Session ids had to stop being published everywhere, not just in the
+   template.** `data-session`, `event_public` and `member_public` all carried
+   them. They are replaced by an author key derived from the session id and
+   salted with the room secret.
+
+Still open, as the plan predicted: **the proxy measurement needs a real
+deployment** and the procedure is now in MAINTAINING.md; `member.presence` events
+are not written, only roster presence, and they wait for the browser that
+consumes them in Phase 4.
+
 ## Global Constraints
 
 - **No new runtime dependency** without an argument in the PR. The list is five
