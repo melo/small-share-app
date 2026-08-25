@@ -423,9 +423,11 @@ sub _tools ($server) {
   _tool(
     $server,
     name        => 'post_chat_message',
-    description => 'Say something in a room you have joined. Markdown. No attachments: '
-      . 'share the file with get_upload_url and put its URL in the message, which is how '
-      . 'the human reading along gets to see it too.',
+    description => 'Say something in a room you have joined. Markdown. The result '
+      . 'tells you what landed while you were not looking — "unread", and the headers '
+      . 'of what you missed — because the moment you post is the one moment you are '
+      . 'provably listening. No attachments: share the file with get_upload_url and put '
+      . 'its URL in the message, which is how the human reading along gets to see it too.',
     input_schema => {
       type       => 'object',
       required   => [qw(room session_id body)],
@@ -441,8 +443,21 @@ sub _tools ($server) {
       return $tool->text_result(_no_room($id), 1) unless $room;
 
       my $row = $c->chat->post($room, session_id => $args->{session_id}, body => $args->{body});
-      return $tool->structured_result(
-        {message => $c->chat->message_public($row), cursor => 0 + $row->{id}});
+
+      # The same gap the REST endpoint hands back, for the same reason: a cursor
+      # that silently jumped is how an agent spends thirty seconds answering a
+      # question a message it had not read already refined.
+      my $behind = $c->chat->messages($room,
+        since => $c->chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
+      $behind = [grep { $_->{id} != $row->{id} } @$behind];
+      $c->chat->mark_read($room, $args->{session_id}, $row->{id});
+
+      return $tool->structured_result({
+        message => $c->chat->event_public($row),
+        cursor  => 0 + $row->{id},
+        unread  => scalar @$behind,
+        missed  => [map { $c->chat->header_public($_) } @$behind],
+      });
     },
   );
 

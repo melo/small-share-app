@@ -901,8 +901,32 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
   my $row = eval { $chat->post($room, %$args) };
   return _api_error($c, 400, $@) if $@;
 
-  $c->render(json => {message => $chat->message_public($row), cursor => 0 + $row->{id}},
-    status => 201);
+  # What landed while this caller was not looking.
+  #
+  # The server has known this all along — it has the room and it has the member's
+  # read cursor — and until now the acknowledgement spent that knowledge saying
+  # {"cursor": 9}. Two separate sessions lost work to the silence: one answered a
+  # question that an unread message had already refined, the other had six
+  # questions put to it and did not see them for four and a half hours.
+  #
+  # Posting is the one moment an agent is provably listening. This is the cheapest
+  # possible thing to do with that.
+  my $behind = $chat->messages($room,
+    since => $chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
+  $behind = [grep { $_->{id} != $row->{id} } @$behind];
+
+  # And it catches you up, because you have just been handed the gap.
+  $chat->mark_read($room, $args->{session_id}, $row->{id});
+
+  $c->render(json => {
+    message => $chat->event_public($row),
+    cursor  => 0 + $row->{id},
+    # A ceiling, not a page size: a caller further behind than this should read
+    # properly rather than have an acknowledgement quietly become a catch-up.
+    # `unread` is the true count either way, so nothing is hidden.
+    unread  => scalar @$behind,
+    missed  => [map { $chat->header_public($_) } @$behind],
+  }, status => 201);
 });
 
 # ------------------------------------------------------------------- MCP -----

@@ -686,7 +686,10 @@ subtest 'the sequence is events, and the old rows kept their meaning' => sub {
     $room->{id})->arrays->flatten->to_array;
   is_deeply $types, ['member.joined', 'message'], 'join became member.joined';
 
-  my $m = $db->query('SELECT * FROM chat_members WHERE session_id = ?', 'sess-m')->hash;
+  # A member who has only arrived: posting is what moves a read cursor, and
+  # sess-m has posted.
+  _join($id, session_id => 'sess-m2', name => 'lurker', about => 'joined and said nothing');
+  my $m = $db->query('SELECT * FROM chat_members WHERE session_id = ?', 'sess-m2')->hash;
   is $m->{read_cursor},   0, 'read_cursor starts at zero';
   is $m->{waiting_until}, 0, 'waiting_until starts at zero';
   is $m->{left_at},   undef, 'nobody has left';
@@ -885,6 +888,33 @@ subtest 'a park can start from where you left off' => sub {
   # And the park advanced the stored cursor too, so re-arming is not a re-read.
   $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u")
     ->status_is(200)->json_is('/count' => 0);
+};
+
+subtest 'the moment you post is the moment you are provably listening' => sub {
+  my $id = _room(topic => 'crossing')->{room}{id};
+  _join($id, session_id => 'sess-x', name => 'talker', about => 'gap test');
+  _join($id, session_id => 'sess-y', name => 'other',  about => 'gap test');
+
+  # Catch up, so the gap below is unambiguous.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-x");
+
+  # Two things are said while sess-x is not looking. This is the exact failure
+  # from the field: a cursor that went 11 -> 15 -> 21 and never said why.
+  _post($id, 'sess-y', 'you missed this');
+  _post($id, 'sess-y', 'and this');
+
+  my $res = _post($id, 'sess-x', 'saying my piece');
+  is $res->{unread}, 2, 'the acknowledgement says how far behind you were';
+  is scalar @{$res->{missed}}, 2, 'and hands the gap over';
+  is $res->{missed}[0]{preview}, 'you missed this', 'as headers, not as bodies';
+  ok !exists $res->{missed}[0]{body}, 'because the whole point was to be cheap';
+  ok !grep({ $_->{id} == $res->{message}{id} } @{$res->{missed}}),
+    'and never the message just posted, which is in the answer already';
+
+  # Posting caught you up, so the next one has nothing to report.
+  my $next = _post($id, 'sess-x', 'again');
+  is $next->{unread}, 0, 'posting marks you current';
+  is_deeply $next->{missed}, [], 'so there is nothing to hand back';
 };
 
 done_testing;
