@@ -55,6 +55,9 @@ has max_messages => 5000;
 # rather than thousands.
 has preview_chars => 160;
 
+# How long after a member was last seen the room stops calling them present.
+has presence_grace => 120;
+
 # What can happen in a room.
 #
 # The sequence is the whole interface — "everything since <id>" has to mean
@@ -335,6 +338,9 @@ sub join_room ($self, $room, %args) {
       name_key     => lc $name,
       about        => $about // $existing->{about},
       last_seen_at => $now,
+      # Coming back is not a second member and not a resurrection: it is the
+      # same participant, here again.
+      left_at      => undef,
     },
     {id => $existing->{id}}
   );
@@ -350,6 +356,66 @@ sub member ($self, $room, $session_id) {
   return undef unless defined $session_id && length $session_id;
   return $self->sql->db->query('SELECT * FROM chat_members WHERE room_id = ? AND session_id = ?',
     $room->{id}, $session_id)->hash;
+}
+
+# What the roster can honestly say about somebody.
+#
+# `last_seen_at` was never "last spoke" — touch_member fires on every READ as
+# well as every post, from five call sites — so it was always a better presence
+# signal than it was given credit for. What it cannot survive is a fifteen-minute
+# park: the member is silent that whole time while genuinely listening, and any
+# grace window short enough to spot a dead session would mark a live listener
+# away. So a waiter records how long it means to be there, and holding an open
+# poll IS the presence signal. Nobody has to remember to say anything.
+sub presence ($self, $member, $now = time) {
+  return 'gone'      if $member->{left_at};
+  return 'listening' if ($member->{waiting_until} // 0) > $now;
+  return 'idle'      if $member->{last_seen_at} > $now - $self->presence_grace;
+  return 'away';
+}
+
+# Dropping out was posting a goodbye and hoping. Two agents did exactly that in
+# one afternoon, and the roster went on listing both as present -- which looks
+# identical to two that are listening, and is how you end up addressing nobody.
+sub leave_room ($self, $room, $session_id) {
+  my $member = $self->member($room, $session_id) or return undef;
+  return $member if $member->{left_at};
+
+  $self->sql->db->query('UPDATE chat_members SET left_at = ?, waiting_until = 0 WHERE id = ?',
+    time, $member->{id});
+  $self->_write($room, $session_id, $member->{name}, 'member.left' => '');
+  return $self->member($room, $session_id);
+}
+
+# "I will be here until T", and "I have let go". Both are bookkeeping and neither
+# is ever a reason to fail a read -- the same rule, and the same reason, as
+# touch_member.
+sub hold ($self, $room, $session_id, $seconds) {
+  return unless defined $session_id && length $session_id;
+  eval {
+    $self->sql->db->query(
+      'UPDATE chat_members SET waiting_until = ?, last_seen_at = ? '
+        . 'WHERE room_id = ? AND session_id = ?',
+      time + $seconds, time, $room->{id}, $session_id);
+    1;
+  } or do {
+    $self->log->warn("chat: hold failed (carrying on): " . ($@ // '')) if $self->log;
+  };
+  return;
+}
+
+sub release ($self, $room, $session_id) {
+  return unless defined $session_id && length $session_id;
+  eval {
+    $self->sql->db->query(
+      'UPDATE chat_members SET waiting_until = 0, last_seen_at = ? '
+        . 'WHERE room_id = ? AND session_id = ?',
+      time, $room->{id}, $session_id);
+    1;
+  } or do {
+    $self->log->warn("chat: release failed (carrying on): " . ($@ // '')) if $self->log;
+  };
+  return;
 }
 
 sub members ($self, $room) {
@@ -663,6 +729,7 @@ sub room_public ($self, $room, $base_url, %opt) {
 }
 
 sub member_public ($self, $member) {
+  my $presence = $self->presence($member);
   return {
     session_id   => $member->{session_id},
     name         => $member->{name},
@@ -670,6 +737,12 @@ sub member_public ($self, $member) {
     kind         => $member->{kind},
     joined_at    => iso8601($member->{joined_at}),
     last_seen_at => iso8601($member->{last_seen_at}),
+    presence     => $presence,
+    online       => ($presence eq 'listening' || $presence eq 'idle') ? \1 : \0,
+    # How far they have read. A crude "has not read anything since 7" in the
+    # roster is what would have told one agent to stop waiting on another and ask
+    # the human instead -- which is what it eventually did, hours later.
+    read_cursor  => 0 + ($member->{read_cursor} // 0),
   };
 }
 

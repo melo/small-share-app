@@ -865,8 +865,17 @@ my $read_events = sub ($c) {
 
   return $answer->($chat->messages($room, %query)) unless $wait;
 
+  # An open poll is what says this member is listening, so it is claimed for as
+  # long as the park intends to last and given up the moment it ends -- however
+  # it ends. Leaving the claim standing to its deadline would make a session that
+  # hung up fifteen minutes ago look like the most attentive member in the room.
+  $chat->hold($room, $session, $wait);
+
   $c->render_later;
-  $c->chat_await($room, \%query, $wait)->then(sub ($rows) { $answer->($rows, waited => 1) });
+  $c->chat_await($room, \%query, $wait)->then(sub ($rows) {
+    $chat->release($room, $session);
+    $answer->($rows, waited => 1);
+  });
 };
 
 # One event in full, for a caller reading headers that decided it wants the body
@@ -881,6 +890,14 @@ $api->get('/chatrooms/<room:id>/events/<event>' => sub ($c) {
 # "I have processed up to here." Separate from reading, because a watcher that
 # crashes between reading and acting should be able to come back to the work it
 # had not finished rather than to the messages it had merely received.
+# Leaving. A call, not an announcement -- see Share::Chat::leave_room.
+$api->delete('/chatrooms/<room:id>/members/<session>' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $member = $chat->leave_room($room, $c->stash('session'))
+    or return _api_error($c, 404, 'nobody here by that session id');
+  $c->render(json => {left => $member->{name}, room => $room->{secret}});
+});
+
 $api->post('/chatrooms/<room:id>/members/<session>/read' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
   my $args = eval { _chat_args($c, qw(cursor)) };
@@ -1258,6 +1275,15 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
     # How far behind this caller still is. One integer, and it answers the
     # question that previously took re-reading the room and reasoning about it.
     unread   => $chat->unread_count($room, $opt{session}),
+    # Off unless asked for. The roster is one call away and never reaches the
+    # place it is needed, which is a real complaint -- but attaching it to every
+    # answer would undo format=headers, whose entire purpose is that a watcher
+    # re-arming a thousand times pays hundreds of tokens rather than thousands.
+    # Under an event stream it is not needed on every read anyway: departures and
+    # arrivals arrive as events, so a member that joined is kept current by the
+    # sequence. This is for wanting a fresh snapshot without rejoining.
+    ($c->param('roster')
+      ? (members => [map { $chat->member_public($_) } @{$chat->members($room)}]) : ()),
     messages => \@messages,
   });
 }

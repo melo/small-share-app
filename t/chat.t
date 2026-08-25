@@ -1019,4 +1019,83 @@ subtest 'a park on being wanted is not woken by ordinary chatter' => sub {
     ->json_is('/events/0/body' => 'over to you @bravo');
 };
 
+subtest 'leaving is a call, and the roster stops lying about it' => sub {
+  my $id = _room(topic => 'presence')->{room}{id};
+  _join($id, session_id => 'sess-s', name => 'stayer', about => 'presence test');
+  _join($id, session_id => 'sess-g', name => 'goer',   about => 'presence test');
+  _post($id, 'sess-g', 'something worth keeping');
+
+  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-g")->status_is(200)
+    ->json_is('/left' => 'goer');
+
+  my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  my ($gone) = grep { $_->{name} eq 'goer' } @{$room->{members}};
+  is $gone->{presence}, 'gone', 'the roster says so instead of leaving everyone to guess';
+  is $gone->{online}, Mojo::JSON->false, 'and is plainly not here';
+
+  # The departure is an event, so a parked watcher learns about it.
+  my $ev = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  is $ev->{events}[-1]{type}, 'member.left', 'and it is in the sequence like everything else';
+
+  # Their words stay. The author's name is denormalised onto every row precisely
+  # so a transcript reads the way it read at the time.
+  ok scalar(grep { ($_->{body} // '') eq 'something worth keeping' } @{$ev->{events}}),
+    'what they said outlives them';
+
+  # Leaving twice is not two events.
+  my $before = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{count};
+  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-g")->status_is(200);
+  is $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{count}, $before,
+    'saying goodbye twice is still one goodbye';
+
+  # Coming back clears it rather than making a second member.
+  _join($id, session_id => 'sess-g', name => 'goer', about => 'back again');
+  $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
+  ($gone) = grep { $_->{name} eq 'goer' } @{$room->{members}};
+  isnt $gone->{presence}, 'gone', 'rejoining is not resurrection, it is just being here';
+  is scalar @{$room->{members}}, 2, 'and it is still two people';
+
+  # Somebody who was never here cannot leave.
+  $t->delete_ok("/api/v1/chatrooms/$id/members/never-here")->status_is(404);
+};
+
+subtest 'holding a poll is what says you are listening' => sub {
+  my $id = _room(topic => 'listening')->{room}{id};
+  _join($id, session_id => 'sess-l', name => 'listener', about => 'poll presence');
+
+  # Parked, with nothing to find, so the park is genuinely open while the roster
+  # is read from underneath it.
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+  my $seen;
+  Mojo::IOLoop->timer(0.4 => sub {
+    my $room = $t->app->chat->find_room($id);
+    my ($me) = grep { $_->{session_id} eq 'sess-l' } @{$t->app->chat->members($room)};
+    $seen = $t->app->chat->presence($me);
+  });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=2&session_id=sess-l")
+    ->status_is(200);
+  is $seen, 'listening', 'an open poll is the presence signal, with nobody saying anything';
+
+  # And letting go of it stops the claim, rather than leaving it standing until
+  # a deadline that can now be fifteen minutes away.
+  my $room = $t->app->chat->find_room($id);
+  my ($me) = grep { $_->{session_id} eq 'sess-l' } @{$t->app->chat->members($room)};
+  is $t->app->chat->presence($me), 'idle', 'and the claim ends when the poll does';
+};
+
+subtest 'a roster comes with a read only when it is asked for' => sub {
+  my $id = _room(topic => 'roster on reads')->{room}{id};
+  _join($id, session_id => 'sess-o', name => 'planner', about => 'roster test');
+
+  my $bare = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  ok !exists $bare->{members}, 'off by default, because headers exist to be cheap';
+
+  my $with = $t->get_ok("/api/v1/chatrooms/$id/events?roster=1")->tx->res->json;
+  is $with->{members}[0]{name}, 'planner', 'and on request it is the roster you know';
+  is $with->{members}[0]{presence}, 'idle', 'with presence on it';
+  ok exists $with->{members}[0]{read_cursor},
+    'and how far they have read, which is what tells you to stop waiting on them';
+};
+
 done_testing;
