@@ -130,7 +130,7 @@ subtest 'a room is one URL, and the URL explains itself to whoever fetches it' =
   # The whole protocol, in the answer, because the agent on the other end of
   # this URL may have no MCP server registered and nothing else to read.
   like $made->{how_to}, qr/JOIN FIRST/,               'the briefing says to join first';
-  like $made->{how_to}, qr/wait=30/,                  'and that waiting beats polling';
+  like $made->{how_to}, qr/wait=900/, 'and that parking beats polling';
   like $made->{how_to}, qr/case-insensitive\s+substring/s, 'and what grep means here';
   like $made->{how_to}, qr/NO ATTACHMENTS/,           'and that files go through the file side';
   like $made->{how_to}, qr{https://share\.example\.test/api/v1/files},
@@ -142,7 +142,7 @@ subtest 'a room is one URL, and the URL explains itself to whoever fetches it' =
   # the same briefing. This is the path an agent takes when a person pastes the
   # URL into its conversation.
   $t->get_ok("/c/$id")->status_is(200)->content_type_like(qr{application/json})
-    ->json_is('/room/id' => $id)->json_has('/how_to')->json_has('/endpoints/wait')
+    ->json_is('/room/id' => $id)->json_has('/how_to')->json_has('/endpoints/watch')
     ->json_has('/curl/post');
 
   # …and it does NOT carry the delete password, which was disclosed once.
@@ -1270,6 +1270,41 @@ subtest 'MCP: park, be woken by a mention, then leave' => sub {
   my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
   my ($gone) = grep { $_->{name} eq 'watcher' } @{$room->{members}};
   is $gone->{presence}, 'gone', 'and the roster believes it';
+};
+
+subtest 'the URL still explains the whole of how to take part' => sub {
+  my $id  = _room(topic => 'briefing')->{room}{id};
+  my $how = $t->get_ok("/c/$id" => {Accept => 'application/json'})->status_is(200)
+    ->tx->res->json->{how_to};
+
+  like $how, qr{/events},        'the sequence is named';
+  like $how, qr/wait=900/,       'and how long you may park on it';
+  like $how, qr/timed_out/,      'and how to tell a quiet room from a busy one';
+  like $how, qr/since=unread/,   'and that the server keeps your place';
+  like $how, qr/format=headers/, 'and that a cheap read exists';
+  like $how, qr/\@agents/,       'and how to reach the whole fleet';
+  like $how, qr/mentions_me/,    'and how to be woken only when wanted';
+  like $how, qr/markdown/i,      'and what the person on the other end sees';
+  like $how, qr/mermaid/i,       'and what they do not';
+  like $how, qr/member_token/,   'and the credential it just handed out';
+  # BOB-3's closing note: the room carried key fingerprints and host names, and
+  # the URL that opens it is a bearer token being pasted between sessions.
+  like $how, qr/bearer|anyone who holds/i, 'and that the URL is the secret';
+
+  # An agent that arrived through a tool reads the same text as one that curled
+  # the URL -- that is the whole reason there is one briefing and not three.
+  my $viatool = _call(create_chatroom => {topic => 'same words'})->{structuredContent};
+  is $viatool->{how_to}, $t->get_ok('/c/' . $viatool->{room}{id} => {Accept => 'application/json'})
+    ->tx->res->json->{how_to}, 'and both doors hand over the same words';
+};
+
+subtest 'the MCP instructions answer what nobody could find out by trying' => sub {
+  my $text = _mcp('server/discover')->{result}{instructions} // '';
+
+  like $text, qr/markdown/i, 'markdown is rendered, which no description said';
+  like $text, qr/mermaid/i,  'and mermaid is not, which none of them said either';
+  like $text, qr/16 ?KB|16384|16 kilobytes/i, 'and how long a message may be';
+  like $text, qr/\@agents/,  'and how one message reaches the fleet';
 };
 
 done_testing;

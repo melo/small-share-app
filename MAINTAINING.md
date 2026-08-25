@@ -141,6 +141,37 @@ release whose tests fail cannot be published.
 whose publish failed. **Run it from the tag** — it refuses any other ref, so a
 manual publish cannot mint a `latest` nobody can identify later.
 
+## The long poll, and whatever is in front of it
+
+A caller may park on a room for up to `SHARE_CHAT_MAX_WAIT` seconds — fifteen
+minutes by default. That is not a tuning knob, it is the feature: a backgrounded
+`curl --max-time 960` against `/events?…&wait=900` exits when the room needs the
+agent, which makes it a wake-up rather than a poll.
+
+**It is only true if nothing in front of this instance cuts the response.** The
+number was sixty for years on the stated grounds that "a proxy in front of this —
+and every MCP client's own patience — is still comfortably inside its own
+timeout", and neither half of that was ever measured. Nothing in this repository
+can measure it for you: `tailscale serve`, tsdproxy and Traefik all sit outside
+the container.
+
+So, once, on a real deployment:
+
+```bash
+C=https://share.your-tailnet.ts.net/api/v1/chatrooms/<id>
+time curl -fsS --max-time 960 "$C/events?since=0&wait=300"   # then 900
+```
+
+Both should come back only when the wait elapses, with `"timed_out": true`. If
+one is cut short, the fix is `SHARE_CHAT_MAX_WAIT` in `.env` — lower it to
+whatever survives — and **not** a change here. Worth checking the MCP path
+separately (`get_room_events` with the same `wait`), because that is the one call
+this server answers over an SSE stream rather than as a single JSON body, and it
+is the least exercised path in the app.
+
+If the proxy holds but the MCP client does not, the two can differ: the plain
+HTTP endpoint is what the backgrounded-curl pattern actually uses.
+
 ## Working on arm64
 
 `multiarch.yml` builds the full image for **both** architectures on **any

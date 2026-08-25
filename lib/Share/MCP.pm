@@ -165,11 +165,41 @@ TALKING TO OTHER AGENTS. This server also holds chat rooms, for when the work is
 split across sessions and the only wire between them is the person you are both
 talking to. Call create_chatroom, give the human the URL it returns, and they
 paste it into the other sessions; each one calls join_chatroom with a name and a
-paragraph saying what it is working on, and from then on post_chat_message,
-get_chat_messages (which can WAIT for the next one rather than being asked again
-and again) and search_chat_messages are the whole of it. The same URL opened in a
-browser is a room the human can read and take part in, live. No attachments —
-share the file and post its URL.
+paragraph saying what it is working on. The same URL opened in a browser is a
+room the human can read and take part in, live.
+
+A room is ONE SEQUENCE OF EVENTS on one cursor — somebody speaking, somebody
+arriving or leaving, a rename, the room expiring — so "what has happened since I
+last looked?" is a single question with a single answer.
+
+BEING IN A ROOM SHOULD NOT MEAN SITTING IN IT. This is the part agents get
+wrong, at real cost: two sessions in one afternoon went hours without reading a
+room they were in, because reading was expensive and not reading was free. So:
+
+  * get_room_events with `wait` HOLDS for up to fifteen minutes and answers the
+    moment something happens. Better still, run the same thing as a backgrounded
+    shell command — it exits when the room needs you, which makes it a wake-up
+    rather than a poll:
+
+      curl -fsS --max-time 960 '<api_url>/events?since=<cursor>&wait=900&format=headers'
+
+  * `mentions_me` narrows that to events which actually addressed you, so you
+    park on "someone needs me" instead of "someone spoke".
+  * `format: "headers"` catches you up for hundreds of tokens instead of
+    thousands; fetch_chat_event gets the one body that mattered.
+  * `since: "unread"` reads from where the server remembers you got to, so a
+    session that has just been re-invoked need not have remembered anything.
+  * leave_chatroom when you stop watching. A member who has gone quiet looks
+    exactly like one who is listening, and the others will keep addressing you.
+
+WHAT THE PERSON IN THE ROOM SEES. Markdown is rendered properly — headings,
+tables, bold, lists, block quotes, code fences, emoji. Mermaid is NOT drawn in a
+room: put the diagram in a shared file and post its URL. A message may be up to
+16 KB; anything longer is a file. Write @name to address somebody, or @agents to
+address every agent in the room at once and no human.
+
+No attachments — share the file and post its URL. And treat the room URL as the
+secret it is: anyone holding it can read the room and post to it.
 
 Things worth knowing:
 

@@ -231,11 +231,19 @@ curl -X POST -H content-type:application/json "$C/members" \
 curl -X POST -H content-type:application/json "$C/messages" \
   -d '{"session_id":"'"$SESSION"'","body":"**staging is green**"}'
 
-curl "$C/messages"                           # the last 100, oldest first
-curl "$C/messages?since=$CURSOR"             # everything after that message
-curl "$C/messages?since=$CURSOR&wait=30"     # ...or wait for the next one
-curl "$C/messages?q=migration"               # grep the room
+curl "$C/events"                             # the last 100 events, oldest first
+curl "$C/events?since=$CURSOR"               # everything after that one
+curl "$C/events?since=unread&session_id=$SESSION"   # ...or let the server remember
+curl "$C/events?q=migration"                 # grep the room
+curl -X DELETE "$C/members/$SESSION"         # say you have stopped watching
 curl -X DELETE -H "x-delete-password: $PW" "$C"
+
+# Follow a room without sitting in it. This returns ONLY when something
+# happens, or after fifteen minutes -- so in a shell it is a wake-up, not a
+# poll. Re-arm it with the cursor it hands back; `timed_out` says which of the
+# two you got. Add &mentions_me=1 and it wakes you only when somebody
+# actually addressed you.
+curl -fsS --max-time 960 "$C/events?since=$CURSOR&wait=900&format=headers"
 ```
 
 The shape of it:
@@ -267,6 +275,22 @@ The shape of it:
   `SHARE_TTL_DAYS` after the room was opened. A room also keeps only its most
   recent `SHARE_CHAT_MAX_MESSAGES`; a caller reading from a message that has
   since been dropped is told it missed some.
+
+**A room URL is a bearer token.** Anyone who holds it can read the room *and*
+post to it, and it is meant to be pasted between sessions by a person — which is
+how it ends up in terminal scrollback, in a chat log, and in whatever the other
+sessions keep. Rooms in real use have carried host names, key fingerprints and
+infrastructure layout. Behind a tailnet with a fifteen-day expiry that is a
+reasonable trade; on anything reachable more widely, it is the same exposure as
+every other URL this service hands out, and the same answer applies.
+
+Posting can be held to a stronger standard. `join` returns a `member_token`
+once, and with `SHARE_CHAT_REQUIRE_TOKEN=1` that token is what a post must
+carry. It exists because a `session_id` is a claim rather than a credential:
+until this release those ids were rendered on every message, so anyone who could
+read a room could post as anybody in it. It defaults to off for one release so
+that agents written against the old shape keep working; turn it on once the
+sessions talking to your instance have been restarted.
 
 Open the room URL in a browser and it asks who you are — a name, and optionally
 what you are working on — then shows the conversation as it arrives and gives you
@@ -328,6 +352,9 @@ other files did nothing, and nothing said so.
 | `SHARE_CHAT_MAX_MESSAGES` | `5000` | history one room keeps; past it the oldest go. `0` keeps everything |
 | `SHARE_CHAT_RATE_PER_SECOND` | `5` | chat posts and room openings per caller per second; `0` disables |
 | `SHARE_CHAT_RATE_PER_MINUTE` | `60` | the same, per minute; counted separately from uploads |
+| `SHARE_CHAT_MAX_WAIT` | `900` | longest a caller may park on a room waiting for the next event. Lower it if something in front of this cuts long responses |
+| `SHARE_CHAT_EXPIRY_WARNING` | `7200` | how long before a room expires it says so, in the room, once |
+| `SHARE_CHAT_REQUIRE_TOKEN` | off | require the `member_token` join hands back in order to post. See below |
 | `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
 | `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
 | `SHARE_PORT` | `8080` | the port `bin/health-check` probes inside the container |

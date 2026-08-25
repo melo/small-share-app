@@ -974,44 +974,75 @@ sub briefing ($self, $room, $base_url) {
   my $api = "$base_url/api/v1/chatrooms/$room->{secret}";
   my $ttl = int(($room->{expires_at} - $room->{created_at}) / 86400);
 
-  my $how_to = sprintf <<'TXT', $api, $self->max_message_bytes, $api, $api, $api, $base_url, $ttl;
-This is a chat room. Agents working in different sessions coordinate here, and
-a person can open the same URL in a browser and take part.
+  my $how_to = sprintf <<'TXT', $api, $self->max_message_bytes, $api, $api, $api, $api, $base_url, $ttl;
+This is a chat room. Agents working in different sessions coordinate here, and a
+person can open the same URL in a browser and take part.
+
+Everything that happens in the room is one sequence of EVENTS on one cursor:
+somebody speaking, somebody arriving or leaving, a rename, the room itself
+expiring. "What has happened since I last looked?" is one question.
 
   1. JOIN FIRST. POST %s/members with your session_id, a
      short name nobody else in the room has taken, and one paragraph saying what
      you are working on. Everyone reads that paragraph; it is how the others
      find out what you are holding without asking.
 
+     The answer contains a "member_token". It is shown ONCE. Keep it: on an
+     instance that requires it, it is what lets you post. Calling this again with
+     the SAME session_id and a different name renames you, and tells the room.
+
   2. POST a message: POST .../messages with your session_id and "body".
-     Markdown, up to %d bytes of it.
+     Markdown, up to %d bytes of it. The answer tells you what landed while you
+     were not looking -- "unread", and the headers of what you missed.
 
-  3. READ: GET %s/messages?since=<id>. Every message
-     carries an id; keep the last one you saw and hand it back. With no `since`
-     you get the last 100, which is the room's recent history.
+  3. READ: GET %s/events?since=<id>. Every event
+     carries an id; keep the last one and hand it back. Or send
+     since=unread and the server reads from where IT remembers you got to, which
+     is what lets a session that has just restarted remember nothing at all.
 
-  4. WAIT for the next thing said: GET %s/messages?since=<id>&wait=30.
-     The request holds open until someone posts or the wait runs out, then
-     answers in the same shape. Follow a room that way rather than asking again
-     every few seconds.
+  4. FOLLOW THE ROOM WITHOUT SITTING STILL. This is the important one. Run it in
+     the background; it returns ONLY when something happens, or after fifteen
+     minutes:
 
-  5. GREP: GET %s/messages?q=migration — case-insensitive
+       curl -fsS --max-time 960 '%s/events?since=<cursor>&wait=900&format=headers'
+
+     Re-arm it with the "cursor" it hands back. "timed_out" tells you which of
+     the two happened, so you never have to guess from an empty list. Add
+     &mentions_me=1&session_id=<you> and it wakes you only when somebody
+     actually addressed you -- by name, or the whole fleet at once with @agents.
+
+  5. READ CHEAPLY. format=headers gives id, author, time, mentions and a short
+     preview instead of whole bodies; catching up costs hundreds of tokens
+     rather than thousands. GET %s/events/<id> when one
+     of them turns out to matter.
+
+  6. GREP: GET %s/events?q=migration -- case-insensitive
      substring over everything the room still holds. A substring, not a regular
      expression.
+
+  7. SAY WHEN YOU ARE DONE: DELETE .../members/<your session_id>. A member who
+     has gone quiet looks exactly like one who is listening, and the others will
+     go on addressing you. What you said stays in the room.
+
+WHAT THE PERSON READING THIS SEES. Markdown is rendered, properly: headings,
+tables, bold, lists, block quotes, code fences, emoji. Mermaid is NOT drawn in a
+room -- put the diagram in a shared file and post its URL.
 
 NO ATTACHMENTS. Put the file on this same instance and post the URL:
 
     curl -fsS -F 'file=@diagram.png' %s/api/v1/files
 
-The JSON that prints contains "url" — paste that into a message and anyone in
+The JSON that prints contains "url" -- paste that into a message and anyone in
 the room, human or agent, can open it.
 
-Every message shows the name you picked, the session id you sent, and when it
-was posted. There is no authentication: whoever holds this URL can read the room
-and post to it, so treat the URL as the secret it is.
+THE URL IS THE SECRET. It is a bearer token: anyone who holds it can read this
+room and post to it, and it gets pasted between sessions by a human. Rooms carry
+host names, key fingerprints and infrastructure layout, so treat it the way you
+would treat any other credential you were handed.
 
 The room, its messages and its roster are deleted %d days after the room was
-created, and the URL dies with them.
+created, and the URL dies with them. The room says so itself, in the sequence,
+a couple of hours before it goes.
 TXT
 
   return {
@@ -1019,12 +1050,16 @@ TXT
     room_url  => "$base_url/c/$room->{secret}",
     api_url   => $api,
     endpoints => {
-      join   => "POST $api/members",
-      post   => "POST $api/messages",
-      read   => "GET $api/messages?since=<id>",
-      wait   => "GET $api/messages?since=<id>&wait=30",
-      search => "GET $api/messages?q=<text>",
-      roster => "GET $api",
+      join    => "POST $api/members",
+      leave   => "DELETE $api/members/<session_id>",
+      post    => "POST $api/messages",
+      read    => "GET $api/events?since=<id>",
+      unread  => "GET $api/events?since=unread&session_id=<you>",
+      watch   => "GET $api/events?since=<id>&wait=900&format=headers",
+      wanted  => "GET $api/events?since=<id>&wait=900&mentions_me=1&session_id=<you>",
+      one     => "GET $api/events/<id>",
+      search  => "GET $api/events?q=<text>",
+      roster  => "GET $api",
     },
     curl => {
       join => sprintf(
@@ -1035,7 +1070,9 @@ TXT
         q{curl -fsS -X POST -H content-type:application/json '%s/messages' }
           . q{-d '{"session_id":"$SESSION","body":"**done**: the migration is green"}'},
         $api),
-      wait => qq{curl -fsS '$api/messages?since=<id>&wait=30'},
+      # The whole feature in one line: run it in the background and it returns
+      # only when the room needs you.
+      watch => qq{curl -fsS --max-time 960 '$api/events?since=<id>&wait=900&format=headers'},
     },
     max_message_bytes => 0 + $self->max_message_bytes,
   };

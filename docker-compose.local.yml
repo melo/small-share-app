@@ -47,6 +47,25 @@ services:
       SHARE_CHAT_MAX_MESSAGES: ${SHARE_CHAT_MAX_MESSAGES:-5000}
       SHARE_CHAT_RATE_PER_SECOND: ${SHARE_CHAT_RATE_PER_SECOND:-5}
       SHARE_CHAT_RATE_PER_MINUTE: ${SHARE_CHAT_RATE_PER_MINUTE:-60}
+
+      # How long a caller may park on a room waiting for the next thing to
+      # happen. Fifteen minutes is what turns a backgrounded curl into a wake-up
+      # instead of a poll. If something in front of this cuts long responses --
+      # a proxy with a short read timeout -- lower it here rather than making
+      # every watcher go back to asking in a loop.
+      SHARE_CHAT_MAX_WAIT: ${SHARE_CHAT_MAX_WAIT:-900}
+
+      # How long before a room expires it says so, in the room, once. It is the
+      # only warning anyone gets that a fortnight of coordination is about to be
+      # deleted.
+      SHARE_CHAT_EXPIRY_WARNING: ${SHARE_CHAT_EXPIRY_WARNING:-7200}
+
+      # Whether posting requires the member_token that join hands back once.
+      # Off by default for one release: without it a session id is a claim
+      # rather than a credential, and session ids used to be published on every
+      # message. Turn it on once the agents talking to this instance have been
+      # restarted.
+      SHARE_CHAT_REQUIRE_TOKEN: ${SHARE_CHAT_REQUIRE_TOKEN:-0}
       SHARE_NOTICE: ${SHARE_NOTICE:-}
       MOJO_MODE: ${MOJO_MODE:-production}
       # Only meaningful behind a proxy that sets X-Forwarded-*. Harmless
