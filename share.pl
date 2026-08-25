@@ -838,6 +838,15 @@ my $read_events = sub ($c) {
 
   my %query = (since => $since, limit => scalar $c->param('limit'), q => scalar $c->param('q'));
 
+  # Resolved to a member id here and put into the query, which chat_await passes
+  # through verbatim — so the PARK inherits the filter for free. Applying it to
+  # the read but not the wait would wake an agent for every word said in the room
+  # and then hand it nothing, which is worse than not filtering at all.
+  if ($c->param('mentions_me') && defined $session) {
+    my $me = $chat->member($room, $session);
+    $query{mentions_me} = $me ? $me->{id} : -1;
+  }
+
   # A search waits for nothing: `q` asks about what has already been said.
   my $wait = length($query{q} // '') ? 0 : _chat_wait_seconds($c);
 
@@ -1221,8 +1230,12 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
   my $markup  = $c->param('html') ? 1 : 0;
   my $headers = ($c->param('format') // '') eq 'headers';
 
+  # One query for the whole page rather than one per event.
+  my $mentions = $chat->mentions_for($room, [map { $_->{id} } @$rows]);
+
   my @messages = map {
-    my $info = $headers ? $chat->header_public($_) : $chat->event_public($_);
+    my $said = $mentions->{$_->{id}} // [];
+    my $info = $headers ? $chat->header_public($_, $said) : $chat->event_public($_, $said);
     $markup ? {%$info, markup => _chat_markup($c, $_)} : $info;
   } @$rows;
 

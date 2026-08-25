@@ -102,6 +102,18 @@ sub _post ($id, $session, $body) {
   return $t->tx->res->json;
 }
 
+# A person in the room. The API deliberately will not make one -- it hardcodes
+# kind => 'agent', because the paragraph saying what you are working on is
+# required of an agent and optional for somebody who has just opened the page --
+# so a human arrives the way a human really does, through the model behind the
+# browser's join form.
+sub _human ($id, $session, $name) {
+  my $room = $t->app->chat->find_room($id);
+  my ($member) = $t->app->chat->join_room($room,
+    session_id => $session, name => $name, kind => 'human');
+  return $member;
+}
+
 # ------------------------------------------------------------ the briefing ---
 
 subtest 'a room is one URL, and the URL explains itself to whoever fetches it' => sub {
@@ -915,6 +927,96 @@ subtest 'the moment you post is the moment you are provably listening' => sub {
   my $next = _post($id, 'sess-x', 'again');
   is $next->{unread}, 0, 'posting marks you current';
   is_deeply $next->{missed}, [], 'so there is nothing to hand back';
+};
+
+subtest 'a mention is data, and an at-sign was decoration' => sub {
+  my $id = _room(topic => 'mentions')->{room}{id};
+  _join($id, session_id => 'sess-1', name => 'planner',  about => 'mention test');
+  _join($id, session_id => 'sess-2', name => 'DRAC-E1',  about => 'mention test');
+  _join($id, session_id => 'sess-d', name => 'drac',     about => 'the shorter name');
+  _human($id, 'sess-3', 'melo');
+
+  _post($id, 'sess-1', 'nothing for anybody here');
+  my $direct = _post($id, 'sess-1', 'can @DRAC-E1 confirm the compose file?');
+
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=" . ($direct->{message}{id} - 1))
+    ->tx->res->json;
+  is_deeply $got->{events}[0]{mentions}, ['DRAC-E1'], 'the mention is a field, not prose';
+
+  # "@drac" must not be found inside "@DRAC-E1". A hyphen is a word character as
+  # far as a name is concerned, and treating it as a boundary addresses the
+  # wrong agent -- quietly, and in a room where that is the whole point.
+  ok !grep({ $_ eq 'drac' } @{$got->{events}[0]{mentions}}), 'and it is the whole name';
+
+  # Case-insensitive, because nobody types a name back exactly.
+  _post($id, 'sess-1', 'and @drac-e1 again');
+
+  my $noise = _post($id, 'sess-1', 'ping @nobody-here');
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=" . ($noise->{message}{id} - 1))
+    ->tx->res->json;
+  is_deeply $got->{events}[0]{mentions}, [], 'an at-sign that matches nobody is just an at-sign';
+
+  # "Has anyone addressed me?" is one call.
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&since=0")
+    ->status_is(200)->tx->res->json;
+  is $got->{count}, 2, 'both, and none of the others';
+
+  # A rename does not orphan what was already addressed to you: the row binds to
+  # the member, and the name is looked up when it is asked for.
+  _join($id, session_id => 'sess-2', name => 'E1', about => 'renamed mid-run');
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&since=0")
+    ->tx->res->json;
+  is $got->{count}, 2, 'still both';
+  is_deeply $got->{events}[0]{mentions}, ['E1'], 'under the name they go by now';
+
+  # Headers carry them too, which is the combination a watcher actually uses.
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2"
+      . "&since=0&format=headers")->tx->res->json;
+  is_deeply $got->{events}[0]{mentions}, ['E1'], 'in headers as well as in full';
+};
+
+subtest 'one message can reach the whole fleet, and no human' => sub {
+  my $id = _room(topic => 'broadcast')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'alpha', about => 'fleet test');
+  _join($id, session_id => 'sess-b', name => 'bravo', about => 'fleet test');
+  _human($id, 'sess-h', 'melo');
+
+  my $all = _post($id, 'sess-h', '@agents stop what you are doing and read BOB-6');
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=" . ($all->{message}{id} - 1))
+    ->tx->res->json;
+  is_deeply [sort @{$got->{events}[0]{mentions}}], ['alpha', 'bravo'],
+    'every agent in the room';
+
+  # Not the person who sent it, and not any other person. Steering the fleet
+  # should not ping the people who are reading anyway -- that is the difference
+  # between a broadcast and a megaphone.
+  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-h&since=0")
+    ->json_is('/count' => 0);
+  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-a&since=0")
+    ->json_is('/count' => 1);
+};
+
+subtest 'a park on being wanted is not woken by ordinary chatter' => sub {
+  my $id = _room(topic => 'selective')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'alpha', about => 'park test');
+  _join($id, session_id => 'sess-b', name => 'bravo', about => 'park test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  # Chatter first, then the thing that actually concerns bravo. If the filter is
+  # applied to the read but not to the PARK, the first post ends the wait and
+  # this comes back with the wrong message -- which is the difference between a
+  # watcher an agent leaves running and one it turns off.
+  Mojo::IOLoop->timer(0.2 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-a', body => 'unrelated noise') });
+  Mojo::IOLoop->timer(0.6 => sub {
+    $t->app->chat->post($t->app->chat->find_room($id),
+      session_id => 'sess-a', body => 'over to you @bravo') });
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10"
+      . "&mentions_me=1&session_id=sess-b")->status_is(200)
+    ->json_is('/count' => 1)
+    ->json_is('/events/0/body' => 'over to you @bravo');
 };
 
 done_testing;

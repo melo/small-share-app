@@ -474,15 +474,30 @@ sub _tools ($server) {
       required   => ['room'],
       properties => {
         room  => _str('The room URL, or its id.'),
-        since => {type => 'integer', description => 'Message id to read on from — the '
-            . '"cursor" from your last call.'},
+        # Either shape, because it is genuinely two things: a number the caller
+        # is carrying, or the word "unread" asking the server for the one it
+        # keeps. Refusing the integer here would break every caller that has ever
+        # handed back a cursor.
+        since => {type => ['integer', 'string'],
+          description => 'Event id to read on from — the "cursor" from your last call. '
+            . 'Or the literal "unread", which reads from where the SERVER remembers you '
+            . 'got to and then moves it, so a session that has just been re-invoked need '
+            . 'not have remembered anything.'},
         limit => {type => 'integer', description => 'At most this many, up to 500. '
             . 'Default 100.'},
         wait => {type => 'integer', description => 'Seconds to HOLD the call open '
             . 'waiting for the next thing to happen, up to 900. Default 0, which answers '
             . 'at once. The answer carries "timed_out" so a loop can tell a quiet room '
             . 'from a room that said something.'},
-        session_id => _str('Your session id, so the room can show you as still here.'),
+        session_id => _str('Your session id, so the room can show you as still here, '
+            . 'and so "unread" and mentions_me mean anything.'),
+        format => _str('"full" (default) or "headers" — id, author, time, mentions and a '
+            . 'short preview instead of whole bodies. Catching up in headers costs '
+            . 'hundreds of tokens where full bodies cost thousands; fetch_chat_event '
+            . 'gets the one you actually care about.'),
+        mentions_me => {type => 'boolean', description => 'Only events that addressed '
+            . 'you by name, or the whole fleet with @agents. Combined with "wait" this is '
+            . 'how you park on "someone needs me" rather than on "someone spoke".'},
       },
     },
     code => sub ($tool, $args) {
@@ -492,8 +507,20 @@ sub _tools ($server) {
 
       $c->chat->touch_member($room, $args->{session_id});
 
+      # "unread" reads from the position the server keeps for this member, so a
+      # watcher that has just been re-invoked does not have to have remembered
+      # anything. Only this form advances it; a caller passing a number is
+      # carrying its own place.
       my $since = $args->{since};
+      my $by_cursor = defined $since && $since eq 'unread';
+      $since = $c->chat->read_cursor($room, $args->{session_id}) // 0 if $by_cursor;
+
       my %query = (since => $since, limit => $args->{limit});
+
+      if ($args->{mentions_me} && defined $args->{session_id}) {
+        my $me = $c->chat->member($room, $args->{session_id});
+        $query{mentions_me} = $me ? $me->{id} : -1;
+      }
       my $wait  = $args->{wait} // 0;
       # The SECOND ceiling. share.pl has its own, and for a long time this one
       # sat here quietly holding every MCP caller to sixty seconds no matter what
@@ -504,15 +531,29 @@ sub _tools ($server) {
       $wait = 0    if $wait < 0;
 
       my $answer = sub ($rows) {
+        $c->chat->mark_read($room, $args->{session_id}, $rows->[-1]{id})
+          if $by_cursor && @$rows;
+
+        my $mentions = $c->chat->mentions_for($room, [map { $_->{id} } @$rows]);
+        my $headers  = ($args->{format} // '') eq 'headers';
+        my @public   = map {
+          $headers
+            ? $c->chat->header_public($_, $mentions->{$_->{id}} // [])
+            : $c->chat->event_public($_,  $mentions->{$_->{id}} // [])
+        } @$rows;
+
         $tool->structured_result({
-          count    => scalar @$rows,
+          count    => scalar @public,
           cursor   => $c->chat->cursor($room, $rows, $since),
           missed   => $c->chat->missed($room, $since) ? \1 : \0,
+          unread   => $c->chat->unread_count($room, $args->{session_id}),
+          events   => \@public,
           # Same reason as the REST endpoint: a loop that re-arms itself must be
           # able to tell "the room was quiet" from "I never waited" without
           # inspecting a count that means neither on its own.
           timed_out => ($wait && !@$rows) ? \1 : \0,
-          messages => [map { $c->chat->message_public($_) } @$rows],
+          # Both names for one list, exactly as the REST endpoint does it.
+          messages => \@public,
         });
       };
 

@@ -450,8 +450,67 @@ sub _write ($self, $room, $session_id, $name, $type, $body, %extra) {
 
   my $id  = $db->dbh->sqlite_last_insert_rowid;
   my $row = $db->query('SELECT * FROM chat_events WHERE id = ?', $id)->hash;
+  $self->_record_mentions($room, $row);
   $self->_prune($room);
   return $row;
+}
+
+# Who this event addressed.
+#
+# Matched against the roster, never against a caller-supplied pattern — the same
+# discipline the room's search already follows, and for the same reason: one
+# nested quantifier over a few thousand messages takes a worker out of service,
+# and Perl's engine has no timeout to stop it. A name is a name.
+#
+# The row binds to the MEMBER and not to the text, so renaming yourself does not
+# orphan every message that ever addressed you — which matters here, because
+# renaming mid-run is a thing sessions actually do.
+sub _record_mentions ($self, $room, $row) {
+  my $body = $row->{body} // '';
+  return unless length $body;
+
+  # One message to the whole fleet. It earns its place on the use it was asked
+  # for — one instruction reaching four sessions at once, which is exactly what
+  # happened in the room these changes come from — and it reaches AGENTS only.
+  # Not pinging the people who are reading anyway is the difference between a
+  # broadcast and a megaphone.
+  my $fleet = $body =~ /(?:\A|[^\w\@])\@agents(?![\w-])/i;
+
+  my %wanted;
+  for my $member (@{$self->members($room)}) {
+    next if $member->{left_at};
+    $wanted{$member->{id}} = 1, next if $fleet && $member->{kind} eq 'agent';
+
+    # (?![\w-]) rather than a plain word boundary: a hyphen is part of a name as
+    # far as this room is concerned, and \b would find "@drac" inside "@drac-e1"
+    # and address the wrong agent — quietly, in the one place that would matter.
+    $wanted{$member->{id}} = 1
+      if $body =~ /(?:\A|[^\w\@])\@\Q$member->{name}\E(?![\w-])/i;
+  }
+
+  my $db = $self->sql->db;
+  $db->query('INSERT OR IGNORE INTO chat_mentions (event_id, member_id, room_id) VALUES (?,?,?)',
+    $row->{id}, $_, $room->{id})
+    for sort keys %wanted;
+  return;
+}
+
+# Names by event id, for a whole page in one query rather than one per event —
+# a hundred events would otherwise be a hundred round trips. The name is read
+# from the member now, not from the text then, which is what makes a rename
+# harmless.
+sub mentions_for ($self, $room, $ids) {
+  return {} unless @$ids;
+  my $in   = join ',', ('?') x @$ids;
+  my $rows = $self->sql->db->query(
+    "SELECT n.event_id, m.name FROM chat_mentions n
+       JOIN chat_members m ON m.id = n.member_id
+      WHERE n.room_id = ? AND n.event_id IN ($in) ORDER BY m.name",
+    $room->{id}, @$ids)->hashes;
+
+  my %by;
+  push @{$by{$_->{event_id}}}, $_->{name} for @$rows;
+  return \%by;
 }
 
 # The per-room ceiling, enforced after the fact like the disk one: a room that
@@ -507,6 +566,14 @@ sub messages ($self, $room, %opt) {
   # quantifier over a few thousand messages takes a worker out of service, and
   # there is no timeout in Perl's engine to put a stop to it. Everything grep is
   # actually reached for here ("who mentioned the migration?") is a substring.
+  # "Has anyone addressed me?" — and, combined with `wait`, the difference
+  # between parking on "someone needs me" and parking on "someone spoke". An
+  # agent will leave the first one running and will turn the second one off.
+  if (my $me = $opt{mentions_me}) {
+    push @where, 'id IN (SELECT event_id FROM chat_mentions WHERE member_id = ?)';
+    push @bind,  $me;
+  }
+
   if (defined $opt{q} && length $opt{q}) {
     push @where, 'instr(lower(body), lower(?)) > 0';
     push @bind,  $opt{q};
@@ -606,7 +673,7 @@ sub member_public ($self, $member) {
   };
 }
 
-sub event_public ($self, $row) {
+sub event_public ($self, $row, $mentions = []) {
   return {
     id         => 0 + $row->{id},
     session_id => $row->{session_id},
@@ -619,6 +686,7 @@ sub event_public ($self, $row) {
     kind       => $row->{type},
     body       => $row->{body},
     created_at => iso8601($row->{created_at}),
+    mentions   => $mentions,
     (defined $row->{target_id} ? (target_id => 0 + $row->{target_id}) : ()),
   };
 }
