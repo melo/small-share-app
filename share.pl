@@ -844,6 +844,15 @@ my $read_events = sub ($c) {
     ->then(sub ($rows) { _chat_messages_json($c, $room, $rows, $since, waited => 1) });
 };
 
+# One event in full, for a caller reading headers that decided it wants the body
+# after all. The whole point of a header is that this call is usually not made.
+$api->get('/chatrooms/<room:id>/events/<event>' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $row = $chat->event($room, $c->stash('event'))
+    or return _api_error($c, 404, 'no such event in this room');
+  $c->render(json => {event => $chat->event_public($row)});
+});
+
 $api->get('/chatrooms/<room:id>/events'   => $read_events);
 $api->get('/chatrooms/<room:id>/messages' => $read_events);
 
@@ -1153,9 +1162,11 @@ sub _chat_view ($c, $row) {
 sub _chat_markup ($c, $row) { return '' . $c->render_to_string('chat_message', m => _chat_view($c, $row)) }
 
 sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
-  my $markup = $c->param('html') ? 1 : 0;
+  my $markup  = $c->param('html') ? 1 : 0;
+  my $headers = ($c->param('format') // '') eq 'headers';
+
   my @messages = map {
-    my $info = $chat->message_public($_);
+    my $info = $headers ? $chat->header_public($_) : $chat->event_public($_);
     $markup ? {%$info, markup => _chat_markup($c, $_)} : $info;
   } @$rows;
 

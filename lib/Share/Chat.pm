@@ -50,6 +50,11 @@ has max_message_bytes => 16 * 1024;
 # handed a shorter conversation than it asked for.
 has max_messages => 5000;
 
+# How much of a body a header shows: enough to know whether the thing concerns
+# you, short enough that catching up on twenty events costs hundreds of tokens
+# rather than thousands.
+has preview_chars => 160;
+
 # What can happen in a room.
 #
 # The sequence is the whole interface — "everything since <id>" has to mean
@@ -588,6 +593,52 @@ sub event_public ($self, $row) {
 
 # The name the rest of the app still calls it by.
 sub message_public ($self, $row) { return $self->event_public($row) }
+
+# The same event, with everything expensive left out.
+#
+# A real catch-up on nineteen messages cost about SIX THOUSAND tokens in one tool
+# result, and the agent that paid it drew the obvious conclusion: it stopped
+# re-reading the room to check facts. That is how a room fills up with agents
+# restating stale values at each other. Enough here to know whether something
+# concerns you, and a second call for the ones that do.
+sub header_public ($self, $row, $mentions = []) {
+  my $body  = $row->{body} // '';
+  my $bytes = $body;
+  utf8::encode($bytes);
+
+  my $preview = $body;
+  $preview =~ s/\s+/ /g;
+  $preview =~ s/\A\s+|\s+\z//g;
+
+  my $cut = length($preview) > $self->preview_chars;
+  if ($cut) {
+    $preview = substr $preview, 0, $self->preview_chars;
+    # Back to a word boundary. A preview that stops mid-word is how a truncated
+    # notification announced itself in the field — and the ones that happened to
+    # stop on a boundary read as complete and got acted on, which is worse. Hence
+    # `truncated` as well: never leave it to the shape of the text to say.
+    $preview =~ s/\s+\S*\z// if $preview =~ /\s/;
+  }
+
+  return {
+    id         => 0 + $row->{id},
+    type       => $row->{type},
+    name       => $row->{name},
+    created_at => iso8601($row->{created_at}),
+    mentions   => $mentions,
+    bytes      => length $bytes,
+    preview    => $preview,
+    truncated  => $cut ? \1 : \0,
+    (defined $row->{target_id} ? (target_id => 0 + $row->{target_id}) : ()),
+  };
+}
+
+# One event, by id, and only from the room that holds it.
+sub event ($self, $room, $id) {
+  return undef unless defined $id && $id =~ /\A\d+\z/;
+  return $self->sql->db->query('SELECT * FROM chat_events WHERE room_id = ? AND id = ?',
+    $room->{id}, $id)->hash;
+}
 
 # ------------------------------------------------------------- briefing ------
 

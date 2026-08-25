@@ -776,4 +776,43 @@ subtest 'events and messages are one endpoint under two names' => sub {
   $t->get_ok('/api/v1/chatrooms/nosuchroomnosuchroom12345678/events')->status_is(404);
 };
 
+subtest 'a catch-up can cost hundreds of tokens instead of thousands' => sub {
+  my $id = _room(topic => 'headers')->{room}{id};
+  _join($id, session_id => 'sess-h', name => 'planner', about => 'headers test');
+
+  my $long = 'x' x 4000;
+  my $ev   = _post($id, 'sess-h', "the first line\n\n$long")->{message}{id};
+
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?format=headers")->status_is(200)
+    ->tx->res->json;
+  my ($head) = grep { $_->{id} == $ev } @{$got->{events}};
+
+  ok !exists $head->{body}, 'a header carries no body';
+  ok length($head->{preview}) <= 160, 'the preview is bounded';
+  like $head->{preview}, qr/^the first line/, 'and it is the top of the message';
+  is $head->{truncated}, Mojo::JSON->true, 'which it says, so nobody acts on half a sentence';
+  is $head->{bytes}, length("the first line\n\n$long"), 'and says how much it did not send';
+  is $head->{name}, 'planner', 'the author is a header field, not a body field';
+  is $head->{type}, 'message', 'and so is the kind of thing it was';
+
+  # The whole point, in one number: headers are an order of magnitude smaller.
+  my $full = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  ok length(Mojo::JSON::encode_json($got)) * 5 < length(Mojo::JSON::encode_json($full)),
+    'and the answer really is much smaller than the bodies it stands for';
+
+  # The body is one call away when it turns out to matter.
+  $t->get_ok("/api/v1/chatrooms/$id/events/$ev")->status_is(200)
+    ->json_is('/event/body' => "the first line\n\n$long")
+    ->json_is('/event/type' => 'message');
+
+  my $short = _post($id, 'sess-h', 'brief')->{message}{id};
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?format=headers&since=" . ($short - 1))
+    ->tx->res->json;
+  is $got->{events}[0]{truncated}, Mojo::JSON->false, 'nothing was cut';
+  is $got->{events}[0]{preview}, 'brief', 'so the preview is the whole of it';
+
+  # An event id that is not in this room is not readable through it.
+  $t->get_ok("/api/v1/chatrooms/$id/events/999999")->status_is(404);
+};
+
 done_testing;
