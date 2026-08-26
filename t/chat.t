@@ -1208,7 +1208,12 @@ subtest 'writing can be made to require the token' => sub {
       {session_id => 'sess-q', body => 'no token, and that is fine for now'})
     ->status_is(201);
 
+  # Both, because the flag is read once at startup into Share::Chat -- the guard
+  # belongs to the model rather than to a route, so changing the app's config on
+  # a running instance is no longer enough. In production this is a restart,
+  # which setting it in a compose file requires anyway.
   local $t->app->config->{chat_require_token} = 1;
+  local $t->app->chat->{require_token} = 1;
 
   $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
       {session_id => 'sess-q', body => 'no token'})->status_is(403)
@@ -1530,6 +1535,95 @@ subtest 'the sweep repairs a database that already ran 1.5.0' => sub {
   is scalar @$left, 1, 'the orphans are gone';
   is_deeply $left->[0], {event_id => 1, member_id => 1, room_id => 1},
     'and the real one is untouched';
+};
+
+subtest 'the token guard is on the far side of both transports' => sub {
+  # Reported by an ops session after deploying 1.5.0: SHARE_CHAT_REQUIRE_TOKEN
+  # was enforced in the REST post route and nowhere else. The MCP tool called
+  # Share::Chat::post underneath it and had no member_token in its schema at
+  # all, so on an instance with a public /mcp anyone holding a room URL could
+  # still post as anybody in the room -- the exact hole the flag exists to
+  # close.
+  #
+  # The cause is not that one tool was missed. It is that the guard was written
+  # in a route, and a guard in a route is a guard the next route forgets: three
+  # more write paths were added after it and none of them called it. So it moves
+  # to Share::Chat, which is the one place every write funnels through.
+  my $id  = _room(topic => 'guarded everywhere')->{room}{id};
+  my $tok = _join($id, session_id => 'sess-g', name => 'guarded', about => 'guard test')
+    ->{member_token};
+  my $vic = _join($id, session_id => 'sess-v', name => 'victim', about => 'guard test')
+    ->{member_token};
+
+  local $t->app->config->{chat_require_token} = 1;
+  local $t->app->chat->{require_token} = 1;
+
+  # 1. REST post -- the one that was already closed.
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-g', body => 'no token'})->status_is(403);
+
+  # 2. MCP post -- impersonation, and the reported hole. Note the session id
+  # being posted as is somebody else's, which is the whole point: it is readable
+  # off nothing at all now, but a caller that knows it must still not be able to
+  # speak as them.
+  my $mcp = _call(post_chat_message => {room => $id, session_id => 'sess-v',
+    body => 'posted as the victim, with no credential'});
+  ok $mcp->{isError}, 'MCP posting without a token is refused';
+  like $mcp->{content}[0]{text}, qr/member_token/, 'and says what is missing';
+
+  my $ok = _call(post_chat_message => {room => $id, session_id => 'sess-v',
+    body => 'and with one it goes through', member_token => $vic});
+  ok !$ok->{isError}, 'the tool accepts a member_token';
+
+  # 3. Leaving somebody else -- a nuisance rather than impersonation, but it
+  # makes the roster say a live agent is gone and everyone stops addressing it.
+  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-v")->status_is(403);
+  my $mleave = _call(leave_chatroom => {room => $id, session_id => 'sess-v'});
+  ok $mleave->{isError}, 'and over MCP too';
+
+  # 4. Moving somebody else's read cursor, which is the quiet one: set it
+  # forward and they skip exactly the message somebody needed them to see.
+  $t->post_ok("/api/v1/chatrooms/$id/members/sess-v/read" => json => {cursor => 99999})
+    ->status_is(403);
+
+  # Reading is untouched. The URL has always been the read credential and stays
+  # one; what needed a credential was writing.
+  $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200);
+
+  # With the right token, all of them work.
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-g', body => 'with a token', member_token => $tok})->status_is(201);
+  $t->post_ok("/api/v1/chatrooms/$id/members/sess-v/read" => json =>
+      {cursor => 1, member_token => $vic})->status_is(200);
+  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-v" =>
+      json => {member_token => $vic})->status_is(200);
+};
+
+subtest 'an unauthorised reader may still read, it just cannot move the cursor' => sub {
+  # since=unread advances a position on the member row, so a read carrying
+  # somebody else's session id is a WRITE wearing a read's clothes -- and the
+  # same forgery. Rather than making reading need a credential, which the URL
+  # has always been, an unauthorised caller gets the events and the cursor stays
+  # exactly where its owner left it.
+  my $id  = _room(topic => 'read but do not move')->{room}{id};
+  my $tok = _join($id, session_id => 'sess-r', name => 'reader', about => 'cursor guard')
+    ->{member_token};
+  _join($id, session_id => 'sess-s', name => 'speaker', about => 'cursor guard');
+  _post($id, 'sess-s', 'something to be unread');
+
+  local $t->app->config->{chat_require_token} = 1;
+  local $t->app->chat->{require_token} = 1;
+
+  my $before = $t->app->chat->read_cursor($t->app->chat->find_room($id), 'sess-r');
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")->status_is(200)
+    ->json_is('/count' => 3);
+  is $t->app->chat->read_cursor($t->app->chat->find_room($id), 'sess-r'), $before,
+    'a stranger reading as me does not mark me caught up';
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r&member_token=$tok")
+    ->status_is(200);
+  isnt $t->app->chat->read_cursor($t->app->chat->find_room($id), 'sess-r'), $before,
+    'and with the token it advances as it should';
 };
 
 done_testing;

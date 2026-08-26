@@ -63,6 +63,19 @@ has presence_grace => 120;
 # something that matters and short enough that the warning still means "now".
 has expiry_warning => 7200;
 
+# Whether writing to a room needs the member_token join handed back.
+#
+# It lives HERE, and not in a route, because the first version of it lived in a
+# route. The REST post path checked it; the MCP tool called post() underneath
+# that check and never saw it, and three more write paths were added afterwards
+# that did not call it either. On an instance with a public /mcp that left
+# anyone holding a room URL able to post as anybody in the room — which is the
+# one thing the flag exists to prevent.
+#
+# A guard in a transport is a guard the next transport forgets. This is the far
+# side of both of them.
+has require_token => 0;
+
 # What can happen in a room.
 #
 # The sequence is the whole interface — "everything since <id>" has to mean
@@ -501,6 +514,17 @@ sub issue_token ($self, $member) {
   return $token;
 }
 
+# Refuses unless this caller may write as this member. `trusted` is how a
+# browser says so: its session cookie is signed and lives in one browser, so it
+# already IS a credential and there is no token to carry.
+sub authorise ($self, $room, $session_id, %args) {
+  return 1 unless $self->require_token;
+  return 1 if $args{trusted};
+  return 1 if $self->token_ok($room, $session_id, $args{member_token});
+  _fail('this room requires the member_token that join returned — it is the only copy '
+      . 'of it you were ever given, and no other call will tell you it again');
+}
+
 sub token_ok ($self, $room, $session_id, $token) {
   my $member = $self->member($room, $session_id) or return 0;
   return 0 unless defined $member->{token_hash};
@@ -532,8 +556,11 @@ sub presence ($self, $member, $now = time) {
 # Dropping out was posting a goodbye and hoping. Two agents did exactly that in
 # one afternoon, and the roster went on listing both as present -- which looks
 # identical to two that are listening, and is how you end up addressing nobody.
-sub leave_room ($self, $room, $session_id) {
+sub leave_room ($self, $room, $session_id, %args) {
   my $member = $self->member($room, $session_id) or return undef;
+  # After the lookup, so that "nobody here by that id" is still a 404 rather
+  # than a 403 that confirms the id exists.
+  $self->authorise($room, $session_id, %args);
   return $member if $member->{left_at};
 
   $self->sql->db->query('UPDATE chat_members SET left_at = ?, waiting_until = 0 WHERE id = ?',
@@ -594,9 +621,13 @@ sub read_cursor ($self, $room, $session_id) {
   return 0 + $member->{read_cursor};
 }
 
-sub mark_read ($self, $room, $session_id, $cursor) {
+sub mark_read ($self, $room, $session_id, $cursor, %args) {
   return unless defined $cursor && $cursor =~ /\A\d+\z/;
   my $member = $self->member($room, $session_id) or return;
+  # The quiet one. Set somebody's cursor forward and they skip exactly the
+  # message another agent needed them to see — no error anywhere, and the room
+  # looks fine.
+  $self->authorise($room, $session_id, %args);
   # Never backwards. Two reads can overlap, and the later one landing first must
   # not un-read what the earlier one already delivered.
   return if $cursor <= $member->{read_cursor};
@@ -634,6 +665,7 @@ sub touch_member ($self, $room, $session_id) {
 
 sub post ($self, $room, %args) {
   my $session_id = _clean_line($args{session_id}, 200) // _fail('session_id is required');
+  $self->authorise($room, $session_id, %args);
   my $member     = $self->member($room, $session_id)
     or _fail('join the room before posting: send your session_id, a name and one '
       . 'paragraph about what you are working on');

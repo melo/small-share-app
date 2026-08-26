@@ -184,6 +184,7 @@ my $chat = Share::Chat->new(
   max_message_bytes => $CFG{chat_max_message_bytes},
   max_messages      => $CFG{chat_max_messages},
   expiry_warning    => $CFG{chat_expiry_warning},
+  require_token     => $CFG{chat_require_token},
 )->init;
 
 # Signs the identity cookie a person gets when they join a room — the one piece
@@ -878,8 +879,16 @@ my $read_events = sub ($c) {
   # nothing here, but over MCP it is the difference between one JSON body and an
   # SSE stream — see the tool in Share::MCP — and the two sides should behave the
   # same way for the same request.
+  my %creds = _chat_credentials($c, {session_id => $session,
+    member_token => scalar $c->param('member_token')});
+
   my $answer = sub ($rows, %opt) {
-    $chat->mark_read($room, $session, $rows->[-1]{id}) if $by_cursor && @$rows;
+    # Reading stays open — the URL has always been the read credential. But
+    # `since=unread` MOVES a position on the member row, so a read carrying
+    # somebody else's session id is a write in a read's clothes. An unauthorised
+    # caller gets the events and the cursor stays where its owner left it.
+    eval { $chat->mark_read($room, $session, $rows->[-1]{id}, %creds); 1 }
+      if $by_cursor && @$rows;
     return _chat_messages_json($c, $room, $rows, $since, %opt, session => $session);
   };
 
@@ -913,18 +922,24 @@ $api->get('/chatrooms/<room:id>/events/<event>' => sub ($c) {
 # Leaving. A call, not an announcement -- see Share::Chat::leave_room.
 $api->delete('/chatrooms/<room:id>/members/<session>' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
-  my $member = $chat->leave_room($room, $c->stash('session'))
-    or return _api_error($c, 404, 'nobody here by that session id');
+  my $args = eval { _chat_args($c, qw(member_token)) } // {};
+  $args->{session_id} = $c->stash('session');
+
+  my $member = eval { $chat->leave_room($room, $c->stash('session'), _chat_credentials($c, $args)) };
+  return _api_error($c, _refused($@) ? 403 : 400, $@) if $@;
+  return _api_error($c, 404, 'nobody here by that session id') unless $member;
   $c->render(json => {left => $member->{name}, room => $room->{secret}});
 });
 
 $api->post('/chatrooms/<room:id>/members/<session>/read' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
-  my $args = eval { _chat_args($c, qw(cursor)) };
+  my $args = eval { _chat_args($c, qw(cursor member_token)) };
   return _api_error($c, 400, $@) if $@;
 
   my $session = $c->stash('session');
-  $chat->mark_read($room, $session, $args->{cursor});
+  $args->{session_id} = $session;
+  eval { $chat->mark_read($room, $session, $args->{cursor}, _chat_credentials($c, $args)); 1 }
+    or return _api_error($c, _refused($@) ? 403 : 400, $@);
   $c->render(json => {
     cursor => $chat->read_cursor($room, $session) // 0,
     unread => $chat->unread_count($room, $session),
@@ -944,12 +959,9 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
   my $args = eval { _chat_args($c, qw(session_id body member_token)) };
   return _api_error($c, 400, $@) if $@;
 
-  return _api_error($c, 403, 'this instance requires the member_token that '
-      . 'join handed back — it is the only copy, and nothing else will tell you it again')
-    unless _chat_may_write($c, $room, $args->{session_id}, delete $args->{member_token});
-
-  my $row = eval { $chat->post($room, %$args) };
-  return _api_error($c, 400, $@) if $@;
+  my %creds = _chat_credentials($c, $args);
+  my $row   = eval { $chat->post($room, %$args, %creds) };
+  return _api_error($c, _refused($@) ? 403 : 400, $@) if $@;
 
   # What landed while this caller was not looking.
   #
@@ -965,8 +977,11 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
     since => $chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
   $behind = [grep { $_->{id} != $row->{id} } @$behind];
 
-  # And it catches you up, because you have just been handed the gap.
-  $chat->mark_read($room, $args->{session_id}, $row->{id});
+  # And it catches you up, because you have just been handed the gap. Trusted
+  # unconditionally: post() authorised this caller a few lines ago, and making
+  # the guard re-judge its own callers is how an internal call ends up refusing
+  # somebody who has already been let in.
+  $chat->mark_read($room, $args->{session_id}, $row->{id}, trusted => 1);
 
   $c->render(json => {
     message => $chat->event_public($row, [], $room),
@@ -1278,15 +1293,19 @@ sub _chat_identity ($c) {
 
 sub _chat_me ($c, $room) { return $chat->member($room, _chat_identity($c)->{sid}) }
 
-# May this caller write as this member?
+# How a caller says who it is, for Share::Chat::authorise to judge. Deciding
+# happens there, in the one place every write funnels through — this used to
+# decide, and being a route it was the only route that did.
 #
-# A browser needs no token: its session cookie is signed and lives in one
-# browser, so it already IS one. An agent presents the token join gave it.
-sub _chat_may_write ($c, $room, $session_id, $token) {
-  return 1 unless $c->app->config->{chat_require_token};
+# A browser carries no token: its session cookie is signed and lives in one
+# browser, so it already IS a credential.
+sub _chat_credentials ($c, $args = {}) {
   my $mine = ($c->session('chat') // {})->{sid};
-  return 1 if defined $mine && defined $session_id && $mine eq $session_id;
-  return $chat->token_ok($room, $session_id, $token);
+  return (
+    member_token => delete $args->{member_token},
+    trusted      => (defined $mine && defined $args->{session_id} && $mine eq $args->{session_id})
+      ? 1 : 0,
+  );
 }
 
 # A message as the templates want it: the public fields, plus its markdown
@@ -1374,6 +1393,10 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
 }
 
 sub _no_room ($c) { return 'no such room — it was deleted, or it expired' }
+
+# A refusal, as opposed to a malformed request. Share::Chat dies with one hashref
+# shape for everything; this is the one case that is 403 rather than 400.
+sub _refused ($err) { return _error_text($err) =~ /member_token/ ? 1 : 0 }
 
 # Enforced by eviction after the fact rather than by refusing the upload: a
 # public box that fills its disk goes down, which is worse than losing the

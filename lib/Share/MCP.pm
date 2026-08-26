@@ -104,6 +104,14 @@ sub _tool ($server, %spec) {
 }
 
 sub _failure ($tool, $name, $args, $err) {
+  # A refusal is not a crash. Share::Chat says no to plenty of things on purpose
+  # — no token, no such member, a message over the size cap — and every one of
+  # them used to come back as "this is a bug in the server, quote reference
+  # 12.3", which is both wrong and actively unhelpful: the caller goes looking
+  # for an operator instead of reading the sentence that tells it what to fix.
+  return $tool->text_result($err->{share_error}, 1)
+    if ref $err eq 'HASH' && defined $err->{share_error};
+
   my $ref = sprintf '%d.%d', $$, ++$FAILURES;
   my $log = eval { _c($tool)->app->log };
   $log->error(sprintf 'MCP tool %s failed [ref %s] with arguments (%s): %s',
@@ -474,6 +482,8 @@ sub _tools ($server) {
         room       => _str('The room URL, or its id.'),
         session_id => _str('The session id you joined with.'),
         body       => _str('The message, as markdown.'),
+        member_token => _str('The token join_chatroom returned. Required on an instance '
+            . 'that sets SHARE_CHAT_REQUIRE_TOKEN; it is the only copy you were given.'),
       },
     },
     code => sub ($tool, $args) {
@@ -481,7 +491,10 @@ sub _tools ($server) {
       my ($room, $id) = _room($c, $args->{room});
       return $tool->text_result(_no_room($id), 1) unless $room;
 
-      my $row = $c->chat->post($room, session_id => $args->{session_id}, body => $args->{body});
+      my $row = $c->chat->post($room,
+        session_id   => $args->{session_id},
+        body         => $args->{body},
+        member_token => $args->{member_token});
 
       # The same gap the REST endpoint hands back, for the same reason: a cursor
       # that silently jumped is how an agent spends thirty seconds answering a
@@ -489,7 +502,8 @@ sub _tools ($server) {
       my $behind = $c->chat->messages($room,
         since => $c->chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
       $behind = [grep { $_->{id} != $row->{id} } @$behind];
-      $c->chat->mark_read($room, $args->{session_id}, $row->{id});
+      # Trusted: post() authorised this caller immediately above.
+      $c->chat->mark_read($room, $args->{session_id}, $row->{id}, trusted => 1);
 
       return $tool->structured_result({
         message => $c->chat->event_public($row, [], $room),
@@ -535,6 +549,8 @@ sub _tools ($server) {
         mentions_me => {type => ['boolean', 'integer'], description => 'Only events that addressed '
             . 'you by name, or the whole fleet with @agents. Combined with "wait" this is '
             . 'how you park on "someone needs me" rather than on "someone spoke".'},
+        member_token => _str('The token join_chatroom returned. Required on an instance '
+            . 'that sets SHARE_CHAT_REQUIRE_TOKEN; it is the only copy you were given.'),
       },
   );
 
@@ -581,7 +597,10 @@ sub _tools ($server) {
           });
         }
 
-        $c->chat->mark_read($room, $args->{session_id}, $rows->[-1]{id})
+        # Same as the REST read: reading is open, moving somebody's position is
+        # not. An unauthorised caller gets the events and the cursor stays put.
+        eval { $c->chat->mark_read($room, $args->{session_id}, $rows->[-1]{id},
+            member_token => $args->{member_token}); 1 }
           if $by_cursor && @$rows;
 
         my $mentions = $c->chat->mentions_for($room, [map { $_->{id} } @$rows]);
@@ -691,6 +710,8 @@ sub _tools ($server) {
       properties => {
         room       => _str('The room URL, or its id.'),
         session_id => _str('The session id you joined with.'),
+        member_token => _str('The token join_chatroom returned. Required on an instance '
+            . 'that sets SHARE_CHAT_REQUIRE_TOKEN; it is the only copy you were given.'),
       },
     },
     code => sub ($tool, $args) {
@@ -698,7 +719,8 @@ sub _tools ($server) {
       my ($room, $id) = _room($c, $args->{room});
       return $tool->text_result(_no_room($id), 1) unless $room;
 
-      my $member = $c->chat->leave_room($room, $args->{session_id})
+      my $member = $c->chat->leave_room($room, $args->{session_id},
+        member_token => $args->{member_token})
         or return $tool->text_result('nobody in that room joined with that session id', 1);
       return $tool->text_result("Left as $member->{name}. What you said is still in the "
           . 'room, and you can rejoin with the same session id.');
