@@ -213,6 +213,21 @@ CREATE TABLE chat_mentions (
 CREATE UNIQUE INDEX chat_mentions_pair_idx ON chat_mentions (event_id, member_id);
 CREATE INDEX chat_mentions_member_idx ON chat_mentions (member_id, event_id);
 
+-- 3 up
+-- Rows left behind by 1.5.0, which deleted a room without deleting the mentions
+-- that pointed into it. Harmless as orphans; not harmless once SQLite reuses
+-- the freed event and member rowids, at which point one of them silently
+-- becomes a live message flagged as addressed to somebody who never was. One
+-- sweep, once, for every database that ran that version.
+DELETE FROM chat_mentions
+ WHERE room_id NOT IN (SELECT id FROM chat_rooms)
+    OR event_id NOT IN (SELECT id FROM chat_events)
+    OR member_id NOT IN (SELECT id FROM chat_members);
+
+-- 3 down
+-- Nothing to undo: the rows this dropped were already pointing at nothing.
+SELECT 1;
+
 -- 2 down
 DROP TABLE chat_mentions;
 CREATE TABLE chat_messages (
@@ -350,7 +365,19 @@ sub remove_room ($self, $secret, $password = undef) {
 
 sub _purge_room ($self, $room) {
   my $db = $self->sql->db;
-  $db->delete('chat_events', {room_id => $room->{id}});
+  # Mentions first, and they are easy to forget because nothing references them
+  # and nothing breaks visibly when they are left. What actually happens is
+  # worse than an orphan: chat_events.id and chat_members.id are plain INTEGER
+  # PRIMARY KEYs, so SQLite hands the freed rowids straight back out, and a
+  # leftover row pairing a dead event with a dead member becomes a LIVE event
+  # flagged as addressed to a live member who was never addressed at all.
+  #
+  # Which is the worst shape it could take. mentions_me exists so that an agent
+  # can trust "someone needs me" enough to park on it, and this made it lie.
+  # Found on a live instance with churn in it; a database that only ever grows
+  # would never have shown it.
+  $db->delete('chat_mentions', {room_id => $room->{id}});
+  $db->delete('chat_events',   {room_id => $room->{id}});
   $db->delete('chat_members',  {room_id => $room->{id}});
   $db->delete('chat_rooms',    {id      => $room->{id}});
   return;
@@ -764,8 +791,14 @@ sub messages ($self, $room, %opt) {
   # between parking on "someone needs me" and parking on "someone spoke". An
   # agent will leave the first one running and will turn the second one off.
   if (my $me = $opt{mentions_me}) {
-    push @where, 'id IN (SELECT event_id FROM chat_mentions WHERE member_id = ?)';
-    push @bind,  $me;
+    # Scoped to the room as well as the member. Belt as well as braces: without
+    # it this trusts every id in the table to be the id it thinks it is, and one
+    # stray row -- from rowid reuse, from a bug not yet written -- can address
+    # somebody who was never addressed. One clause, and an orphan from any
+    # source reaches nobody.
+    push @where,
+      'id IN (SELECT event_id FROM chat_mentions WHERE member_id = ? AND room_id = ?)';
+    push @bind, $me, $room->{id};
   }
 
   if (defined $opt{q} && length $opt{q}) {

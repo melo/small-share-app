@@ -1426,4 +1426,110 @@ V1
     'a second startup does not double the backfill';
 };
 
+subtest 'a deleted room takes its mentions with it' => sub {
+  # Found on a live instance, and it could not have been found on a fresh one.
+  #
+  # _purge_room deleted the events, the members and the room, and left the
+  # mention rows behind. Orphans would be harmless if ids were never reused --
+  # but chat_events.id and chat_members.id are plain INTEGER PRIMARY KEYs, so
+  # SQLite hands the freed rowids straight back out. An orphan pairing a dead
+  # event with a dead member then silently becomes a live event flagged as
+  # addressed to a live member who was never addressed at all.
+  #
+  # Which is the worst shape this bug could take: mentions_me exists so an agent
+  # can trust "someone needs me", and this made it lie.
+  my $made = _room(topic => 'mentions outlive their room');
+  my $id   = $made->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'alpha', about => 'purge test');
+  _join($id, session_id => 'sess-b', name => 'bravo', about => 'purge test');
+  _post($id, 'sess-a', 'over to you @bravo');
+
+  my $db  = $t->app->chat->sql->db;
+  my $rid = $t->app->chat->find_room($id)->{id};
+  is $db->query('SELECT COUNT(*) FROM chat_mentions WHERE room_id = ?', $rid)->array->[0], 1,
+    'the mention was recorded';
+
+  $t->delete_ok("/api/v1/chatrooms/$id" => {'X-Delete-Password' => $made->{delete_password}})
+    ->status_is(200);
+  is $db->query('SELECT COUNT(*) FROM chat_mentions WHERE room_id = ?', $rid)->array->[0], 0,
+    'and went with the room';
+
+  # The same hole, reached the other way: a room that expires is purged by the
+  # reaper through the same path.
+  my $short = _room(topic => 'expiring with mentions', ttl_days => 0.042)->{room}{id};
+  _join($short, session_id => 'sess-c', name => 'charlie', about => 'reap test');
+  _join($short, session_id => 'sess-d', name => 'delta',   about => 'reap test');
+  _post($short, 'sess-c', 'yours @delta');
+  my $srid = $t->app->chat->find_room($short)->{id};
+  is $db->query('SELECT COUNT(*) FROM chat_mentions WHERE room_id = ?', $srid)->array->[0], 1,
+    'recorded there too';
+
+  $t->app->chat->reap(time + 86400);
+  is $db->query('SELECT COUNT(*) FROM chat_mentions WHERE room_id = ?', $srid)->array->[0], 0,
+    'and the reaper takes them as well';
+};
+
+subtest 'being addressed in one room is not being addressed in another' => sub {
+  # Belt as well as braces. Even with the purge fixed, a filter that asks only
+  # "is there a row for this member?" trusts every id in the table to be the id
+  # it thinks it is. Scoping it to the room costs one clause and makes an
+  # orphan -- from any source, including one this code has not thought of --
+  # unable to reach anybody.
+  my $id = _room(topic => 'scoped')->{room}{id};
+  _join($id, session_id => 'sess-x', name => 'xray', about => 'scope test');
+  _post($id, 'sess-x', 'nothing addressed to anyone');
+
+  my $chat = $t->app->chat;
+  my $room = $chat->find_room($id);
+  my $me   = $chat->member($room, 'sess-x');
+  my $ev   = $chat->messages($room)->[-1];
+
+  # Exactly the shape rowid reuse produces: real event, real member, wrong room.
+  $chat->sql->db->query(
+    'INSERT INTO chat_mentions (event_id, member_id, room_id) VALUES (?,?,?)',
+    $ev->{id}, $me->{id}, $room->{id} + 9999);
+
+  is scalar @{$chat->messages($room, mentions_me => $me->{id})}, 0,
+    'a mention row belonging to another room reaches nobody';
+};
+
+subtest 'the sweep repairs a database that already ran 1.5.0' => sub {
+  # An instance that ran 1.5.0 has orphans in it already, and they do not repair
+  # themselves -- they wait for a rowid to be reused. So the fix has to reach
+  # backwards, once, rather than only stopping new ones being made.
+  my $file = "$tmp/orphans.db";
+  my $sql  = Mojo::SQLite->new("sqlite:$file");
+  Share::Chat->new(sql => $sql, log => $t->app->log)->init;
+
+  my $db = $sql->db;
+  $db->query('INSERT INTO chat_rooms (id, secret, topic, created_at, expires_at) '
+      . 'VALUES (1, ?, ?, ?, ?)', 'b' x 32, 'still here', time, time + 86400);
+  $db->query('INSERT INTO chat_members (id, room_id, session_id, name, name_key, kind, '
+      . 'joined_at, last_seen_at) VALUES (1,1,?,?,?,?,?,?)',
+    'sess-1', 'alpha', 'alpha', 'agent', time, time);
+  $db->query('INSERT INTO chat_events (id, room_id, session_id, name, type, body, '
+      . 'created_at) VALUES (1,1,?,?,?,?,?)', 'sess-1', 'alpha', 'message', 'hi', time);
+
+  # One good row, and one orphan of each shape 1.5.0 could leave. The pairs are
+  # distinct because (event_id, member_id) is unique -- an event addresses a
+  # member once -- so the room is the only part that can vary freely.
+  $db->query('INSERT INTO chat_mentions (event_id, member_id, room_id) VALUES (?,?,?)', @$_)
+    for ([1, 1, 1],     # real
+      [2, 1, 1],        # the event is gone
+      [1, 2, 1],        # the member is gone
+      [3, 3, 99]);      # the room is gone, and so is everything in it
+  is $db->query('SELECT COUNT(*) FROM chat_mentions')->array->[0], 4, 'four rows to start';
+
+  # Rewound to 2 so init runs migration 3 and only that, which is exactly what an
+  # instance already on 1.5.0 does when it restarts on this version.
+  $db->query(q{UPDATE mojo_migrations SET version = 2 WHERE name = 'share_chat'});
+  Share::Chat->new(sql => $sql, log => $t->app->log)->init;
+
+  my $left = $db->query('SELECT event_id, member_id, room_id FROM chat_mentions')
+    ->hashes->to_array;
+  is scalar @$left, 1, 'the orphans are gone';
+  is_deeply $left->[0], {event_id => 1, member_id => 1, room_id => 1},
+    'and the real one is untouched';
+};
+
 done_testing;
