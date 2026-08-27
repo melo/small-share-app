@@ -118,11 +118,18 @@ my %CFG = (
   # How long before a room's expiry it says so, in the room, once.
   chat_expiry_warning => _number(SHARE_CHAT_EXPIRY_WARNING => 7200),
 
-  # Whether posting needs the member_token that join handed back. Off for one
-  # release so that nothing written against yesterday's shape breaks today; the
-  # operations that did not exist yesterday — edit, delete, rename a room —
-  # require it from the start, because they have no callers to break.
-  chat_require_token => _number(SHARE_CHAT_REQUIRE_TOKEN => 0),
+  # Whether writing to a room needs the member_token that join hands back once.
+  #
+  # ON by default, which is a break, and deliberate. With it off, a room URL is
+  # the whole credential for writing as well as reading -- so anyone who was ever
+  # handed one, or found one in scrollback, can post as any member, rename them,
+  # mark them gone or move their read cursor. An audit demonstrated all four
+  # against a default instance. "The URL is the read credential" was always the
+  # documented bargain; the write half was never meant to be part of it.
+  #
+  # Set SHARE_CHAT_REQUIRE_TOKEN=0 to go back, for an instance whose agents
+  # cannot be restarted yet. It is read once at startup.
+  chat_require_token => _number(SHARE_CHAT_REQUIRE_TOKEN => 1),
 
   # How long a member may say nothing at all before the room marks them gone.
   # The browser keeps itself alive every 60-90s; five minutes survives a closed
@@ -1218,10 +1225,47 @@ sub _delete_password ($c) {
 # into remote_address. Neither is forgeable by a client that is actually behind
 # the proxy, and a deployment with nothing in front has no forwarded headers to
 # be confused by.
+# Who to count this request against.
+#
+# `CF-Connecting-IP` used to be believed unconditionally, and three of the four
+# compose files put nothing in front that sets or strips it. So on those the
+# header was simply attacker-controlled, in both directions: rotate it and the
+# limiter never fires; put a VICTIM's address in it and fill their bucket
+# instead, throttling a chosen participant out of a room. The same identity gates
+# uploads, and the disk quota evicts the globally oldest file rather than the
+# offender's -- so defeating the limiter was also a way to delete other people's
+# shares.
+#
+# A forwarded address is now only believed from a peer that is allowed to send
+# one. SHARE_TRUSTED_PROXIES is a comma-separated list of addresses or CIDR
+# prefixes; empty, the default, means trust nothing and use the peer.
 sub _client ($c) {
-  my $cf = $c->req->headers->header('CF-Connecting-IP');
-  return $cf if defined $cf && length $cf;
-  return $c->tx->remote_address // 'unknown';
+  my $peer = $c->tx->remote_address // 'unknown';
+  return $peer unless _trusted_proxy($peer);
+
+  for my $header (qw(CF-Connecting-IP X-Forwarded-For)) {
+    my $value = $c->req->headers->header($header) // next;
+    # The left-most entry is the original client; everything after it was added
+    # by a hop. Only the nearest hop is trusted to have got it right.
+    my ($first) = split /\s*,\s*/, $value;
+    return $first if defined $first && length $first;
+  }
+  return $peer;
+}
+
+# Cheap prefix matching rather than real CIDR arithmetic: this is a small
+# allow-list an operator writes by hand, and pulling in a netmask library to
+# compare a handful of strings would be a new runtime dependency for nothing.
+# A prefix must end at a dot boundary so that 10.1.2 cannot match 10.1.20.
+sub _trusted_proxy ($peer) {
+  state $trusted = [grep { length } split /\s*,\s*/, ($ENV{SHARE_TRUSTED_PROXIES} // '')];
+  return 0 unless @$trusted;
+  for my $entry (@$trusted) {
+    my $prefix = $entry =~ s{/\d+\z}{}r;
+    return 1 if $peer eq $prefix;
+    return 1 if index($peer, "$prefix.") == 0;
+  }
+  return 0;
 }
 
 # Returns a Retry-After value when the caller must wait, undef when it may go.

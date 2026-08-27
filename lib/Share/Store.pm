@@ -639,7 +639,14 @@ sub remove ($self, $secret, $password = undef) {
   # wrong, so this cannot be used to enumerate ids.
   my $refuse = "no such file, or the wrong delete password";
 
-  return (0, $refuse) unless $row;
+  # The same refusal for both cases, and the same cost for both: without the
+  # dummy derivation below, a missing file answered in a millisecond and a real
+  # one in a quarter of a second.
+  unless ($row) {
+    my ($salt, $hash) = password_hash(token(24));
+    password_ok($password // '', $salt, $hash);
+    return (0, $refuse);
+  }
   return (0, $refuse) unless password_ok($password, $row->{delete_salt}, $row->{delete_hash});
 
   $self->_purge($row);
@@ -713,7 +720,14 @@ sub public ($self, $row, $base_url) {
     size         => 0 + $row->{size},
     size_human   => human_size($row->{size}),
     sha256       => $row->{sha256},
-    session_id   => $row->{session_id},
+    # NOT session_id. It looks like a label and it is a capability: for_session
+    # returns every live file a session shared, so printing it in the metadata of
+    # one file handed whoever held that link the index to the agent's entire
+    # conversation. It is also the same identifier namespace the rooms use, so an
+    # id learned from a file was a way into a room.
+    #
+    # The owner knows its own id and can still list with it. Nobody else learns
+    # one from here.
     title        => $row->{title},
     note         => $row->{note},
     created_at   => iso8601($row->{created_at}),

@@ -60,12 +60,20 @@ services:
       # deleted.
       SHARE_CHAT_EXPIRY_WARNING: ${SHARE_CHAT_EXPIRY_WARNING:-7200}
 
-      # Whether posting requires the member_token that join hands back once.
-      # Off by default for one release: without it a session id is a claim
-      # rather than a credential, and session ids used to be published on every
-      # message. Turn it on once the agents talking to this instance have been
-      # restarted.
-      SHARE_CHAT_REQUIRE_TOKEN: ${SHARE_CHAT_REQUIRE_TOKEN:-0}
+      # Whether writing to a room requires the member_token that join hands back
+      # once. ON by default: without it a room URL is the credential for writing
+      # as well as reading, so anyone who was ever handed one can post as any
+      # member, rename them, or mark them gone. Set to 0 only for an instance
+      # whose agents cannot be restarted yet.
+      SHARE_CHAT_REQUIRE_TOKEN: ${SHARE_CHAT_REQUIRE_TOKEN:-1}
+
+      # Peers allowed to tell this instance who the real client is, as a
+      # comma-separated list of addresses or CIDR prefixes. Empty means trust
+      # nobody and count the peer itself -- which is right unless something in
+      # front sets CF-Connecting-IP or X-Forwarded-For. Believing that header
+      # from anyone lets a caller rotate it to escape the rate limit, or put
+      # somebody else's address in it to throttle them out of a room.
+      SHARE_TRUSTED_PROXIES: ${SHARE_TRUSTED_PROXIES:-}
 
       # How long a member may say nothing at all before the room concludes they
       # are gone and says so in the transcript. The room page keeps itself alive

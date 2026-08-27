@@ -345,11 +345,16 @@ MD
 
 my ($id, $delete_password);
 
+# NOT session_id, anywhere in a file's metadata. It looks like a label and it is
+# a capability: /api/v1/files?session_id=… returns every live file that session
+# shared, so echoing it back from one file handed whoever held that link the
+# index to the agent's whole conversation. The owner knows its own and can still
+# list with it; nobody else learns one from here.
 subtest 'raw-body upload' => sub {
   $t->post_ok("/api/v1/files?filename=report.md&session_id=$SESSION&note=have+a+look"
       => {'Content-Type' => 'text/markdown'} => $MARKDOWN)->status_is(201)
     ->json_is('/filename' => 'report.md')->json_is('/kind' => 'markdown')
-    ->json_is('/session_id' => $SESSION)->json_is('/note' => 'have a look')
+    ->json_is('/note' => 'have a look')
     ->json_like('/url' => qr{\Ahttps://share\.example\.test/f/[A-Za-z0-9]{32}\z})
     ->json_like('/expires_in' => qr/^(?:14|15) days$/);
 
@@ -1010,7 +1015,7 @@ subtest 'MCP: get_upload_url hands back a command, not a byte sink' => sub {
   # And the URL it produced actually works — this is the contract.
   my $upload = Mojo::URL->new($out->{upload_url});
   $t->post_ok($upload->path_query => form => {file => {content => "# a report\n",
-      filename => 'report.md'}})->status_is(201)->json_is('/session_id' => $SESSION)
+      filename => 'report.md'}})->status_is(201)
     ->json_is('/title' => 'A report')->json_like('/expires_in' => qr/^(?:2|3) days$/);
   my $made = $t->tx->res->json;
 
@@ -1156,6 +1161,28 @@ subtest 'the delete password is disclosed exactly once' => sub {
   $t->get_ok("/f/$once")->status_is(200)->content_unlike(qr/\Q$password\E/);
 
   _delete($once, $password)->code == 200 or die 'cleanup failed';
+};
+
+subtest 'a file does not name the session that shared it' => sub {
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+  local $t->app->store->{rate_per_second} = 1000;
+  local $t->app->store->{rate_per_minute} = 1000;
+
+  $t->post_ok("/api/v1/files?filename=secretive.md&session_id=$SESSION" => '# hello')
+    ->status_is(201);
+  my $file = $t->tx->res->json;
+  ok !exists $file->{session_id}, 'not in the upload response';
+
+  $t->get_ok("/api/v1/files/$file->{id}")->status_is(200);
+  ok !exists $t->tx->res->json->{session_id}, 'not in the metadata';
+
+  # The owner, which knows its own, can still find what it shared.
+  $t->get_ok("/api/v1/files?session_id=$SESSION")->status_is(200);
+  ok scalar(grep { $_->{id} eq $file->{id} } @{$t->tx->res->json->{files}}),
+    'and listing by it still works for whoever has it';
+
+  $t->delete_ok("/api/v1/files/$file->{id}" =>
+      {'X-Delete-Password' => $file->{delete_password}})->status_is(200);
 };
 
 done_testing;

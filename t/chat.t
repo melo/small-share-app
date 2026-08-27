@@ -21,7 +21,9 @@ use Mojo::IOLoop ();
 # from_json, not decode_json: anything read out of an MCP result has already
 # been decoded from the response and is characters. See t/share.t.
 use Mojo::JSON  qw(from_json);
+use Digest::SHA  ();
 use Mojo::SQLite ();
+use Time::HiRes  ();
 use Share::Chat  ();
 use Test::Mojo  ();
 use Test::More;
@@ -48,6 +50,8 @@ delete $ENV{SHARE_TTL_DAYS};
 }
 
 my $t = Test::Mojo->new(curfile->dirname->sibling('share.pl'));
+
+my %TOKEN;
 
 my $PROTOCOL = '2026-07-28';
 my $META     = 'io.modelcontextprotocol/protocolVersion';
@@ -89,10 +93,27 @@ sub _mcp ($method, $params = undef, %opt) {
 }
 
 # One tool call, unwrapped to the structured content it answered with.
+#
+# It carries the caller's member_token the way a real client does -- kept from
+# the join that issued it -- unless the test supplied one itself, which is how
+# the guard tests pass a wrong one or none at all.
 sub _call ($name, $args) {
+  my $key = defined $args->{room} && defined $args->{session_id}
+    ? _room_id($args->{room}) . "/$args->{session_id}" : undef;
+  $args = {member_token => $TOKEN{$key}, %$args}
+    if defined $key && defined $TOKEN{$key} && !exists $args->{member_token};
+
   my $res = _mcp('tools/call', {name => $name, arguments => $args});
+
+  # A join over MCP issues a token too, and it is shown exactly once.
+  my $tok = $res->{result}{structuredContent}{member_token};
+  $TOKEN{$key} = $tok if defined $key && length($tok // '');
   return $res->{result};
 }
+
+# A room is named by URL or by id, and %TOKEN is keyed by id.
+sub _room_id ($value) { my $id = "$value"; $id =~ s{[?#].*\z}{}; $id =~ s{/+\z}{};
+  $id =~ s{.*/}{}; return $id }
 
 # A room, made the way an agent makes one.
 sub _room (%args) {
@@ -100,14 +121,23 @@ sub _room (%args) {
   return $t->tx->res->json;
 }
 
+# Joining hands back a member_token exactly once, and writing needs it now that
+# SHARE_CHAT_REQUIRE_TOKEN is on by default. Remembering it here is what a real
+# caller does; the tests that care about the guard pass it explicitly, or omit it
+# on purpose.
 sub _join ($id, %args) {
+  $args{member_token} //= $TOKEN{"$id/$args{session_id}"}
+    if defined $args{session_id};
   $t->post_ok("/api/v1/chatrooms/$id/members" => json => {%args});
-  return $t->tx->res->json;
+  my $json = $t->tx->res->json;
+  $TOKEN{"$id/$args{session_id}"} = $json->{member_token}
+    if ref $json eq 'HASH' && length($json->{member_token} // '');
+  return $json;
 }
 
 sub _post ($id, $session, $body) {
   $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
-      {session_id => $session, body => $body});
+      {session_id => $session, body => $body, member_token => $TOKEN{"$id/$session"}});
   return $t->tx->res->json;
 }
 
@@ -116,10 +146,36 @@ sub _post ($id, $session, $body) {
 # required of an agent and optional for somebody who has just opened the page --
 # so a human arrives the way a human really does, through the model behind the
 # browser's join form.
+sub _token ($id, $session) { return $TOKEN{"$id/$session"} }
+
+# The member-attributed writes over REST. Each carries that member's token,
+# because each of them changes something about that member and a session id is
+# a name rather than a credential.
+sub _mark_read ($id, $session, $cursor) {
+  $t->post_ok("/api/v1/chatrooms/$id/members/$session/read" => json =>
+      {cursor => $cursor, member_token => _token($id, $session)});
+  return $t->tx->res->json;
+}
+
+sub _leave ($id, $session) {
+  $t->delete_ok("/api/v1/chatrooms/$id/members/$session" => json =>
+      {member_token => _token($id, $session)});
+  return $t->tx->res->json;
+}
+
+sub _alive ($id, $session) {
+  $t->post_ok("/api/v1/chatrooms/$id/members/$session/alive" => json =>
+      {member_token => _token($id, $session)});
+  return $t->tx->res->json;
+}
+
 sub _human ($id, $session, $name) {
   my $room = $t->app->chat->find_room($id);
-  my ($member) = $t->app->chat->join_room($room,
-    client => 'test', session_id => $session, name => $name, kind => 'human');
+  my ($member, undef, $token) = $t->app->chat->join_room($room,
+    client => 'test', trusted => 1, session_id => $session, name => $name, kind => 'human');
+  # A person joining through the page gets a token like anyone else; the browser
+  # keeps it in its signed cookie, and here the helper keeps it for them.
+  $TOKEN{"$id/$session"} = $token if length($token // '');
   return $member;
 }
 
@@ -304,11 +360,19 @@ subtest 'posting is for members, and a message is markdown and nothing else' => 
   my $id = _room(topic => 'posting')->{room}{id};
   _join($id, session_id => 'sess-a', name => 'planner', about => 'the checklist');
 
+  # A stranger and a member who did not bring a token get the SAME answer. It
+  # used to be "join the room before posting" for one and a refusal for the
+  # other, which made a room URL a way to test whether a guessed session id was
+  # a real member.
   $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
-      {session_id => 'stranger', body => 'hello'})
-    ->status_is(400)->json_like('/error' => qr/join the room before posting/);
+      {session_id => 'stranger', body => 'hello'})->status_is(403);
+  my $stranger = $t->tx->res->json->{error};
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-a', body => 'hello'})->status_is(403);
+  is $t->tx->res->json->{error}, $stranger, 'and a member without one gets it too';
 
-  $t->post_ok("/api/v1/chatrooms/$id/messages" => json => {session_id => 'sess-a', body => ''})
+  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+      {session_id => 'sess-a', body => '', member_token => _token($id, 'sess-a')})
     ->status_is(400)->json_like('/error' => qr/a message needs something in it/);
 
   my $said = _post($id, 'sess-a', "**staging is green**\n\n- ran the migration");
@@ -327,18 +391,20 @@ subtest 'posting is for members, and a message is markdown and nothing else' => 
   my $was  = $chat->max_message_bytes;
   $chat->max_message_bytes(64);
   $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
-      {session_id => 'sess-a', body => 'x' x 100})
+      {session_id => 'sess-a', body => 'x' x 100, member_token => _token($id, 'sess-a')})
     ->status_is(400)->json_like('/error' => qr/put the long thing in a file/);
 
   # Bytes, not characters: an emoji must not buy four times the room.
   $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
-      {session_id => 'sess-a', body => "\x{1f680}" x 20})
+      {session_id => 'sess-a', body => "\x{1f680}" x 20,
+        member_token => _token($id, 'sess-a')})
     ->status_is(400)->json_like('/error' => qr/\A那?that message is 80 bytes/i);
   $chat->max_message_bytes($was);
 
   # Form parameters work as well as JSON, because both are one line of curl.
   $t->post_ok("/api/v1/chatrooms/$id/messages" => form =>
-      {session_id => 'sess-a', body => 'posted as a form'})->status_is(201)
+      {session_id => 'sess-a', body => 'posted as a form',
+        member_token => _token($id, 'sess-a')})->status_is(201)
     ->json_is('/message/body' => 'posted as a form');
 };
 
@@ -411,7 +477,7 @@ subtest 'a caller can wait for the next thing said instead of asking again' => s
   # happened yet and really is woken by the write.
   Mojo::IOLoop->timer(
     0.3 => sub { $t->app->chat->post($t->app->chat->find_room($id),
-        client => 'test', session_id => 'sess-a', body => 'woke you') });
+        client => 'test', trusted => 1, session_id => 'sess-a', body => 'woke you') });
 
   my $started = time;
   $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=10")->status_is(200)
@@ -438,7 +504,7 @@ subtest 'a person is asked who they are before the room opens' => sub {
   my $id = _room(topic => 'the human', purpose => 'a person and an agent')->{room}{id};
   _join($id, session_id => 'agent-1', name => 'planner', about => 'holding the checklist');
   $t->app->chat->post($t->app->chat->find_room($id),
-    client => 'test', session_id => 'agent-1', body => "# Plan\n\n<script>alert(1)</script>");
+    client => 'test', trusted => 1, session_id => 'agent-1', body => "# Plan\n\n<script>alert(1)</script>");
 
   my %html = (Accept => 'text/html');
   $t->get_ok("/c/$id" => \%html)->status_is(200)
@@ -636,7 +702,7 @@ subtest 'MCP: reading can wait, and waiting does not block the worker' => sub {
 
   Mojo::IOLoop->timer(
     0.3 => sub { $t->app->chat->post($t->app->chat->find_room($id),
-        client => 'test', session_id => 'sess-a', body => 'over here') });
+        client => 'test', trusted => 1, session_id => 'sess-a', body => 'over here') });
 
   my $waited = _call('get_chat_messages', {room => $url, since => $cursor, wait => 10});
   is $waited->{structuredContent}{count}, 1, 'the tool answered when the message landed';
@@ -738,7 +804,7 @@ subtest 'a park that ends in silence says so' => sub {
 
   Mojo::IOLoop->timer(0.2 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      client => 'test', session_id => 'sess-w', body => 'oi') });
+      client => 'test', trusted => 1, session_id => 'sess-w', body => 'oi') });
   $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=10")->status_is(200)
     ->json_is('/timed_out' => Mojo::JSON->false)
     ->json_is('/count' => 1);
@@ -852,21 +918,21 @@ subtest 'the server keeps your place, but only when you ask it to' => sub {
   _post($id, 'sess-p', 'two');
 
   # A watcher that remembers nothing asks for what it has not read.
-  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+  my $got = $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r&member_token=" . (_token($id, 'sess-r') // '') . "")
     ->status_is(200)->tx->res->json;
   is $got->{count}, 4, 'two arrivals and two messages';
   is $got->{unread}, 0, 'and it is now caught up';
 
   # Asking again gets nothing, because the server advanced the cursor.
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r&member_token=" . (_token($id, 'sess-r') // '') . "")
     ->status_is(200)->json_is('/count' => 0);
 
   # An explicit cursor does NOT move the stored one: the caller is carrying its
   # own position and the server has no business overwriting it.
   _post($id, 'sess-p', 'three');
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=0&session_id=sess-r")->status_is(200)
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=0&session_id=sess-r&member_token=" . (_token($id, 'sess-r') // '') . "")->status_is(200)
     ->json_is('/count' => 5);
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r")
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-r&member_token=" . (_token($id, 'sess-r') // '') . "")
     ->status_is(200)->json_is('/count' => 1)->json_is('/events/0/body' => 'three');
 
   # A watcher that reads with its OWN cursor acknowledges separately, and can
@@ -877,18 +943,18 @@ subtest 'the server keeps your place, but only when you ask it to' => sub {
   _post($id, 'sess-p', 'four');
   _post($id, 'sess-p', 'five');
   my $mine = $t->app->chat->read_cursor($t->app->chat->find_room($id), 'sess-r');
-  my $back = $t->get_ok("/api/v1/chatrooms/$id/events?since=$mine&session_id=sess-r")
+  my $back = $t->get_ok("/api/v1/chatrooms/$id/events?since=$mine&session_id=sess-r&member_token=" . (_token($id, 'sess-r') // '') . "")
     ->tx->res->json;
   is $back->{count},  2, 'two more arrived';
   is $back->{unread}, 2, 'and an explicit read did not silently mark them read';
 
-  $t->post_ok("/api/v1/chatrooms/$id/members/sess-r/read" => json =>
-      {cursor => $back->{events}[0]{id}})->status_is(200)->json_is('/unread' => 1);
+  _mark_read($id, 'sess-r', $back->{events}[0]{id});
+  $t->status_is(200)->json_is('/unread' => 1);
 
   # A cursor never goes backwards: two reads can overlap, and the later one
   # landing first must not un-read what the earlier one already delivered.
-  $t->post_ok("/api/v1/chatrooms/$id/members/sess-r/read" => json => {cursor => 1})
-    ->status_is(200)->json_is('/unread' => 1);
+  _mark_read($id, 'sess-r', 1);
+  $t->status_is(200)->json_is('/unread' => 1);
 
   # Somebody who never joined has read nothing, so `unread` means the room. It is
   # not an error and it is not a leak: they could have asked for since=0 anyway,
@@ -901,18 +967,18 @@ subtest 'a park can start from where you left off' => sub {
   my $id = _room(topic => 'parked unread')->{room}{id};
   _join($id, session_id => 'sess-u', name => 'watcher', about => 'unread park');
   # Catch up so the park below genuinely has nothing waiting for it.
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u");
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u&member_token=" . (_token($id, 'sess-u') // '') . "");
 
   Mojo::IOLoop->timer(0.3 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      client => 'test', session_id => 'sess-u', body => 'arrived while parked') });
+      client => 'test', trusted => 1, session_id => 'sess-u', body => 'arrived while parked') });
 
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u&wait=10")
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u&member_token=" . (_token($id, 'sess-u') // '') . "&wait=10")
     ->status_is(200)->json_is('/count' => 1)
     ->json_is('/events/0/body' => 'arrived while parked');
 
   # And the park advanced the stored cursor too, so re-arming is not a re-read.
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u")
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u&member_token=" . (_token($id, 'sess-u') // '') . "")
     ->status_is(200)->json_is('/count' => 0);
 };
 
@@ -922,7 +988,7 @@ subtest 'the moment you post is the moment you are provably listening' => sub {
   _join($id, session_id => 'sess-y', name => 'other',  about => 'gap test');
 
   # Catch up, so the gap below is unambiguous.
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-x");
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-x&member_token=" . (_token($id, 'sess-x') // '') . "");
 
   # Two things are said while sess-x is not looking. This is the exact failure
   # from the field: a cursor that went 11 -> 15 -> 21 and never said why.
@@ -971,20 +1037,20 @@ subtest 'a mention is data, and an at-sign was decoration' => sub {
   is_deeply $got->{events}[0]{mentions}, [], 'an at-sign that matches nobody is just an at-sign';
 
   # "Has anyone addressed me?" is one call.
-  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&since=0")
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&member_token=" . (_token($id, 'sess-2') // '') . "&since=0")
     ->status_is(200)->tx->res->json;
   is $got->{count}, 2, 'both, and none of the others';
 
   # A rename does not orphan what was already addressed to you: the row binds to
   # the member, and the name is looked up when it is asked for.
   _join($id, session_id => 'sess-2', name => 'E1', about => 'renamed mid-run');
-  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&since=0")
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&member_token=" . (_token($id, 'sess-2') // '') . "&since=0")
     ->tx->res->json;
   is $got->{count}, 2, 'still both';
   is_deeply $got->{events}[0]{mentions}, ['E1'], 'under the name they go by now';
 
   # Headers carry them too, which is the combination a watcher actually uses.
-  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2"
+  $got = $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-2&member_token=" . (_token($id, 'sess-2') // '') . ""
       . "&since=0&format=headers")->tx->res->json;
   is_deeply $got->{events}[0]{mentions}, ['E1'], 'in headers as well as in full';
 };
@@ -1004,9 +1070,9 @@ subtest 'one message can reach the whole fleet, and no human' => sub {
   # Not the person who sent it, and not any other person. Steering the fleet
   # should not ping the people who are reading anyway -- that is the difference
   # between a broadcast and a megaphone.
-  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-h&since=0")
+  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-h&member_token=" . (_token($id, 'sess-h') // '') . "&since=0")
     ->json_is('/count' => 0);
-  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-a&since=0")
+  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1&session_id=sess-a&member_token=" . (_token($id, 'sess-a') // '') . "&since=0")
     ->json_is('/count' => 1);
 };
 
@@ -1022,10 +1088,10 @@ subtest 'a park on being wanted is not woken by ordinary chatter' => sub {
   # watcher an agent leaves running and one it turns off.
   Mojo::IOLoop->timer(0.2 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      client => 'test', session_id => 'sess-a', body => 'unrelated noise') });
+      client => 'test', trusted => 1, session_id => 'sess-a', body => 'unrelated noise') });
   Mojo::IOLoop->timer(0.6 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      client => 'test', session_id => 'sess-a', body => 'over to you @bravo') });
+      client => 'test', trusted => 1, session_id => 'sess-a', body => 'over to you @bravo') });
 
   $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10"
       . "&mentions_me=1&session_id=sess-b")->status_is(200)
@@ -1039,8 +1105,8 @@ subtest 'leaving is a call, and the roster stops lying about it' => sub {
   _join($id, session_id => 'sess-g', name => 'goer',   about => 'presence test');
   _post($id, 'sess-g', 'something worth keeping');
 
-  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-g")->status_is(200)
-    ->json_is('/left' => 'goer');
+  _leave($id, 'sess-g');
+  $t->status_is(200)->json_is('/left' => 'goer');
 
   my $room = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room};
   my ($gone) = grep { $_->{name} eq 'goer' } @{$room->{members}};
@@ -1058,7 +1124,8 @@ subtest 'leaving is a call, and the roster stops lying about it' => sub {
 
   # Leaving twice is not two events.
   my $before = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{count};
-  $t->delete_ok("/api/v1/chatrooms/$id/members/sess-g")->status_is(200);
+  _leave($id, 'sess-g');
+  $t->status_is(200);
   is $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{count}, $before,
     'saying goodbye twice is still one goodbye';
 
@@ -1069,8 +1136,10 @@ subtest 'leaving is a call, and the roster stops lying about it' => sub {
   isnt $gone->{presence}, 'gone', 'rejoining is not resurrection, it is just being here';
   is scalar @{$room->{members}}, 2, 'and it is still two people';
 
-  # Somebody who was never here cannot leave.
-  $t->delete_ok("/api/v1/chatrooms/$id/members/never-here")->status_is(404);
+  # Somebody who was never here cannot leave -- and gets the same answer a member
+  # without a credential gets, because 404-for-a-stranger and 403-for-a-member is
+  # how a room URL becomes a way to test whether a guessed session id is real.
+  $t->delete_ok("/api/v1/chatrooms/$id/members/never-here")->status_is(403);
 };
 
 subtest 'holding a poll is what says you are listening' => sub {
@@ -1087,7 +1156,7 @@ subtest 'holding a poll is what says you are listening' => sub {
     $seen = $t->app->chat->presence($me);
   });
 
-  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=2&session_id=sess-l")
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=2&session_id=sess-l&member_token=" . (_token($id, 'sess-l') // '') . "")
     ->status_is(200);
   is $seen, 'listening', 'an open poll is the presence signal, with nobody saying anything';
 
@@ -1211,18 +1280,19 @@ subtest 'writing can be made to require the token' => sub {
   my $tok = _join($id, session_id => 'sess-q', name => 'planner', about => 'guard test')
     ->{member_token};
 
-  # Off by default for one release, so nothing written last week breaks today.
-  $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
-      {session_id => 'sess-q', body => 'no token, and that is fine for now'})
-    ->status_is(201);
+  # On by default now. An instance that has to go back -- agents that cannot be
+  # restarted yet -- sets SHARE_CHAT_REQUIRE_TOKEN=0, and then a room URL is once
+  # again the whole credential for writing as well as reading.
+  {
+    local $t->app->chat->{require_token} = 0;
+    $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
+        {session_id => 'sess-q', body => 'no token, on an instance that allows it'})
+      ->status_is(201);
+  }
 
-  # Both, because the flag is read once at startup into Share::Chat -- the guard
-  # belongs to the model rather than to a route, so changing the app's config on
-  # a running instance is no longer enough. In production this is a restart,
-  # which setting it in a compose file requires anyway.
-  local $t->app->config->{chat_require_token} = 1;
-  local $t->app->chat->{require_token} = 1;
-
+  # The flag is read once at startup into Share::Chat, because the guard belongs
+  # to the model rather than to a route. In production, changing it is a restart
+  # -- which setting it in a compose file requires anyway.
   $t->post_ok("/api/v1/chatrooms/$id/messages" => json =>
       {session_id => 'sess-q', body => 'no token'})->status_is(403)
     ->json_like('/error' => qr/member_token/);
@@ -1263,10 +1333,10 @@ subtest 'MCP: park, be woken by a mention, then leave' => sub {
 
   Mojo::IOLoop->timer(0.2 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      client => 'test', session_id => 'sess-mate', body => 'ignore me') });
+      client => 'test', trusted => 1, session_id => 'sess-mate', body => 'ignore me') });
   Mojo::IOLoop->timer(0.6 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      client => 'test', session_id => 'sess-mate', body => 'yours @watcher') });
+      client => 'test', trusted => 1, session_id => 'sess-mate', body => 'yours @watcher') });
 
   my $out = _call(get_room_events => {room => $id, session_id => 'sess-mcp',
     since => 'unread', wait => 10, mentions_me => 1, format => 'headers'})
@@ -1537,8 +1607,12 @@ subtest 'the sweep repairs a database that already ran 1.5.0' => sub {
       [3, 3, 99]);      # the room is gone, and so is everything in it
   is $db->query('SELECT COUNT(*) FROM chat_mentions')->array->[0], 4, 'four rows to start';
 
-  # Rewound to 2 so init runs migration 3 and only that, which is exactly what an
-  # instance already on 1.5.0 does when it restarts on this version.
+  # Wound back to what an instance already on 1.5.0 actually looks like: schema
+  # version 2, and without the columns later migrations added. Rewinding the
+  # version alone would replay those migrations against a database that already
+  # has their columns, which is a fact about this test rather than about any real
+  # upgrade.
+  $db->query('ALTER TABLE chat_members DROP COLUMN author_salt');
   $db->query(q{UPDATE mojo_migrations SET version = 2 WHERE name = 'share_chat'});
   Share::Chat->new(sql => $sql, log => $t->app->log)->init;
 
@@ -1578,7 +1652,7 @@ subtest 'the token guard is on the far side of both transports' => sub {
   # being posted as is somebody else's, which is the whole point: it is readable
   # off nothing at all now, but a caller that knows it must still not be able to
   # speak as them.
-  my $mcp = _call(post_chat_message => {room => $id, session_id => 'sess-v',
+  my $mcp = _call(post_chat_message => {member_token => '', room => $id, session_id => 'sess-v',
     body => 'posted as the victim, with no credential'});
   ok $mcp->{isError}, 'MCP posting without a token is refused';
   like $mcp->{content}[0]{text}, qr/member_token/, 'and says what is missing';
@@ -1590,7 +1664,7 @@ subtest 'the token guard is on the far side of both transports' => sub {
   # 3. Leaving somebody else -- a nuisance rather than impersonation, but it
   # makes the roster say a live agent is gone and everyone stops addressing it.
   $t->delete_ok("/api/v1/chatrooms/$id/members/sess-v")->status_is(403);
-  my $mleave = _call(leave_chatroom => {room => $id, session_id => 'sess-v'});
+  my $mleave = _call(leave_chatroom => {member_token => '', room => $id, session_id => 'sess-v'});
   ok $mleave->{isError}, 'and over MCP too';
 
   # 4. Moving somebody else's read cursor, which is the quiet one: set it
@@ -1753,10 +1827,11 @@ subtest 'every write path refuses a caller who cannot prove who it is' => sub {
     'reading as somebody else does not move their presence';
 
   # --- MCP ------------------------------------------------------------------
-  ok _call(post_chat_message => {room => $id, session_id => 'victim', body => 'as them'})
-    ->{isError}, 'MCP post';
-  ok _call(leave_chatroom => {room => $id, session_id => 'victim'})->{isError}, 'MCP leave';
-  ok _call(join_chatroom => {room => $id, session_id => 'victim',
+  ok _call(post_chat_message => {member_token => '', room => $id, session_id => 'victim',
+      body => 'as them'})->{isError}, 'MCP post';
+  ok _call(leave_chatroom => {member_token => '', room => $id, session_id => 'victim'})->{isError},
+    'MCP leave';
+  ok _call(join_chatroom => {member_token => '', room => $id, session_id => 'victim',
       name => 'pwned', about => 'a stranger wrote this'})->{isError},
     'MCP re-join as an existing member';
 
@@ -1816,8 +1891,8 @@ subtest 'a member who stops saying anything is eventually declared gone' => sub 
 
   # The keep-alive is the cheapest thing in the API, and it is what a page with
   # nobody touching it sends.
-  $t->post_ok("/api/v1/chatrooms/$id/members/stayer/alive" => json => {})
-    ->status_is(200)->json_is('/alive' => Mojo::JSON->true)
+  _alive($id, 'stayer');
+  $t->status_is(200)->json_is('/alive' => Mojo::JSON->true)
     ->json_is('/presence' => 'idle');
   ok $t->tx->res->json->{every} > 0, 'and it says how often to send the next one';
 
@@ -1825,7 +1900,8 @@ subtest 'a member who stops saying anything is eventually declared gone' => sub 
   my $long_ago = time - 3600;
   $chat->sql->db->query('UPDATE chat_members SET last_seen_at = ? WHERE room_id = ?',
     $long_ago, $room->{id});
-  $t->post_ok("/api/v1/chatrooms/$id/members/stayer/alive" => json => {})->status_is(200);
+  _alive($id, 'stayer');
+  $t->status_is(200);
 
   is $chat->sweep_idle(time, force => 1), 1, 'only the silent one is swept';
 
@@ -1896,6 +1972,140 @@ subtest 'an agent parked over MCP is listening, not away' => sub {
   _call(get_room_events =>
     {room => $id, session_id => 'mcp-parked', since => $cursor, wait => 2});
   is $seen, 'listening', 'the roster says so while the park is open';
+};
+
+# ------------------------------------------------------------- identity -----
+
+subtest 'the author key cannot be reversed by somebody holding the room URL' => sub {
+  # 1.5.1 stopped publishing session ids and published sha256(room_secret, id)
+  # instead. But every participant HOLDS the room secret -- it is the URL -- and
+  # the roster hands out the name-to-key map, so recovering a session id was an
+  # offline dictionary attack against a string agents choose to be short and
+  # memorable. The audit recovered "victim" from its key and posted as them.
+  #
+  # The salt is per member and random, so holding the room secret and the whole
+  # roster tells an attacker nothing about anybody's session id.
+  my $id = _room(topic => 'identity')->{room}{id};
+  _join($id, session_id => 'planner', name => 'planner', about => 'a guessable id');
+
+  my $chat = $t->app->chat;
+  my $room = $chat->find_room($id);
+  my $key  = $chat->member_public($chat->member($room, 'planner'), $room)->{author};
+  like $key, qr/\A[0-9a-f]{12}\z/, 'still a short stable handle';
+
+  # The old derivation, computed by hand from what any participant has.
+  my $guessable = substr Digest::SHA::sha256_hex("$room->{secret}\0planner"), 0, 12;
+  isnt $key, $guessable, 'and not derivable from the room secret and the name';
+
+  # Stable across reads, because the page uses it to mark your own messages.
+  is $chat->member_public($chat->member($room, 'planner'), $room)->{author}, $key,
+    'the same handle every time';
+
+  # Different in another room, so one session cannot be followed between rooms.
+  my $other = _room(topic => 'elsewhere')->{room}{id};
+  _join($other, session_id => 'planner', name => 'planner', about => 'same session');
+  my $oroom = $chat->find_room($other);
+  isnt $chat->member_public($chat->member($oroom, 'planner'), $oroom)->{author}, $key,
+    'and a different one in a different room';
+};
+
+subtest 'one file URL does not hand over the index to everything else shared' => sub {
+  # session_id is a LISTING CAPABILITY -- for_session returns every live file a
+  # session shared -- and it was printed in the metadata of every file. Hand
+  # somebody one link and they held the index to that agent's whole
+  # conversation. The chat side went to some trouble to stop exactly this while
+  # the file side published the raw id, and it is the same namespace, so an id
+  # learned here was also the key to impersonation in a room.
+  # Uploads have their own bucket, spent by earlier subtests and set to one a
+  # second by default. Neither is what this subtest is about.
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+  # On the store object, not in config: the upload limits are attributes set at
+  # construction, where the chat ones are read from config at call time.
+  local $t->app->store->{rate_per_second} = 1000;
+  local $t->app->store->{rate_per_minute} = 1000;
+
+  $t->post_ok('/api/v1/files?filename=one.md&session_id=agent-alpha' => '# one')
+    ->status_is(201);
+  my $one = $t->tx->res->json;
+  $t->post_ok('/api/v1/files?filename=two.md&session_id=agent-alpha' => '# two')
+    ->status_is(201);
+  my $two = $t->tx->res->json;
+
+  ok !exists $one->{session_id}, 'the upload response does not echo it back';
+  $t->get_ok("/api/v1/files/$one->{id}")->status_is(200);
+  ok !exists $t->tx->res->json->{session_id}, 'nor does the metadata of a file';
+
+  my $mcp = _call(get_shared_file => {id => $one->{id}})->{structuredContent};
+  ok !exists $mcp->{session_id}, 'nor the MCP tool';
+
+  # The owner, who knows its own id, can still list its own.
+  $t->get_ok('/api/v1/files?session_id=agent-alpha')->status_is(200)
+    ->json_is('/count' => 2);
+
+  $t->delete_ok("/api/v1/files/$_->{id}" => {'X-Delete-Password' => $_->{delete_password}})
+    ->status_is(200) for $one, $two;
+};
+
+subtest 'refusing tells you nothing about whether the thing exists' => sub {
+  # Two oracles the audit found, both of which the code believed it had closed.
+  #
+  # The delete refusal says one sentence for "no such room" and "wrong password"
+  # -- but only ran the key derivation when the room existed, so it answered in
+  # a millisecond for one and a quarter second for the other.
+  my $made = _room(topic => 'timing');
+  my $real = $made->{room}{id};
+
+  my $t0 = Time::HiRes::time();
+  $t->delete_ok("/api/v1/chatrooms/$real" => {'X-Delete-Password' => 'wrong'})->status_is(403);
+  my $existing = Time::HiRes::time() - $t0;
+
+  $t0 = Time::HiRes::time();
+  $t->delete_ok('/api/v1/chatrooms/nosuchroomnosuchroom12345678' =>
+      {'X-Delete-Password' => 'wrong'})->status_is(403);
+  my $missing = Time::HiRes::time() - $t0;
+
+  # Within an order of magnitude of each other, rather than 270x apart.
+  ok $missing > $existing / 5,
+    sprintf('a missing room costs about what a real one does (%.3fs vs %.3fs)',
+      $missing, $existing);
+
+  # And membership: leaving somebody else's session said 403 for a member and
+  # 404 for a stranger, so a room URL was a way to test whether a guessed
+  # session id was real.
+  my $id = _room(topic => 'membership oracle')->{room}{id};
+  _join($id, session_id => 'a-real-member', name => 'real', about => 'x');
+
+  local $t->app->config->{chat_require_token} = 1;
+  local $t->app->chat->{require_token} = 1;
+
+  $t->delete_ok("/api/v1/chatrooms/$id/members/a-real-member")->status_is(403);
+  my $member = $t->tx->res->json->{error};
+  $t->delete_ok("/api/v1/chatrooms/$id/members/invented")->status_is(403);
+  is $t->tx->res->json->{error}, $member, 'a member and a stranger get one answer';
+};
+
+subtest 'a forwarded address is only believed from a peer allowed to send one' => sub {
+  # Rotating CF-Connecting-IP defeated the limiter entirely; putting a victim's
+  # address in it filled THEIR bucket and threw them out of a room. Three of the
+  # four shipped compose files put nothing in front that strips the header.
+  my $cfg = $t->app->config;
+  my @was = @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)};
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = (1, 2);
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+
+  # Nothing is trusted by default, so the header is ignored and one client is
+  # one client however it labels itself.
+  my @codes;
+  for my $i (1 .. 5) {
+    $t->post_ok('/api/v1/chatrooms' => {'CF-Connecting-IP' => "10.0.0.$i"} =>
+        json => {topic => "spoof $i"});
+    push @codes, $t->tx->res->code;
+  }
+  ok scalar(grep { $_ == 429 } @codes) >= 2,
+    'rotating the header does not buy more requests (' . join(' ', @codes) . ')';
+
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = @was;
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
 };
 
 done_testing;

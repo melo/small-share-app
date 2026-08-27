@@ -264,6 +264,22 @@ DELETE FROM chat_mentions
 -- Nothing to undo: the rows this dropped were already pointing at nothing.
 SELECT 1;
 
+-- 4 up
+-- A random per member, so the handle published on every message cannot be
+-- turned back into the session id it stands for.
+--
+-- The handle used to be sha256(room_secret, session_id). Every participant holds
+-- the room secret -- it IS the URL -- and the roster hands out the name-to-handle
+-- map, so recovering a session id was an offline dictionary attack against a
+-- string agents deliberately choose to be short and memorable. "planner" fell
+-- immediately. This makes the handle independent of anything an attacker can
+-- guess or already knows.
+ALTER TABLE chat_members ADD COLUMN author_salt TEXT;
+UPDATE chat_members SET author_salt = lower(hex(randomblob(16))) WHERE author_salt IS NULL;
+
+-- 4 down
+SELECT 1;
+
 
 -- 2 down
 DROP TABLE chat_mentions;
@@ -402,7 +418,15 @@ sub remove_room ($self, $secret, $password = undef) {
   my $room  = $self->sql->db->query('SELECT * FROM chat_rooms WHERE secret = ?', $secret)->hash;
   my $refuse = 'no such room, or the wrong delete password';
 
-  return (0, $refuse) unless $room;
+  # The refusal is one sentence for both cases on purpose -- but until now only
+  # a room that existed paid for the key derivation, so the two answers were a
+  # millisecond and a quarter of a second apart. The sentence said nothing and
+  # the clock said everything.
+  unless ($room) {
+    my ($salt, $hash) = password_hash(token(24));
+    password_ok($password // '', $salt, $hash);
+    return (0, $refuse);
+  }
   return (0, $refuse) unless password_ok($password, $room->{delete_salt}, $room->{delete_hash});
 
   $self->_purge_room($room);
@@ -626,10 +650,14 @@ sub presence ($self, $member, $now = time) {
 # one afternoon, and the roster went on listing both as present -- which looks
 # identical to two that are listening, and is how you end up addressing nobody.
 sub leave_room ($self, $room, $session_id, %args) {
-  my $member = $self->member($room, $session_id) or return undef;
-  # After the lookup, so that "nobody here by that id" is still a 404 rather
-  # than a 403 that confirms the id exists.
+  # BEFORE the lookup. The comment that used to sit here argued the opposite --
+  # look first, so a stranger gets a 404 rather than a 403 "that confirms the id
+  # exists". It has it exactly backwards: 404-for-a-stranger and
+  # 403-for-a-member is precisely what makes a room URL a way to test whether a
+  # guessed session id is real, and session ids are guessable. One answer for
+  # both, the way remove_room has always done it.
   $self->authorise($room, $session_id, %args);
+  my $member = $self->member($room, $session_id) or return undef;
   return $member if $member->{left_at};
 
   $self->sql->db->query('UPDATE chat_members SET left_at = ?, waiting_until = 0 WHERE id = ?',
@@ -694,6 +722,9 @@ sub read_cursor ($self, $room, $session_id) {
 
 sub mark_read ($self, $room, $session_id, $cursor, %args) {
   return unless defined $cursor && $cursor =~ /\A\d+\z/;
+  # Before the lookup, for the same reason as leave_room: a silent 200 for a
+  # stranger and a 403 for a member is a membership oracle.
+  $self->authorise($room, $session_id, %args);
   my $member = $self->member($room, $session_id) or return;
   # The quiet one. Set somebody's cursor forward and they skip exactly the
   # message another agent needed them to see — no error anywhere, and the room
@@ -1096,7 +1127,7 @@ sub room_public ($self, $room, $base_url, %opt) {
 sub member_public ($self, $member, $room = undef) {
   my $presence = $self->presence($member);
   return {
-    author       => $room ? $self->author_key($room, $member->{session_id}) : undef,
+    author       => $self->_author_key_for($member),
     name         => $member->{name},
     about        => $member->{about},
     kind         => $member->{kind},
@@ -1119,9 +1150,37 @@ sub member_public ($self, $member, $room = undef) {
 # read an id off the wall and post as its owner. It is derived rather than
 # stored so that nothing had to migrate, and it is salted with the room secret so
 # the same session in two rooms does not link them.
+# A stable per-room handle for whoever wrote something, which is NOT their
+# session id and cannot be turned back into one.
+#
+# It used to be sha256(room_secret, session_id) truncated. That is reversible by
+# anybody in the room: the room secret is the URL they were handed, the roster
+# publishes the name-to-handle map, and a session id is a short string an agent
+# chose to be readable. The audit recovered "victim" from its handle and posted
+# as them.
+#
+# The salt is random, per member, and never published, so the handle now stands
+# for an identity without describing it. It is still stable -- the page uses it to
+# mark your own messages -- and still per room, so one session cannot be followed
+# from one room to another.
 sub author_key ($self, $room, $session_id) {
   return undef unless defined $session_id;
-  return substr Digest::SHA::sha256_hex("$room->{secret}\0$session_id"), 0, 12;
+  my $member = $self->member($room, $session_id) or return undef;
+  return $self->_author_key_for($member);
+}
+
+sub _author_key_for ($self, $member) {
+  my $salt = $member->{author_salt};
+
+  # A member row that predates the column. Filled in on sight rather than in the
+  # migration alone, so a row created by a mid-upgrade write is covered too.
+  unless (defined $salt && length $salt) {
+    $salt = unpack 'H*', token(16);
+    $self->sql->db->query('UPDATE chat_members SET author_salt = ? WHERE id = ?',
+      $salt, $member->{id});
+  }
+
+  return substr Digest::SHA::sha256_hex("$salt\0$member->{session_id}"), 0, 12;
 }
 
 sub event_public ($self, $row, $mentions = [], $room = undef) {
