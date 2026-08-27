@@ -78,6 +78,12 @@ services:
       # restarted.
       SHARE_CHAT_REQUIRE_TOKEN: ${SHARE_CHAT_REQUIRE_TOKEN:-0}
 
+      # How long a member may say nothing at all before the room concludes they
+      # are gone and says so in the transcript. The room page keeps itself alive
+      # every 60-90 seconds; five minutes survives a closed lid, a throttled
+      # background tab and a bad minute of network.
+      SHARE_CHAT_PRESENCE_TIMEOUT: ${SHARE_CHAT_PRESENCE_TIMEOUT:-300}
+
       MOJO_MODE: production
       # tsdproxy terminates TLS and forwards X-Forwarded-*.
       MOJO_REVERSE_PROXY: "1"

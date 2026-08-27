@@ -123,6 +123,11 @@ my %CFG = (
   # operations that did not exist yesterday — edit, delete, rename a room —
   # require it from the start, because they have no callers to break.
   chat_require_token => _number(SHARE_CHAT_REQUIRE_TOKEN => 0),
+
+  # How long a member may say nothing at all before the room marks them gone.
+  # The browser keeps itself alive every 60-90s; five minutes survives a closed
+  # lid, a throttled background tab and a bad minute of network.
+  chat_presence_timeout => _number(SHARE_CHAT_PRESENCE_TIMEOUT => 300),
 );
 
 sub _decoded ($value) {
@@ -185,6 +190,17 @@ my $chat = Share::Chat->new(
   max_messages      => $CFG{chat_max_messages},
   expiry_warning    => $CFG{chat_expiry_warning},
   require_token     => $CFG{chat_require_token},
+  presence_timeout  => $CFG{chat_presence_timeout},
+  # Read out of app->config at call time rather than closed over from %CFG: the
+  # two hold the same numbers, but one of them can be changed on a running app,
+  # which is how the suite points a real request at a limit of one per minute.
+  limiter           => sub ($client) {
+    my $cfg = app->config;
+    return $store->rate_check($client,
+      bucket     => 'chat',
+      per_second => $cfg->{chat_rate_per_second},
+      per_minute => $cfg->{chat_rate_per_minute});
+  },
 )->init;
 
 # Signs the identity cookie a person gets when they join a room — the one piece
@@ -266,6 +282,17 @@ my $reap = sub {
 };
 Mojo::IOLoop->next_tick($reap);
 Mojo::IOLoop->recurring(600 => $reap);
+
+# Presence, on a minute. A five-minute timeout cannot be enforced by an hourly
+# pass, and a member who has simply closed the tab should not sit in the roster
+# until the room expires. The sweep takes its own claim, so one worker does it.
+Mojo::IOLoop->recurring(
+  60 => sub {
+    my $gone = eval { $chat->sweep_idle };
+    return app->log->error("chat presence sweep failed: $@") unless defined $gone;
+    app->log->info("chat: $gone member(s) timed out") if $gone;
+  }
+);
 
 # Serves the fingerprinted URLs. Unhashed paths never reach here — Mojolicious
 # runs the static handler before the router, and those files exist on disk — so
@@ -522,25 +549,29 @@ get '/c' => sub ($c) {
 
   return $c->rendered(200) if $c->req->method eq 'HEAD';
 
-  if (my $wait = _chat_rate_limited($c)) {
-    return _api_error($c, 429, "too many requests; try again in ${wait}s") if _wants_json($c);
-    $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
-    return $c->render('chat_busy', status => 429, wait => $wait);
-  }
-
   my $topic = $c->param('topic');
   $topic = 'Untitled room' unless defined $topic && $topic =~ /\S/;
 
   my $room = eval {
     $chat->create_room(
+      client => $c->chat_client,
       topic      => $topic,
       purpose    => scalar $c->param('purpose'),
       session_id => scalar $c->param('session_id'),
       ttl_days   => scalar $c->param('ttl_days'),
     );
   };
-  return _api_error($c, 400, $@) if $@ && _wants_json($c);
-  return _gone($c, 'room')       if $@;
+  if (my $err = $@) {
+    my $status = _chat_status($err);
+    return _chat_error($c, $err) if _wants_json($c);
+    # A person who typed /c into the address bar gets the page that says to try
+    # again, not a bare error -- the limit is the commonest way this route says no.
+    if ($status == 429) {
+      $c->res->headers->header('Content-Security-Policy' => _chrome_csp());
+      return $c->render('chat_busy', status => 429, wait => $err->{retry_after});
+    }
+    return _gone($c, 'room');
+  }
 
   my $info = {%{_chat_briefing($c, $room)}, delete_password => $room->{delete_password}};
 
@@ -585,7 +616,8 @@ get '/c/<room:id>' => sub ($c) {
   ) unless $me;
 
   my $rows = $chat->messages($room);
-  $chat->touch_member($room, $me->{session_id});
+  $chat->touch_member($room, $me->{session_id},
+    _chat_credentials($c, {session_id => $me->{session_id}}));
   $c->render('chat_room',
     room     => $chat->room_public($room, $c->base_url, members => 1),
     me       => $chat->member_public($me, $room),
@@ -608,7 +640,12 @@ post '/c/<room:id>/join' => sub ($c) {
       session_id => $identity->{sid},
       kind       => 'human',
       name       => scalar $c->param('name'),
-      about      => scalar $c->param('about'));
+      about      => scalar $c->param('about'),
+      client     => $c->chat_client,
+      # This browser coming back to rename itself is the one case where a
+      # re-join is legitimate without a token: the cookie it carries is signed,
+      # and it can only ever hold its own self-generated id.
+      _chat_credentials($c, {session_id => $identity->{sid}}));
   };
 
   if (my $err = $@) {
@@ -636,11 +673,6 @@ post '/c/<room:id>/messages' => sub ($c) {
 
   my $me = _chat_me($c, $room) or return $c->redirect_to('chat_room');
 
-  if (my $wait = _chat_rate_limited($c)) {
-    $c->flash(chat_error => "That was too fast for this instance. Try again in ${wait} seconds.");
-    return $c->redirect_to('chat_room');
-  }
-
   # The credentials matter here even though a browser has no member_token: its
   # signed cookie IS one, and _chat_credentials is what says so. Without this the
   # form post is refused on any instance that requires a token -- silently, as a
@@ -651,6 +683,7 @@ post '/c/<room:id>/messages' => sub ($c) {
     $chat->post($room,
       session_id => $me->{session_id},
       body       => scalar $c->param('body'),
+      client     => $c->chat_client,
       _chat_credentials($c, {session_id => $me->{session_id}}));
   };
   $c->flash(chat_error => _error_text($@)) if $@;
@@ -781,15 +814,11 @@ $api->delete('/files/<secret:id>' => sub ($c) {
 # convenience over exactly these endpoints and add nothing they cannot do.
 
 $api->post('/chatrooms' => sub ($c) {
-  if (my $wait = _chat_rate_limited($c)) {
-    return _api_error($c, 429, "too many requests; try again in ${wait}s");
-  }
-
   my $args = eval { _chat_args($c, qw(topic purpose session_id ttl_days delete_password)) };
   return _api_error($c, 400, $@) if $@;
 
-  my $room = eval { $chat->create_room(%$args) };
-  return _api_error($c, 400, $@) if $@;
+  my $room = eval { $chat->create_room(%$args, client => $c->chat_client) };
+  return _chat_error($c, $@) if $@;
 
   # The one and only disclosure of the room's delete password, on the same terms
   # as a file's: nothing else returns it, and without it the room can only
@@ -801,7 +830,9 @@ $api->post('/chatrooms' => sub ($c) {
 
 $api->get('/chatrooms/<room:id>' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
-  $chat->touch_member($room, scalar $c->param('session_id'));
+  $chat->touch_member($room, scalar $c->param('session_id'),
+    _chat_credentials($c, {session_id => scalar $c->param('session_id'),
+      member_token => scalar $c->param('member_token')}));
   $c->render(json => _chat_briefing($c, $room));
 });
 
@@ -818,15 +849,14 @@ $api->delete('/chatrooms/<room:id>' => sub ($c) {
 $api->post('/chatrooms/<room:id>/members' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
 
-  if (my $wait = _chat_rate_limited($c)) {
-    return _api_error($c, 429, "too many requests; try again in ${wait}s");
-  }
-
-  my $args = eval { _chat_args($c, qw(session_id name about)) };
+  my $args = eval { _chat_args($c, qw(session_id name about member_token)) };
   return _api_error($c, 400, $@) if $@;
 
-  my ($member, undef, $token) = eval { $chat->join_room($room, %$args, kind => 'agent') };
-  return _api_error($c, 400, $@) if $@;
+  my %creds = _chat_credentials($c, $args);
+  my ($member, undef, $token)
+    = eval { $chat->join_room($room, %$args, %creds, kind => 'agent',
+        client => $c->chat_client) };
+  return _chat_error($c, $@) if $@;
 
   # Everything a session that has just arrived needs in one answer: who else is
   # here, what has been said, where to carry on from, and how to do all of it.
@@ -853,7 +883,9 @@ $api->post('/chatrooms/<room:id>/members' => sub ($c) {
 # so nothing about its behaviour moves, only the name of the list it hands back.
 my $read_events = sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
-  $chat->touch_member($room, scalar $c->param('session_id'));
+  $chat->touch_member($room, scalar $c->param('session_id'),
+    _chat_credentials($c, {session_id => scalar $c->param('session_id'),
+      member_token => scalar $c->param('member_token')}));
 
   my $since   = $c->param('since');
   my $session = scalar $c->param('session_id');
@@ -909,11 +941,11 @@ my $read_events = sub ($c) {
   # long as the park intends to last and given up the moment it ends -- however
   # it ends. Leaving the claim standing to its deadline would make a session that
   # hung up fifteen minutes ago look like the most attentive member in the room.
-  $chat->hold($room, $session, $wait);
+  $chat->hold($room, $session, $wait, %creds);
 
   $c->render_later;
   $c->chat_await($room, \%query, $wait)->then(sub ($rows, $closed = undef) {
-    $chat->release($room, $session) unless $closed;
+    $chat->release($room, $session, %creds) unless $closed;
     $answer->($rows, waited => 1, closed => $closed);
   });
 };
@@ -930,6 +962,55 @@ $api->get('/chatrooms/<room:id>/events/<event>' => sub ($c) {
 # "I have processed up to here." Separate from reading, because a watcher that
 # crashes between reading and acting should be able to come back to the work it
 # had not finished rather than to the messages it had merely received.
+# "I am still here."
+#
+# A browser that is closed stops polling, and until now nothing ever concluded
+# anything from that: the member aged to `away` and sat in the roster until the
+# room expired. Whoever was reading had to guess whether that meant gone home or
+# mid-build. So the page says so explicitly every 60-90 seconds, and silence past
+# SHARE_CHAT_PRESENCE_TIMEOUT becomes a real `member.left` in the sequence.
+#
+# Deliberately the cheapest call in the API: one indexed UPDATE, no body, no
+# events read. Anything a member does that reaches touch_member counts as one --
+# posting, reading, parking -- so this only ever fires for a page sitting idle.
+$api->post('/chatrooms/<room:id>/members/<session>/alive' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $session = $c->stash('session');
+  my $args    = eval { _chat_args($c, qw(member_token)) } // {};
+  $args->{session_id} = $session;
+
+  my $member = $chat->member($room, $session)
+    or return _api_error($c, 404, 'nobody here by that session id');
+  $chat->touch_member($room, $session, _chat_credentials($c, $args));
+
+  $c->render(json => {
+    alive    => \1,
+    presence => $chat->presence($chat->member($room, $session)),
+    # So a client can pace itself from the server's number rather than a
+    # constant of its own that drifts out of step with the instance.
+    every    => int($c->app->config->{chat_presence_timeout} / 5),
+  });
+});
+
+# The same as the DELETE below, reachable by POST.
+#
+# It exists for one caller: navigator.sendBeacon, which a page uses on its way
+# out and which can only ever POST. Best-effort by nature -- a hard close may run
+# nothing at all -- so it never does more than shorten the wait for something the
+# presence sweep would have concluded a few minutes later anyway.
+$api->post('/chatrooms/<room:id>/members/<session>/left' => sub ($c) {
+  my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
+  my $args = eval { _chat_args($c, qw(member_token)) } // {};
+  $args->{session_id} = $c->stash('session');
+
+  my $member = eval {
+    $chat->leave_room($room, $c->stash('session'), _chat_credentials($c, $args));
+  };
+  return _chat_error($c, $@) if $@;
+  return _api_error($c, 404, 'nobody here by that session id') unless $member;
+  $c->render(json => {left => $member->{name}});
+});
+
 # Leaving. A call, not an announcement -- see Share::Chat::leave_room.
 $api->delete('/chatrooms/<room:id>/members/<session>' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
@@ -937,7 +1018,7 @@ $api->delete('/chatrooms/<room:id>/members/<session>' => sub ($c) {
   $args->{session_id} = $c->stash('session');
 
   my $member = eval { $chat->leave_room($room, $c->stash('session'), _chat_credentials($c, $args)) };
-  return _api_error($c, _refused($@) ? 403 : 400, $@) if $@;
+  return _chat_error($c, $@) if $@;
   return _api_error($c, 404, 'nobody here by that session id') unless $member;
   $c->render(json => {left => $member->{name}, room => $room->{secret}});
 });
@@ -950,7 +1031,7 @@ $api->post('/chatrooms/<room:id>/members/<session>/read' => sub ($c) {
   my $session = $c->stash('session');
   $args->{session_id} = $session;
   eval { $chat->mark_read($room, $session, $args->{cursor}, _chat_credentials($c, $args)); 1 }
-    or return _api_error($c, _refused($@) ? 403 : 400, $@);
+    or return _chat_error($c, $@);
   $c->render(json => {
     cursor => $chat->read_cursor($room, $session) // 0,
     unread => $chat->unread_count($room, $session),
@@ -963,16 +1044,12 @@ $api->get('/chatrooms/<room:id>/messages' => $read_events);
 $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
   my $room = $chat->find_room($c->stash('room')) or return _api_error($c, 404, _no_room($c));
 
-  if (my $wait = _chat_rate_limited($c)) {
-    return _api_error($c, 429, "too many messages; try again in ${wait}s");
-  }
-
   my $args = eval { _chat_args($c, qw(session_id body member_token)) };
   return _api_error($c, 400, $@) if $@;
 
   my %creds = _chat_credentials($c, $args);
-  my $row   = eval { $chat->post($room, %$args, %creds) };
-  return _api_error($c, _refused($@) ? 403 : 400, $@) if $@;
+  my $row   = eval { $chat->post($room, %$args, %creds, client => $c->chat_client) };
+  return _chat_error($c, $@) if $@;
 
   # What landed while this caller was not looking.
   #
@@ -1261,25 +1338,6 @@ helper chat_await => sub ($c, $room, $query, $wait) {
   return $promise;
 };
 
-# Read out of app->config rather than the %CFG the file was started with. They
-# are the same numbers — config() is handed %CFG at startup — but one of them can
-# be changed on a running app, which is how the suite gets to point a real HTTP
-# request at a limit of one per minute without a second instance.
-sub _chat_rate_limited ($c) {
-  my $cfg = $c->app->config;
-  my ($ok, $wait) = $store->rate_check(
-    _client($c),
-    bucket     => 'chat',
-    per_second => $cfg->{chat_rate_per_second},
-    per_minute => $cfg->{chat_rate_per_minute},
-  );
-  return undef if $ok;
-
-  $c->res->headers->header('Retry-After' => $wait);
-  app->log->info(sprintf 'chat rate limited %s, retry in %ds', _client($c), $wait);
-  return $wait;
-}
-
 # A room URL is handed to a person and to an agent alike, and the two want
 # different things from it. A browser says text/html in Accept; curl, a fetch
 # with no Accept and most HTTP libraries' defaults do not — so anything that has
@@ -1332,6 +1390,10 @@ sub _chat_me ($c, $room) { return $chat->member($room, _chat_identity($c)->{sid}
 #
 # A browser carries no token: its session cookie is signed and lives in one
 # browser, so it already IS a credential.
+# Who this caller is, for the limiter. A helper rather than a sub so that
+# Share::MCP can reach it too -- the limit has to be the same on both doors.
+helper chat_client => sub ($c) { return _client($c) };
+
 sub _chat_credentials ($c, $args = {}) {
   my $mine = ($c->session('chat') // {})->{sid};
   return (
@@ -1429,7 +1491,21 @@ sub _no_room ($c) { return 'no such room — it was deleted, or it expired' }
 
 # A refusal, as opposed to a malformed request. Share::Chat dies with one hashref
 # shape for everything; this is the one case that is 403 rather than 400.
-sub _refused ($err) { return _error_text($err) =~ /member_token/ ? 1 : 0 }
+# What HTTP owes a refusal from the store. Share::Chat dies with one hashref
+# shape for everything; this is the only place that turns it into a status, so a
+# new kind of refusal is added in one spot rather than in every route.
+sub _chat_status ($err) {
+  return 429 if ref $err eq 'HASH' && defined $err->{retry_after};
+  return 403 if _error_text($err) =~ /member_token/;
+  return 400;
+}
+
+sub _chat_error ($c, $err) {
+  my $status = _chat_status($err);
+  $c->res->headers->header('Retry-After' => $err->{retry_after})
+    if $status == 429 && ref $err eq 'HASH';
+  return _api_error($c, $status, $err);
+}
 
 # Enforced by eviction after the fact rather than by refusing the upload: a
 # public box that fills its disk goes down, which is worse than losing the

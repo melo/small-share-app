@@ -119,7 +119,7 @@ sub _post ($id, $session, $body) {
 sub _human ($id, $session, $name) {
   my $room = $t->app->chat->find_room($id);
   my ($member) = $t->app->chat->join_room($room,
-    session_id => $session, name => $name, kind => 'human');
+    client => 'test', session_id => $session, name => $name, kind => 'human');
   return $member;
 }
 
@@ -411,7 +411,7 @@ subtest 'a caller can wait for the next thing said instead of asking again' => s
   # happened yet and really is woken by the write.
   Mojo::IOLoop->timer(
     0.3 => sub { $t->app->chat->post($t->app->chat->find_room($id),
-        session_id => 'sess-a', body => 'woke you') });
+        client => 'test', session_id => 'sess-a', body => 'woke you') });
 
   my $started = time;
   $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=10")->status_is(200)
@@ -438,7 +438,7 @@ subtest 'a person is asked who they are before the room opens' => sub {
   my $id = _room(topic => 'the human', purpose => 'a person and an agent')->{room}{id};
   _join($id, session_id => 'agent-1', name => 'planner', about => 'holding the checklist');
   $t->app->chat->post($t->app->chat->find_room($id),
-    session_id => 'agent-1', body => "# Plan\n\n<script>alert(1)</script>");
+    client => 'test', session_id => 'agent-1', body => "# Plan\n\n<script>alert(1)</script>");
 
   my %html = (Accept => 'text/html');
   $t->get_ok("/c/$id" => \%html)->status_is(200)
@@ -636,7 +636,7 @@ subtest 'MCP: reading can wait, and waiting does not block the worker' => sub {
 
   Mojo::IOLoop->timer(
     0.3 => sub { $t->app->chat->post($t->app->chat->find_room($id),
-        session_id => 'sess-a', body => 'over here') });
+        client => 'test', session_id => 'sess-a', body => 'over here') });
 
   my $waited = _call('get_chat_messages', {room => $url, since => $cursor, wait => 10});
   is $waited->{structuredContent}{count}, 1, 'the tool answered when the message landed';
@@ -737,7 +737,8 @@ subtest 'a park that ends in silence says so' => sub {
     ->json_is('/cursor' => $cursor);
 
   Mojo::IOLoop->timer(0.2 => sub {
-    $t->app->chat->post($t->app->chat->find_room($id), session_id => 'sess-w', body => 'oi') });
+    $t->app->chat->post($t->app->chat->find_room($id),
+      client => 'test', session_id => 'sess-w', body => 'oi') });
   $t->get_ok("/api/v1/chatrooms/$id/messages?since=$cursor&wait=10")->status_is(200)
     ->json_is('/timed_out' => Mojo::JSON->false)
     ->json_is('/count' => 1);
@@ -904,7 +905,7 @@ subtest 'a park can start from where you left off' => sub {
 
   Mojo::IOLoop->timer(0.3 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      session_id => 'sess-u', body => 'arrived while parked') });
+      client => 'test', session_id => 'sess-u', body => 'arrived while parked') });
 
   $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-u&wait=10")
     ->status_is(200)->json_is('/count' => 1)
@@ -1021,10 +1022,10 @@ subtest 'a park on being wanted is not woken by ordinary chatter' => sub {
   # watcher an agent leaves running and one it turns off.
   Mojo::IOLoop->timer(0.2 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      session_id => 'sess-a', body => 'unrelated noise') });
+      client => 'test', session_id => 'sess-a', body => 'unrelated noise') });
   Mojo::IOLoop->timer(0.6 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      session_id => 'sess-a', body => 'over to you @bravo') });
+      client => 'test', session_id => 'sess-a', body => 'over to you @bravo') });
 
   $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=10"
       . "&mentions_me=1&session_id=sess-b")->status_is(200)
@@ -1262,10 +1263,10 @@ subtest 'MCP: park, be woken by a mention, then leave' => sub {
 
   Mojo::IOLoop->timer(0.2 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      session_id => 'sess-mate', body => 'ignore me') });
+      client => 'test', session_id => 'sess-mate', body => 'ignore me') });
   Mojo::IOLoop->timer(0.6 => sub {
     $t->app->chat->post($t->app->chat->find_room($id),
-      session_id => 'sess-mate', body => 'yours @watcher') });
+      client => 'test', session_id => 'sess-mate', body => 'yours @watcher') });
 
   my $out = _call(get_room_events => {room => $id, session_id => 'sess-mcp',
     since => 'unread', wait => 10, mentions_me => 1, format => 'headers'})
@@ -1356,7 +1357,10 @@ CREATE TABLE chat_messages (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX chat_messages_room_idx ON chat_messages (room_id, id);
-CREATE TABLE mojo_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL)
+CREATE TABLE mojo_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL);
+-- Share::Store's, not ours, but a real database has it and init() needs it for
+-- the presence sweep's claim row.
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)
 V1
 
   # Where migration 1 left off, so init() runs migration 2 and only that.
@@ -1511,6 +1515,7 @@ subtest 'the sweep repairs a database that already ran 1.5.0' => sub {
   # backwards, once, rather than only stopping new ones being made.
   my $file = "$tmp/orphans.db";
   my $sql  = Mojo::SQLite->new("sqlite:$file");
+  $sql->db->query('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
   Share::Chat->new(sql => $sql, log => $t->app->log)->init;
 
   my $db = $sql->db;
@@ -1698,6 +1703,199 @@ subtest 'a parked reader does not leak the request it parked on' => sub {
   }
 
   is $collected, 1, 'and everything it held was freed when it did';
+};
+
+# ------------------------------------------------- every write is guarded ---
+
+# The test that matters more than any single fix below it.
+#
+# Three releases running have shipped a write path that forgot the guard: 1.5.0
+# enforced the token in one route so MCP walked under it; 1.5.2 moved the guard
+# into Share::Chat and left join_room, hold, release and touch_member outside it;
+# and rate limiting is STILL route-only, so the same transport walks under that
+# one too. Patching each is treating symptoms.
+#
+# So: enumerate every way to change a room's state, on both transports, and
+# assert each one refuses a caller who cannot prove who it is. A new endpoint
+# that forgets fails here rather than in somebody's room.
+subtest 'every write path refuses a caller who cannot prove who it is' => sub {
+  my $id  = _room(topic => 'guarded everywhere')->{room}{id};
+  my $vic = _join($id, session_id => 'victim', name => 'victim', about => 'a working agent');
+  _post($id, 'victim', 'something to be behind');
+
+  local $t->app->config->{chat_require_token} = 1;
+  local $t->app->chat->{require_token} = 1;
+
+  my $C = "/api/v1/chatrooms/$id";
+
+  # --- REST -----------------------------------------------------------------
+  $t->post_ok("$C/messages" => json => {session_id => 'victim', body => 'as them'})
+    ->status_is(403, 'REST post');
+  $t->delete_ok("$C/members/victim")->status_is(403, 'REST leave');
+  $t->post_ok("$C/members/victim/read" => json => {cursor => 999})
+    ->status_is(403, 'REST mark-read');
+
+  # Re-joining an EXISTING session rewrites that member's name and paragraph,
+  # clears their departure, and -- because mentions bind to the current name --
+  # silently redirects everything addressed to them.
+  $t->post_ok("$C/members" => json =>
+      {session_id => 'victim', name => 'pwned', about => 'a stranger wrote this'})
+    ->status_is(403, 'REST re-join as an existing member');
+
+  # Presence is a write. It decides whether the others keep addressing this
+  # session at all.
+  my $before = $t->get_ok($C)->tx->res->json->{room}{members};
+  my ($was) = grep { $_->{name} eq 'victim' } @$before;
+  $t->get_ok("$C/events?session_id=victim&wait=1")->status_is(200, 'a read is still a read');
+  my ($now) = grep { $_->{name} eq 'victim' }
+    @{$t->get_ok($C)->tx->res->json->{room}{members}};
+  is $now->{presence}, $was->{presence},
+    'reading as somebody else does not move their presence';
+
+  # --- MCP ------------------------------------------------------------------
+  ok _call(post_chat_message => {room => $id, session_id => 'victim', body => 'as them'})
+    ->{isError}, 'MCP post';
+  ok _call(leave_chatroom => {room => $id, session_id => 'victim'})->{isError}, 'MCP leave';
+  ok _call(join_chatroom => {room => $id, session_id => 'victim',
+      name => 'pwned', about => 'a stranger wrote this'})->{isError},
+    'MCP re-join as an existing member';
+
+  # --- and the victim is untouched throughout -------------------------------
+  my ($still) = grep { $_->{name} eq 'victim' }
+    @{$t->get_ok($C)->tx->res->json->{room}{members}};
+  is $still->{name}, 'victim', 'the name is theirs';
+  is $still->{about}, 'a working agent', 'and so is the paragraph';
+  isnt $still->{presence}, 'gone', 'and nobody marked them gone';
+};
+
+subtest 'rate limiting is a property of the room, not of one door into it' => sub {
+  # Reproduced by the audit: with PER_SECOND=1 PER_MINUTE=3, six REST creates
+  # gave 201 429 429 429 429 429 and six MCP creates gave six rooms. An
+  # operator's SHARE_CHAT_RATE_* settings were decorative on any instance with
+  # /mcp reachable.
+  local $t->app->config->{chat_rate_per_second} = 1;
+  local $t->app->config->{chat_rate_per_minute} = 2;
+
+  my @made;
+  push @made, _call(create_chatroom => {topic => "burst $_"}) for 1 .. 5;
+  my $refused = grep { $_->{isError} } @made;
+  ok $refused >= 2, "MCP room creation is limited too (refused $refused of 5)";
+  like $made[-1]{content}[0]{text}, qr/too many/i, 'and says so in words';
+};
+
+subtest 'posting over MCP is limited too' => sub {
+  # The room and its member are made BEFORE the limit is lowered: the point is
+  # what happens to a burst of posts, not to the setup.
+  my $id = _room(topic => 'mcp posting')->{room}{id};
+  _call(join_chatroom => {room => $id, session_id => 'burst', name => 'burst', about => 'x'});
+
+  local $t->app->config->{chat_rate_per_second} = 1;
+  local $t->app->config->{chat_rate_per_minute} = 2;
+
+  my @posts;
+  push @posts, _call(post_chat_message => {room => $id, session_id => 'burst', body => "m$_"})
+    for 1 .. 5;
+  my $stopped = grep { $_->{isError} } @posts;
+  ok $stopped >= 2, "and so is MCP posting (refused $stopped of 5)";
+};
+
+subtest 'a member who stops saying anything is eventually declared gone' => sub {
+  # "away" was never a conclusion. A closed browser tab stops polling, its
+  # waiting_until lapses and its last_seen_at ages -- and then it sat in the
+  # roster until the room expired, with whoever was reading left to guess
+  # whether that meant gone home or mid-build.
+  my $id = _room(topic => 'still there?')->{room}{id};
+  _join($id, session_id => 'stayer', name => 'stayer', about => 'keeps talking');
+  _join($id, session_id => 'leaver', name => 'leaver', about => 'closes the tab');
+
+  my $chat = $t->app->chat;
+  my $room = $chat->find_room($id);
+
+  # Both are present now, and a sweep concludes nothing.
+  is $chat->sweep_idle(time, force => 1), 0, 'nobody is stale yet';
+
+  # The keep-alive is the cheapest thing in the API, and it is what a page with
+  # nobody touching it sends.
+  $t->post_ok("/api/v1/chatrooms/$id/members/stayer/alive" => json => {})
+    ->status_is(200)->json_is('/alive' => Mojo::JSON->true)
+    ->json_is('/presence' => 'idle');
+  ok $t->tx->res->json->{every} > 0, 'and it says how often to send the next one';
+
+  # Wind both members past the timeout, then let the stayer say it is still here.
+  my $long_ago = time - 3600;
+  $chat->sql->db->query('UPDATE chat_members SET last_seen_at = ? WHERE room_id = ?',
+    $long_ago, $room->{id});
+  $t->post_ok("/api/v1/chatrooms/$id/members/stayer/alive" => json => {})->status_is(200);
+
+  is $chat->sweep_idle(time, force => 1), 1, 'only the silent one is swept';
+
+  my $members = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room}{members};
+  my %by = map { $_->{name} => $_ } @$members;
+  is $by{leaver}{presence}, 'gone',  'the one that stopped answering is gone';
+  isnt $by{stayer}{presence}, 'gone', 'and the one that kept saying so is not';
+
+  # It is an event, so a parked agent finds out the same way it finds out
+  # anything else -- which is the whole point of it being a conclusion.
+  my $events = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{events};
+  ok scalar(grep { $_->{type} eq 'member.left' && $_->{name} eq 'leaver' } @$events),
+    'and the room was told';
+
+  # Idempotent: a second sweep has nothing left to conclude.
+  is $chat->sweep_idle(time, force => 1), 0, 'and it does not keep announcing it';
+
+  # A member holding a long poll is present by definition, however quiet.
+  _join($id, session_id => 'parked', name => 'parked', about => 'listening');
+  $chat->sql->db->query(
+    'UPDATE chat_members SET last_seen_at = ?, waiting_until = ? WHERE session_id = ?',
+    $long_ago, time + 300, 'parked');
+  is $chat->sweep_idle(time, force => 1), 0, 'a parked listener is never swept';
+};
+
+subtest 'the sweep is claimed, so one worker does it' => sub {
+  # Every prefork worker holds the timer. Without the claim they would all sweep
+  # the same members and write a member.left each.
+  my $id = _room(topic => 'claimed')->{room}{id};
+  _join($id, session_id => 'idle-one', name => 'idle-one', about => 'x');
+  my $chat = $t->app->chat;
+  $chat->sql->db->query('UPDATE chat_members SET last_seen_at = ? WHERE session_id = ?',
+    time - 3600, 'idle-one');
+
+  # The app holds this timer too and may have won the round already, so the
+  # claim is reset first -- what is being tested is that two callers in the same
+  # minute do not both sweep, not who happened to get there first.
+  $chat->sql->db->query(q{UPDATE meta SET v = '0' WHERE k = 'last_presence_sweep'});
+
+  my $first  = $chat->sweep_idle;
+  my $second = $chat->sweep_idle;
+  ok $first >= 1, 'the worker that wins the claim does the work';
+  is $second, 0, 'and the next one in the same minute does nothing';
+};
+
+subtest 'an agent parked over MCP is listening, not away' => sub {
+  # The REST read claimed presence for the duration of its park and the MCP one
+  # did not, so an agent that followed the instructions -- which push it hard
+  # towards exactly this call -- was reported away while it was in fact holding
+  # the line. Everyone else stopped addressing it, and it had no way to find out.
+  my $id = _room(topic => 'parked over mcp')->{room}{id};
+  _call(join_chatroom => {room => $id, session_id => 'mcp-parked',
+    name => 'mcpparked', about => 'listening over MCP'});
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  # Aged past the grace window, so nothing but the park itself can keep this
+  # member present.
+  $t->app->chat->sql->db->query(
+    'UPDATE chat_members SET last_seen_at = ? WHERE session_id = ?', time - 3600, 'mcp-parked');
+
+  my $seen;
+  Mojo::IOLoop->timer(0.4 => sub {
+    my $room = $t->app->chat->find_room($id);
+    my ($me) = grep { $_->{session_id} eq 'mcp-parked' } @{$t->app->chat->members($room)};
+    $seen = $t->app->chat->presence($me);
+  });
+
+  _call(get_room_events =>
+    {room => $id, session_id => 'mcp-parked', since => $cursor, wait => 2});
+  is $seen, 'listening', 'the roster says so while the park is open';
 };
 
 done_testing;

@@ -384,6 +384,11 @@ sub _tools ($server) {
     code => sub ($tool, $args) {
       my $c    = _c($tool);
       my $room = $c->chat->create_room(
+        # Every write names its caller. The limit lives in Share::Chat now,
+        # because it lived in the REST routes and this transport walked straight
+        # past it -- the same shape of mistake as the token guard, one release
+        # later, in the same place.
+        client     => $c->chat_client,
         topic      => $args->{topic},
         purpose    => $args->{purpose},
         session_id => $args->{session_id},
@@ -439,6 +444,9 @@ sub _tools ($server) {
             . 'rename rather than becoming a second member.'),
         about => _str('One paragraph: what you are working on, and what you need from '
             . 'the others. Everyone in the room reads this.'),
+        member_token => _str('Only needed to call this again for a session that has '
+            . 'already joined — renaming yourself, or updating your paragraph. Arriving '
+            . 'for the first time needs nothing.'),
       },
     },
     code => sub ($tool, $args) {
@@ -447,10 +455,12 @@ sub _tools ($server) {
       return $tool->text_result(_no_room($id), 1) unless $room;
 
       my ($member, undef, $token) = $c->chat->join_room($room,
-        session_id => $args->{session_id},
-        name       => $args->{name},
-        about      => $args->{about},
-        kind       => 'agent');
+        client       => $c->chat_client,
+        session_id   => $args->{session_id},
+        name         => $args->{name},
+        about        => $args->{about},
+        member_token => $args->{member_token},
+        kind         => 'agent');
 
       my $rows = $c->chat->messages($room);
       return $tool->structured_result({
@@ -492,6 +502,7 @@ sub _tools ($server) {
       return $tool->text_result(_no_room($id), 1) unless $room;
 
       my $row = $c->chat->post($room,
+        client       => $c->chat_client,
         session_id   => $args->{session_id},
         body         => $args->{body},
         member_token => $args->{member_token});
@@ -559,7 +570,8 @@ sub _tools ($server) {
       my ($room, $id) = _room($c, $args->{room});
       return $tool->text_result(_no_room($id), 1) unless $room;
 
-      $c->chat->touch_member($room, $args->{session_id});
+      $c->chat->touch_member($room, $args->{session_id},
+        member_token => $args->{member_token});
 
       # "unread" reads from the position the server keeps for this member, so a
       # watcher that has just been re-invoked does not have to have remembered
@@ -638,7 +650,19 @@ sub _tools ($server) {
       # on an idle one after fifteen seconds.
       $c->inactivity_timeout($wait + 15);
 
-      return $c->chat_await($room, \%query, $wait)->then($answer);
+      # An open poll is what says this member is listening, and this path did
+      # not say it -- so an agent parked here for a quarter of an hour was
+      # reported `away, online: false` while its REST twin showed `listening`.
+      # The precise inverse of what presence is for: a live listener looked
+      # dead, the others stopped addressing it, and it never found out.
+      $c->chat->hold($room, $args->{session_id}, $wait,
+        member_token => $args->{member_token});
+
+      return $c->chat_await($room, \%query, $wait)->then(sub (@args) {
+        $c->chat->release($room, $args->{session_id},
+          member_token => $args->{member_token});
+        return $answer->(@args);
+      });
   };
 
   my $read_description =

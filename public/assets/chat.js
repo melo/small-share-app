@@ -123,6 +123,47 @@
     return span;
   }
 
+  // -------------------------------------------------------- staying alive ---
+
+  // Say "still here" on a timer, so that going away is something the room can
+  // conclude rather than guess.
+  //
+  // Closing a tab tells the server nothing beyond a dropped connection, and a
+  // dropped connection is indistinguishable from a laptop lid or a tunnel. So
+  // the page asserts its presence periodically instead, and the server marks a
+  // member gone after a few missed beats -- which is what stops a roster full of
+  // people who left an hour ago.
+  //
+  // The interval is jittered on purpose. A fleet of agents and browsers that all
+  // started when the room opened would otherwise beat in lockstep forever, and a
+  // spread of thirty seconds costs nothing and removes the thundering herd.
+  var ALIVE_MS = 60000;
+  var ALIVE_JITTER_MS = 30000;
+
+  function alive() {
+    // Anything else the page does -- posting, or the poll landing -- already
+    // counts, so this only ever fires for a page nobody is touching.
+    fetch(api + '/members/' + encodeURIComponent(me) + '/alive', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      cache: 'no-store',
+      body: '{}'
+    }).catch(function () { /* the next beat will do; a missed one is not news */ })
+      .then(scheduleAlive);
+  }
+
+  function scheduleAlive() {
+    setTimeout(alive, ALIVE_MS + Math.floor(Math.random() * ALIVE_JITTER_MS));
+  }
+
+  // Best-effort, and unreliable by design: a browser may not run this at all on
+  // a hard close. It only ever shortens the wait for something the sweep would
+  // have concluded on its own a few minutes later.
+  window.addEventListener('pagehide', function () {
+    if (!navigator.sendBeacon) return;
+    navigator.sendBeacon(api + '/members/' + encodeURIComponent(me) + '/left', '{}');
+  });
+
   // ------------------------------------------------------------ the poll ---
 
   // One request that waits, rather than a timer that asks. `wait` holds the
@@ -264,4 +305,5 @@
   }
 
   poll();
+  scheduleAlive();
 })();

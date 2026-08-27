@@ -59,6 +59,20 @@ has preview_chars => 160;
 # How long after a member was last seen the room stops calling them present.
 has presence_grace => 120;
 
+# How long a member may go without saying anything at all before the room stops
+# believing in them and marks them gone.
+#
+# `away` was never enough. A browser tab that is closed stops polling, its
+# `waiting_until` lapses and its `last_seen_at` ages -- and then it sits in the
+# roster forever, because nothing ever concluded anything. Whoever is reading has
+# to guess whether "away" means gone home or means mid-build.
+#
+# So silence past this becomes a real `member.left`, in the sequence, where a
+# parked agent finds out about it like anything else. The browser keeps itself
+# alive with a cheap call every 60-90 seconds; five minutes is generous enough
+# to survive a laptop lid, a suspended tab and a bad minute of network.
+has presence_timeout => 300;
+
 # How long before a room's expiry it says so. Two hours is enough to move
 # something that matters and short enough that the warning still means "now".
 has expiry_warning => 7200;
@@ -75,6 +89,15 @@ has expiry_warning => 7200;
 # A guard in a transport is a guard the next transport forgets. This is the far
 # side of both of them.
 has require_token => 0;
+
+# How this instance limits a caller, supplied by share.pl: a coderef taking the
+# caller's identity and answering ($ok, $seconds_to_wait).
+#
+# It lives here for the reason `require_token` does. The limit used to be applied
+# in the REST routes, so `SHARE_CHAT_RATE_*` was decorative on any instance with
+# /mcp reachable -- the same shape of mistake as the token guard, in the same
+# place, one release later. Policy belongs on the far side of both doors.
+has limiter => undef;
 
 # What can happen in a room.
 #
@@ -241,6 +264,7 @@ DELETE FROM chat_mentions
 -- Nothing to undo: the rows this dropped were already pointing at nothing.
 SELECT 1;
 
+
 -- 2 down
 DROP TABLE chat_mentions;
 CREATE TABLE chat_messages (
@@ -279,6 +303,13 @@ sub init ($self) {
   my $was = $migrations->active;
   $migrations->migrate;
   $self->_backfill_v2 if $was && $was < 2;
+
+  # The presence sweep's claim row. Done here rather than in a migration because
+  # `meta` belongs to Share::Store's schema, not to this one -- the two sets are
+  # versioned separately precisely so neither reaches into the other. INSERT OR
+  # IGNORE makes it idempotent, and it is one query at startup.
+  $self->sql->db->query(
+    q{INSERT OR IGNORE INTO meta (k, v) VALUES ('last_presence_sweep', '0')});
 
   return $self;
 }
@@ -327,6 +358,8 @@ sub create_room ($self, %args) {
   my $topic = _clean_line($args{topic}, 120)
     // _fail('a room needs a topic — one line saying what is being coordinated');
   my $purpose = _clean_text($args{purpose}, 2000);
+
+  $self->_limit('create_room', %args);
 
   my $now      = time;
   my $ttl      = $self->_ttl_seconds($args{ttl_days});
@@ -428,6 +461,18 @@ sub join_room ($self, $room, %args) {
 
   my $about = _clean_text($args{about}, 2000);
 
+  $self->_limit('join_room', %args);
+
+  # Arriving is open -- it is how a session gets its token in the first place.
+  # Coming BACK as a session that already exists is not: it rewrites that
+  # member's name and paragraph, clears their departure so a session that
+  # correctly said goodbye shows present again, and -- because mentions bind to
+  # the current name -- silently redirects everything addressed to them. An
+  # agent parked on "wake me when somebody needs me" can be muted by a stranger
+  # renaming it.
+  $self->authorise($room, $session_id, %args)
+    if $self->member($room, $session_id);
+
   # Required of an agent, optional for a person. The paragraph exists so that
   # every session in the room can see what the others are doing without asking;
   # a human who has opened the page is already visibly present and has no
@@ -518,11 +563,35 @@ sub issue_token ($self, $member) {
 # browser says so: its session cookie is signed and lives in one browser, so it
 # already IS a credential and there is no token to carry.
 sub authorise ($self, $room, $session_id, %args) {
+  return 1 if $self->may_write($room, $session_id, %args);
+  _fail('this room requires the member_token that join returned — it is the only copy '
+      . 'of it you were ever given, and no other call will tell you it again');
+}
+
+# The same question without the exception, for the writes that must never fail a
+# read -- presence bookkeeping. Those silently do nothing rather than 403.
+sub may_write ($self, $room, $session_id, %args) {
   return 1 unless $self->require_token;
   return 1 if $args{trusted};
   return 1 if $self->token_ok($room, $session_id, $args{member_token});
-  _fail('this room requires the member_token that join returned — it is the only copy '
-      . 'of it you were ever given, and no other call will tell you it again');
+  return 0;
+}
+
+# Every state-changing call passes through here.
+#
+# `client` is REQUIRED when a limiter is configured, and its absence is a die
+# rather than a pass. That asymmetry is deliberate: a caller that forgets to
+# identify itself is exactly how the limit came to be missing from one transport
+# for two releases, and a loud failure in the test suite is cheaper than a quiet
+# bypass in production.
+sub _limit ($self, $what, %args) {
+  my $limiter = $self->limiter or return 1;
+  _fail("internal: $what reached the store without a client identity")
+    unless defined $args{client} && length $args{client};
+
+  my ($ok, $wait) = $limiter->($args{client});
+  return 1 if $ok;
+  die {share_error => "too many requests; try again in ${wait}s", retry_after => $wait};
 }
 
 sub token_ok ($self, $room, $session_id, $token) {
@@ -572,8 +641,9 @@ sub leave_room ($self, $room, $session_id, %args) {
 # "I will be here until T", and "I have let go". Both are bookkeeping and neither
 # is ever a reason to fail a read -- the same rule, and the same reason, as
 # touch_member.
-sub hold ($self, $room, $session_id, $seconds) {
+sub hold ($self, $room, $session_id, $seconds, %args) {
   return unless defined $session_id && length $session_id;
+  return unless $self->may_write($room, $session_id, %args);
   eval {
     $self->sql->db->query(
       'UPDATE chat_members SET waiting_until = ?, last_seen_at = ? '
@@ -586,8 +656,9 @@ sub hold ($self, $room, $session_id, $seconds) {
   return;
 }
 
-sub release ($self, $room, $session_id) {
+sub release ($self, $room, $session_id, %args) {
   return unless defined $session_id && length $session_id;
+  return unless $self->may_write($room, $session_id, %args);
   eval {
     $self->sql->db->query(
       'UPDATE chat_members SET waiting_until = 0, last_seen_at = ? '
@@ -647,8 +718,14 @@ sub unread_count ($self, $room, $session_id) {
 
 # Bookkeeping only, and never a reason to fail a read — the same rule, and for
 # the same reason, as Share::Store::touch.
-sub touch_member ($self, $room, $session_id) {
+# Presence is a write, and it decides whether the others go on addressing this
+# session at all. Forging it re-creates the exact failure the feature exists to
+# prevent -- everyone talking to somebody who is not there, or nobody talking to
+# somebody who is. It refuses silently rather than raising: these are called from
+# the read path, and a read must never fail because of bookkeeping.
+sub touch_member ($self, $room, $session_id, %args) {
   return unless defined $session_id && length $session_id;
+  return unless $self->may_write($room, $session_id, %args);
   eval {
     $self->sql->db->query(
       'UPDATE chat_members SET last_seen_at = ? WHERE room_id = ? AND session_id = ?',
@@ -670,6 +747,7 @@ sub touch_member ($self, $room, $session_id) {
 sub post ($self, $room, %args) {
   my $session_id = _clean_line($args{session_id}, 200) // _fail('session_id is required');
   $self->authorise($room, $session_id, %args);
+  $self->_limit('post', %args);
   my $member     = $self->member($room, $session_id)
     or _fail('join the room before posting: send your session_id, a name and one '
       . 'paragraph about what you are working on');
@@ -945,6 +1023,38 @@ sub destroyed_event ($self, $why) {
       ? 'This room reached its expiry. Everything in it has been deleted.'
       : 'This room was closed. Everything in it has been deleted.',
   };
+}
+
+# Members who have stopped saying anything at all.
+#
+# Runs far more often than the reaper -- a five-minute timeout needs a sweep in
+# minutes, not hours -- so it takes its own claim rather than riding on that one.
+# Anyone still holding a long poll is by definition present and is skipped, which
+# is what stops a fifteen-minute park being mistaken for silence.
+sub sweep_idle ($self, $now = time, %opt) {
+  # The same conditional-UPDATE claim the file reaper uses, under a key of its
+  # own: every prefork worker holds this timer and exactly one wins the round.
+  unless ($opt{force}) {
+    my $claimed = $self->sql->db->query(
+      q{UPDATE meta SET v = ? WHERE k = 'last_presence_sweep' AND CAST(v AS INTEGER) <= ?},
+      $now, $now - ($opt{every} // 60))->rows;
+    return 0 unless $claimed;
+  }
+
+  my $stale = $self->sql->db->query(
+    'SELECT m.*, r.secret FROM chat_members m JOIN chat_rooms r ON r.id = m.room_id
+      WHERE m.left_at IS NULL AND m.waiting_until <= ? AND m.last_seen_at < ?
+        AND r.expires_at > ?',
+    $now, $now - $self->presence_timeout, $now)->hashes->to_array;
+
+  for my $member (@$stale) {
+    $self->sql->db->query('UPDATE chat_members SET left_at = ?, waiting_until = 0 WHERE id = ?',
+      $now, $member->{id});
+    $self->_write({id => $member->{room_id}, secret => $member->{secret}},
+      $member->{session_id}, $member->{name}, 'member.left' => '');
+  }
+
+  return scalar @$stale;
 }
 
 # Called from the file reaper's hourly pass, once it has won the claim, so there
