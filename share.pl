@@ -641,7 +641,18 @@ post '/c/<room:id>/messages' => sub ($c) {
     return $c->redirect_to('chat_room');
   }
 
-  eval { $chat->post($room, session_id => $me->{session_id}, body => scalar $c->param('body')) };
+  # The credentials matter here even though a browser has no member_token: its
+  # signed cookie IS one, and _chat_credentials is what says so. Without this the
+  # form post is refused on any instance that requires a token -- silently, as a
+  # 302 back to a room with the message simply absent -- while the scripted path,
+  # which posts to /api/v1, keeps working. CONTRIBUTING calls this route the real
+  # one and the script an enhancement.
+  eval {
+    $chat->post($room,
+      session_id => $me->{session_id},
+      body       => scalar $c->param('body'),
+      _chat_credentials($c, {session_id => $me->{session_id}}));
+  };
   $c->flash(chat_error => _error_text($@)) if $@;
   $c->redirect_to('chat_room');
 } => 'chat_post';
@@ -1190,36 +1201,58 @@ helper chat_await => sub ($c, $room, $query, $wait) {
   # necessity — the arithmetic says even the naive version is noise against a
   # database that does a hundred thousand indexed reads a second — but a constant
   # that scales with the wait is one less thing to come back to.
-  my $tick;
-  $tick = sub {
-    my $elapsed = time - $started;
-    Mojo::IOLoop->remove($timer) if defined $timer;
-    $timer = Mojo::IOLoop->recurring(
-      ($elapsed < 5 ? 0.5 : $elapsed < 60 ? 2 : 5) => sub {
-        # The room may have gone while this caller was parked on it. Before this
-        # check the poll went on asking a room that no longer existed and settled
-        # empty AT THE DEADLINE — invisible at sixty seconds, a held connection
-        # doing nothing for a quarter of an hour at nine hundred.
-        #
-        # find_room treats an expired room as absent from the moment it expires,
-        # an hour or so before the reaper physically deletes it, so a waiter is
-        # released at the true expiry rather than at the next reaper pass.
-        my $live = eval { $chat->find_room($room->{secret}) };
-        # Asked of the database, not of the room hashref this park started with,
-        # which still says whatever it said a quarter of an hour ago.
-        return $settle->([], $chat->room_state($room->{secret})) unless $live;
+  # A one-shot timer that reschedules itself, rather than a closure that names
+  # itself.
+  #
+  # `my $tick; $tick = sub { ... $tick->() ... }` is a reference cycle, and Perl
+  # frees by refcount: nothing collects it, ever. The cycle captured this
+  # controller, its transaction, the promise, the query and the rows, so every
+  # park retained several kilobytes for the life of the process -- on a path that
+  # is unauthenticated, deliberately not rate limited, and holds for up to
+  # fifteen minutes at a time. Measured at ~7KB a park, strictly monotonic, with
+  # nothing given back when the connection closed.
+  #
+  # `__SUB__` names the running sub without a lexical pointing at it, so there is
+  # no cycle to collect. Rescheduling a one-shot also removes the old dance of
+  # cancelling and re-creating a recurring timer to change its interval.
+  #
+  # Worth the comment rather than a quiet fix: this arrived with the adaptive
+  # interval, which the release notes call "tidiness rather than necessity" and
+  # justify with arithmetic showing the naive version was already noise. An
+  # optimisation nobody needed leaked memory to an anonymous caller.
+  my $poll = sub {
+    # The room may have gone while this caller was parked on it. Before this
+    # check the poll went on asking a room that no longer existed and settled
+    # empty AT THE DEADLINE -- invisible at sixty seconds, a held connection
+    # doing nothing for a quarter of an hour at nine hundred.
+    #
+    # find_room treats an expired room as absent from the moment it expires, an
+    # hour or so before the reaper physically deletes it, so a waiter is released
+    # at the true expiry rather than at the next reaper pass.
+    my $live = eval { $chat->find_room($room->{secret}) };
+    # Asked of the database, not of the room hashref this park started with,
+    # which still says whatever it said a quarter of an hour ago.
+    return $settle->([], $chat->room_state($room->{secret})) unless $live;
 
-        my $found = eval { $chat->messages($room, %$query) };
-        # A failed poll is logged and retried until the deadline: the store going
-        # briefly read-only is not a reason to hang up on somebody waiting.
-        return $c->app->log->warn("chat: poll failed: $@") unless $found;
-        return $settle->($found) if @$found;
-        return $settle->([])     if time >= $deadline;
-        $tick->() if $elapsed < 60 && time - $started >= 5;
-      }
-    );
+    my $found = eval { $chat->messages($room, %$query) };
+    # A failed poll is logged and retried until the deadline: the store going
+    # briefly read-only is not a reason to hang up on somebody waiting.
+    unless ($found) {
+      $c->app->log->warn("chat: poll failed: $@");
+      $found = [];
+    }
+    return $settle->($found) if @$found;
+    return $settle->([])     if time >= $deadline;
+
+    # 0.5s while somebody might still be watching a page, then out to five. A
+    # browser still feels instant; an agent parked for a quarter of an hour costs
+    # about two hundred lookups instead of eighteen hundred.
+    my $elapsed = time - $started;
+    $timer = Mojo::IOLoop->timer(
+      ($elapsed < 5 ? 0.5 : $elapsed < 60 ? 2 : 5) => __SUB__);
+    return;
   };
-  $tick->();
+  $timer = Mojo::IOLoop->timer(0.5 => $poll);
 
   # Somebody who hangs up — a curl interrupted, an agent that gave up — should
   # not leave a timer running to the deadline for nobody.

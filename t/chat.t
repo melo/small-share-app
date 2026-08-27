@@ -40,6 +40,13 @@ $ENV{SHARE_CHAT_RATE_PER_MINUTE} = 1000;
 $ENV{SHARE_HEALTH_DETAIL} = 1;
 delete $ENV{SHARE_TTL_DAYS};
 
+{ # Destroyed exactly when the last reference to it goes. A reference cycle
+  # keeps it alive forever, which is the whole assertion above.
+  package Share::Test::Sentinel;
+  sub new ($class, $cb) { return bless {cb => $cb}, $class }
+  sub DESTROY ($self) { $self->{cb}->() }
+}
+
 my $t = Test::Mojo->new(curfile->dirname->sibling('share.pl'));
 
 my $PROTOCOL = '2026-07-28';
@@ -1624,6 +1631,73 @@ subtest 'an unauthorised reader may still read, it just cannot move the cursor' 
     ->status_is(200);
   isnt $t->app->chat->read_cursor($t->app->chat->find_room($id), 'sess-r'), $before,
     'and with the token it advances as it should';
+};
+
+# ------------------------------------------------------ the 1.5.3 hotfixes ---
+
+subtest 'the no-JavaScript path still works when the token is required' => sub {
+  # CONTRIBUTING calls the no-JS form post "the real one" and the scripted path
+  # an enhancement. 1.5.2 moved the guard into Share::Chat and the form route was
+  # the one caller that never learned to say who it was -- so on an instance with
+  # SHARE_CHAT_REQUIRE_TOKEN set, a person with scripting off could read a room
+  # and never post to it. It failed silently: a 302 back to the room, and the
+  # message simply absent.
+  #
+  # A browser carries no member_token and never will. Its signed cookie IS the
+  # credential, which is exactly what _chat_credentials exists to say.
+  local $t->app->config->{chat_require_token} = 1;
+  local $t->app->chat->{require_token} = 1;
+
+  $t->reset_session;
+  my $id = _room(topic => 'no javascript here')->{room}{id};
+
+  my %html = (Accept => 'text/html');
+  $t->post_ok("/c/$id/join" => \%html => form =>
+      {name => 'Pedro', about => 'reading in a browser'})->status_is(302);
+
+  my $before = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{count};
+  $t->post_ok("/c/$id/messages" => \%html => form => {body => 'posted with no script'})
+    ->status_is(302);
+
+  my $after = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json;
+  is $after->{count}, $before + 1, 'the message landed';
+  is $after->{events}[-1]{body}, 'posted with no script', 'and it is the one that was typed';
+
+  $t->reset_session;
+};
+
+subtest 'a parked reader does not leak the request it parked on' => sub {
+  # chat_await built its interval timer as `my $tick; $tick = sub { ... $tick->() }`,
+  # a closure naming itself. Perl's refcounting cannot collect that cycle, and the
+  # cycle captures the controller, its transaction, the promise, the query and the
+  # rows -- so every park retained ~7KB for the life of the process, on a path that
+  # is unauthenticated, deliberately not rate limited, and can be held for fifteen
+  # minutes at a time.
+  #
+  # Asserted structurally rather than by measuring RSS, because a leak of a few
+  # kilobytes is invisible in a test and obvious only after a thousand parks. The
+  # promise is watched instead: if the closure cycle is still there, the guard
+  # object it closes over is never destroyed.
+  my $id = _room(topic => 'no leaks')->{room}{id};
+  _join($id, session_id => 'sess-leak', name => 'parker', about => 'leak test');
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+
+  my $collected = 0;
+  {
+    # A sentinel with the same lifetime as the park: captured by the query hash
+    # that chat_await holds, so it can only be freed once every closure in that
+    # graph has been.
+    my $room_obj = $t->app->chat->find_room($id);
+    my $sentinel = Share::Test::Sentinel->new(sub { $collected++ });
+    my %query    = (since => $cursor, sentinel => $sentinel);
+
+    my $done = 0;
+    $t->app->build_controller->chat_await($room_obj, \%query, 1)
+      ->then(sub { $done = 1 })->wait;
+    ok $done, 'the park settled';
+  }
+
+  is $collected, 1, 'and everything it held was freed when it did';
 };
 
 done_testing;

@@ -656,7 +656,11 @@ sub touch_member ($self, $room, $session_id) {
     1;
   } or do {
     my $err = $@ || 'unknown error';
-    $self->log->warn("chat: touch failed for $room->{secret} (carrying on): $err") if $self->log;
+    # The rowid, never the secret. A room's secret IS its bearer credential, and
+    # `warn` is on in production -- one transient database hiccup would have put
+    # a live room credential into a log nobody treats as secret material.
+    $self->log->warn("chat: touch failed for room $room->{id} (carrying on): $err")
+      if $self->log;
   };
   return;
 }
