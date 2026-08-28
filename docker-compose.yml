@@ -109,6 +109,12 @@ services:
       # background tab and a bad minute of network.
       SHARE_CHAT_PRESENCE_TIMEOUT: ${SHARE_CHAT_PRESENCE_TIMEOUT:-300}
 
+      # How many callers may be parked on one room at once, per worker. Reads
+      # are deliberately not rate limited -- a limit on reads is a limit on
+      # following a room -- but a park holds a connection, a timer and a database
+      # handle for up to SHARE_CHAT_MAX_WAIT, and nothing else bounds them.
+      SHARE_CHAT_MAX_WAITERS: ${SHARE_CHAT_MAX_WAITERS:-32}
+
       # One line of deployment truth the app cannot know: who can reach this and
       # who to ask for access. Shown on the home page and handed to every agent
       # in the MCP instructions.

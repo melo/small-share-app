@@ -607,21 +607,39 @@ sub rate_check ($self, $client, %opt) {
 # outcome than losing the oldest thing on it.
 #
 # Returns the list of evicted rows, so the caller can say what it did.
-sub enforce_total_limit ($self) {
+sub enforce_total_limit ($self, %opt) {
   my $limit = $self->max_total_bytes or return [];
 
   my $total = $self->sql->db->query('SELECT COALESCE(SUM(size), 0) FROM files')->array->[0];
   return [] if $total <= $limit;
 
+  # Whoever is filling the disk pays for it first.
+  #
+  # This used to evict the globally oldest file, full stop -- so somebody who
+  # could get past the rate limit could fill the quota and delete everybody
+  # else's shares, which is a destructive cross-tenant effect from an endpoint
+  # with no authentication. Taking the uploader's own oldest first means the
+  # cost of filling the disk lands on the session that filled it, and only what
+  # is left over reaches anyone else.
+  my @order = ('SELECT * FROM files WHERE session_id = ? ORDER BY created_at ASC');
+  my @bind  = ($opt{session_id});
+  unless (defined $opt{session_id} && length $opt{session_id}) { @order = (); @bind = () }
+
   my @evicted;
-  # Oldest first, one at a time: each purge changes the total, and stopping the
+  # One at a time, oldest first: each purge changes the total, and stopping the
   # moment it fits means never evicting one file more than necessary.
-  my $rows = $self->sql->db->query('SELECT * FROM files ORDER BY created_at ASC')->hashes;
-  for my $row (@$rows) {
+  for my $pass (@order, 'SELECT * FROM files ORDER BY created_at ASC') {
+    my $rows = $self->sql->db->query($pass, @order ? @bind : ())->hashes;
+    @bind = ();
+    @order = ();
+    for my $row (@$rows) {
+      last if $total <= $limit;
+      next if grep { $_->{id} == $row->{id} } @evicted;
+      $total -= $row->{size};
+      $self->_purge($row);
+      push @evicted, $row;
+    }
     last if $total <= $limit;
-    $total -= $row->{size};
-    $self->_purge($row);
-    push @evicted, $row;
   }
 
   return \@evicted;

@@ -135,6 +135,15 @@ my %CFG = (
   # The browser keeps itself alive every 60-90s; five minutes survives a closed
   # lid, a throttled background tab and a bad minute of network.
   chat_presence_timeout => _number(SHARE_CHAT_PRESENCE_TIMEOUT => 300),
+
+  # How many callers may be parked on one room at once, per worker.
+  #
+  # Specified in the design and in the plan, and then never built -- which left
+  # nothing at all throttling waiters, because reads are deliberately unlimited.
+  # Three hundred concurrent parks from one client were accepted; Mojo's default
+  # ceiling is a thousand connections, so a thousand fifteen-minute holds lock
+  # every worker out of accept() for a quarter of an hour.
+  chat_max_waiters => _number(SHARE_CHAT_MAX_WAITERS => 32),
 );
 
 sub _decoded ($value) {
@@ -408,7 +417,7 @@ post '/upload' => sub ($c) {
           delete_password => $row->{delete_password}}};
   }
 
-  _shed_over_limit($c);
+  _shed_over_limit($c, scalar $c->param('session_id'));
   $c->render('uploaded', results => \@results, error => undef);
 } => 'upload';
 
@@ -775,7 +784,7 @@ $api->post('/files' => sub ($c) {
   # anything else reads, `public` does not carry it, and no later call will
   # return it — losing it means the file simply expires on its own.
   my $info = {%{$store->public($row, $c->base_url)}, delete_password => $row->{delete_password}};
-  _shed_over_limit($c);
+  _shed_over_limit($c, $row->{session_id});
   $c->res->headers->location($info->{url});
   $c->render(json => $info, status => 201);
 });
@@ -927,6 +936,21 @@ my $read_events = sub ($c) {
   # A search waits for nothing: `q` asks about what has already been said.
   my $wait = length($query{q} // '') ? 0 : _chat_wait_seconds($c);
 
+  # And a search is a QUERY, not a way of following a room. It lower-cases every
+  # body the room still holds -- up to five thousand of them, sixteen kilobytes
+  # each -- on the one event loop, so leaving it on the unlimited read path let a
+  # caller with a full room block the worker at will. Following stays free;
+  # asking a question costs what asking a question costs.
+  if (length($query{q} // '')) {
+    my ($ok, $retry) = $store->rate_check($c->chat_client, bucket => 'chat',
+      per_second => $c->app->config->{chat_rate_per_second},
+      per_minute => $c->app->config->{chat_rate_per_minute});
+    unless ($ok) {
+      $c->res->headers->header('Retry-After' => $retry);
+      return _api_error($c, 429, "too many searches; try again in ${retry}s");
+    }
+  }
+
   # Mojolicious closes an idle connection after fifteen seconds, which would
   # hang up on every long poll asking for more than that.
   $c->inactivity_timeout($wait + 15) if $wait;
@@ -958,8 +982,19 @@ my $read_events = sub ($c) {
   # hung up fifteen minutes ago look like the most attentive member in the room.
   $chat->hold($room, $session, $wait, %creds);
 
+  # A park holds a connection, a timer and a database handle for up to fifteen
+  # minutes. Refusing the caller past the ceiling is the difference between a
+  # busy room and a worker that cannot accept anything at all.
+  unless ($c->chat_take_slot($room)) {
+    $c->res->headers->header('Retry-After' => 5);
+    return _api_error($c, 429,
+      'too many callers are already waiting on this room; read without `wait`, '
+        . 'or try again in a moment');
+  }
+
   $c->render_later;
   $c->chat_await($room, \%query, $wait)->then(sub ($rows, $closed = undef) {
+    $c->chat_free_slot($room);
     $chat->release($room, $session, %creds) unless $closed;
     $answer->($rows, waited => 1, closed => $closed);
   });
@@ -1280,6 +1315,28 @@ sub _chat_wait_seconds ($c) {
   my $max = $c->app->config->{chat_max_wait};
   return $wait > $max ? $max : 0 + $wait;
 }
+
+# Parks in flight, per room, for this worker.
+#
+# Reads are deliberately not rate limited -- a limiter on reads is a limiter on
+# following a room, which is the thing the feature exists for. But "not limited"
+# and "unbounded" are different, and until now there was nothing between one
+# client and every connection this worker has.
+my %WAITING;
+
+helper chat_take_slot => sub ($c, $room) {
+  my $cap = $c->app->config->{chat_max_waiters} or return 1;
+  return 0 if ($WAITING{$room->{secret}} // 0) >= $cap;
+  $WAITING{$room->{secret}}++;
+  return 1;
+};
+
+helper chat_free_slot => sub ($c, $room) {
+  my $secret = $room->{secret};
+  return unless $WAITING{$secret};
+  delete $WAITING{$secret} unless --$WAITING{$secret};
+  return;
+};
 
 # Wait for the next thing said in a room, without a worker sitting still for it.
 #
@@ -1615,8 +1672,10 @@ sub _chat_error ($c, $err) {
 # Enforced by eviction after the fact rather than by refusing the upload: a
 # public box that fills its disk goes down, which is worse than losing the
 # oldest file on it.
-sub _shed_over_limit ($c) {
-  my $evicted = $store->enforce_total_limit;
+sub _shed_over_limit ($c, $session_id = undef) {
+  # The uploader's own oldest goes first. Evicting the globally oldest made
+  # filling the disk a way to delete other people's shares.
+  my $evicted = $store->enforce_total_limit(session_id => $session_id);
   return unless @$evicted;
   app->log->info(sprintf 'over the %s ceiling: evicted %d oldest file(s), %s',
     human_size($CFG{max_total_bytes}), scalar @$evicted,

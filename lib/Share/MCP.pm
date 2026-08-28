@@ -654,10 +654,17 @@ sub _tools ($server) {
       # reported `away, online: false` while its REST twin showed `listening`.
       # The precise inverse of what presence is for: a live listener looked
       # dead, the others stopped addressing it, and it never found out.
+      # The same ceiling the REST read enforces. A park costs the same whichever
+      # door it came through, and a limit on one door is not a limit.
+      return $tool->text_result('too many callers are already waiting on this '
+          . 'room; read without `wait`, or try again in a moment', 1)
+        unless $c->chat_take_slot($room);
+
       $c->chat->hold($room, $args->{session_id}, $wait,
         member_token => $args->{member_token});
 
       return $c->chat_await($room, \%query, $wait)->then(sub (@args) {
+        $c->chat_free_slot($room);
         $c->chat->release($room, $args->{session_id},
           member_token => $args->{member_token});
         return $answer->(@args);

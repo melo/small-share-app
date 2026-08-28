@@ -2247,4 +2247,72 @@ subtest 'a room that cannot be read is not a room that was destroyed' => sub {
   ok time - $started < 5, 'and immediately';
 };
 
+# ------------------------------------------------------------- the limits ---
+
+subtest 'a room has a ceiling on how many callers may park on it' => sub {
+  # Specified in the design, listed in the plan, and never built. Reads are
+  # deliberately not rate limited -- a limiter on reads is a limiter on following
+  # a room -- but "not limited" and "unbounded" are different things, and there
+  # was nothing at all between one client and every connection a worker has.
+  # Three hundred concurrent parks were accepted; Mojo's default ceiling is a
+  # thousand, so a thousand fifteen-minute holds lock a worker out of accept().
+  local $t->app->config->{chat_max_waiters} = 2;
+
+  my $id   = _room(topic => 'crowded')->{room}{id};
+  my $room = $t->app->chat->find_room($id);
+  _join($id, session_id => 'sess-p', name => 'parker', about => 'x');
+
+  # The accounting, directly: holding real connections open inside Test::Mojo
+  # means driving its event loop by hand, which tests the harness rather than
+  # the ceiling.
+  my $c = $t->app->build_controller;
+  ok $c->chat_take_slot($room), 'the first caller may park';
+  ok $c->chat_take_slot($room), 'and the second';
+  ok !$c->chat_take_slot($room), 'the third is refused';
+
+  # A room that is full says so over HTTP, with something to wait for.
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=3")->status_is(429)
+    ->json_like('/error' => qr/already waiting/)
+    ->header_like('Retry-After' => qr/\A\d+\z/);
+
+  # A read that does NOT park is never refused: following a room is the feature,
+  # and the ceiling is on holding a connection, not on asking.
+  $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200);
+
+  # And the slot comes back when the park ends.
+  $c->chat_free_slot($room);
+  ok $c->chat_take_slot($room), 'a finished park frees its place';
+  $c->chat_free_slot($room) for 1 .. 3;
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=1")->status_is(200);
+};
+
+subtest 'searching a room is a question, and questions are counted' => sub {
+  # `q` lower-cases every body the room still holds -- up to five thousand of
+  # them at sixteen kilobytes -- on the one event loop. Leaving it on the
+  # unlimited read path let a caller with a full room block the worker at will.
+  my $id = _room(topic => 'searchable')->{room}{id};
+  _join($id, session_id => 'sess-s', name => 'searcher', about => 'x');
+  _post($id, 'sess-s', 'the migration is green');
+
+  my $cfg = $t->app->config;
+  my @was = @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)};
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = (1, 2);
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+
+  my @codes;
+  for (1 .. 5) {
+    $t->get_ok("/api/v1/chatrooms/$id/events?q=migration");
+    push @codes, $t->tx->res->code;
+  }
+  ok scalar(grep { $_ == 429 } @codes) >= 2,
+    'a burst of searches is refused (' . join(' ', @codes) . ')';
+
+  # Following the room is untouched, which is the line being drawn.
+  $t->get_ok("/api/v1/chatrooms/$id/events")->status_is(200);
+
+  @{$cfg}{qw(chat_rate_per_second chat_rate_per_minute)} = @was;
+  $t->app->store->sql->db->query('DELETE FROM upload_hits');
+};
+
 done_testing;

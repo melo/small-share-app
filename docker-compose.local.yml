@@ -80,6 +80,12 @@ services:
       # every 60-90 seconds; five minutes survives a closed lid, a throttled
       # background tab and a bad minute of network.
       SHARE_CHAT_PRESENCE_TIMEOUT: ${SHARE_CHAT_PRESENCE_TIMEOUT:-300}
+
+      # How many callers may be parked on one room at once, per worker. Reads
+      # are deliberately not rate limited -- a limit on reads is a limit on
+      # following a room -- but a park holds a connection, a timer and a database
+      # handle for up to SHARE_CHAT_MAX_WAIT, and nothing else bounds them.
+      SHARE_CHAT_MAX_WAITERS: ${SHARE_CHAT_MAX_WAITERS:-32}
       SHARE_NOTICE: ${SHARE_NOTICE:-}
       MOJO_MODE: ${MOJO_MODE:-production}
       # Only meaningful behind a proxy that sets X-Forwarded-*. Harmless
