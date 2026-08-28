@@ -507,20 +507,16 @@ sub _tools ($server) {
         body         => $args->{body},
         member_token => $args->{member_token});
 
-      # The same gap the REST endpoint hands back, for the same reason: a cursor
-      # that silently jumped is how an agent spends thirty seconds answering a
-      # question a message it had not read already refined.
-      my $behind = $c->chat->messages($room,
-        since => $c->chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
-      $behind = [grep { $_->{id} != $row->{id} } @$behind];
-      # Trusted: post() authorised this caller immediately above.
-      $c->chat->mark_read($room, $args->{session_id}, $row->{id}, trusted => 1);
+      # Exactly the accounting the REST endpoint does, from the one helper, so
+      # the two cannot drift: `unread` is the whole gap, `truncated` says when
+      # the headers are only a page of it, and the cursor moves no further than
+      # the last header actually shown.
+      my %gap = $c->chat_gap($room, $args->{session_id}, $row);
 
       return $tool->structured_result({
         message => $c->chat->event_public($row, [], $room),
         cursor  => 0 + $row->{id},
-        unread  => scalar @$behind,
-        missed  => [map { $c->chat->header_public($_) } @$behind],
+        %gap,
       });
     },
   );
@@ -583,7 +579,10 @@ sub _tools ($server) {
 
       my %query = (since => $since, limit => $args->{limit});
 
-      if ($args->{mentions_me} && defined $args->{session_id}) {
+      if ($args->{mentions_me}) {
+        return $tool->text_result('mentions_me needs a session_id: it means '
+            . '"addressed to me", and the room has to know who that is', 1)
+          unless defined $args->{session_id} && length $args->{session_id};
         my $me = $c->chat->member($room, $args->{session_id});
         $query{mentions_me} = $me ? $me->{id} : -1;
       }

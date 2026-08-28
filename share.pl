@@ -913,7 +913,13 @@ my $read_events = sub ($c) {
   # through verbatim — so the PARK inherits the filter for free. Applying it to
   # the read but not the wait would wake an agent for every word said in the room
   # and then hand it nothing, which is worse than not filtering at all.
-  if ($c->param('mentions_me') && defined $session) {
+  if ($c->param('mentions_me')) {
+    # Silently dropping this turned "wake me when somebody needs me" into "wake
+    # me for everything" -- the precise outcome the filter exists to prevent, and
+    # the one an agent turns the watch off over.
+    return _api_error($c, 400, 'mentions_me needs a session_id: it means '
+        . '"addressed to me", and the room has to know who that is')
+      unless defined $session && length $session;
     my $me = $chat->member($room, $session);
     $query{mentions_me} = $me ? $me->{id} : -1;
   }
@@ -942,7 +948,9 @@ my $read_events = sub ($c) {
     return _chat_messages_json($c, $room, $rows, $since, %opt, session => $session);
   };
 
-  return $answer->($chat->messages($room, %query)) unless $wait;
+  my $immediate = eval { $chat->messages($room, %query) };
+  return _chat_error($c, $@) if $@;
+  return $answer->($immediate) unless $wait;
 
   # An open poll is what says this member is listening, so it is claimed for as
   # long as the park intends to last and given up the moment it ends -- however
@@ -1061,31 +1069,17 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
   # What landed while this caller was not looking.
   #
   # The server has known this all along — it has the room and it has the member's
-  # read cursor — and until now the acknowledgement spent that knowledge saying
+  # read cursor — and once the acknowledgement spent that knowledge saying
   # {"cursor": 9}. Two separate sessions lost work to the silence: one answered a
   # question that an unread message had already refined, the other had six
   # questions put to it and did not see them for four and a half hours.
   #
-  # Posting is the one moment an agent is provably listening. This is the cheapest
-  # possible thing to do with that.
-  my $behind = $chat->messages($room,
-    since => $chat->read_cursor($room, $args->{session_id}) // 0, limit => 20);
-  $behind = [grep { $_->{id} != $row->{id} } @$behind];
-
-  # And it catches you up, because you have just been handed the gap. Trusted
-  # unconditionally: post() authorised this caller a few lines ago, and making
-  # the guard re-judge its own callers is how an internal call ends up refusing
-  # somebody who has already been let in.
-  $chat->mark_read($room, $args->{session_id}, $row->{id}, trusted => 1);
-
+  # Posting is the one moment an agent is provably listening.
+  my %gap = $c->chat_gap($room, $args->{session_id}, $row);
   $c->render(json => {
     message => $chat->event_public($row, [], $room),
     cursor  => 0 + $row->{id},
-    # A ceiling, not a page size: a caller further behind than this should read
-    # properly rather than have an acknowledgement quietly become a catch-up.
-    # `unread` is the true count either way, so nothing is hidden.
-    unread  => scalar @$behind,
-    missed  => [map { $chat->header_public($_) } @$behind],
+    %gap,
   }, status => 201);
 });
 
@@ -1342,6 +1336,8 @@ helper chat_await => sub ($c, $room, $query, $wait) {
   # justify with arithmetic showing the naive version was already noise. An
   # optimisation nobody needed leaked memory to an anonymous caller.
   my $poll = sub {
+    my $found;
+
     # The room may have gone while this caller was parked on it. Before this
     # check the poll went on asking a room that no longer existed and settled
     # empty AT THE DEADLINE -- invisible at sixty seconds, a held connection
@@ -1351,17 +1347,45 @@ helper chat_await => sub ($c, $room, $query, $wait) {
     # hour or so before the reaper physically deletes it, so a waiter is released
     # at the true expiry rather than at the next reaper pass.
     my $live = eval { $chat->find_room($room->{secret}) };
-    # Asked of the database, not of the room hashref this park started with,
-    # which still says whatever it said a quarter of an hour ago.
-    return $settle->([], $chat->room_state($room->{secret})) unless $live;
+    unless ($live) {
+      # Asked of the database, not of the room hashref this park started with,
+      # which still says whatever it said a quarter of an hour ago.
+      my $state = eval { $chat->room_state($room->{secret}) } // 'unknown';
 
-    my $found = eval { $chat->messages($room, %$query) };
-    # A failed poll is logged and retried until the deadline: the store going
-    # briefly read-only is not a reason to hang up on somebody waiting.
-    unless ($found) {
-      $c->app->log->warn("chat: poll failed: $@");
+      # ONLY these two mean the room is over. `$live` comes from an eval, so any
+      # failure of that query -- the store briefly read-only, a full disk, the
+      # failure this codebase has actually seen before -- also yields undef. And
+      # every truthy state used to be treated as closure, so a transient error
+      # told a parked reader that its coordination room had been deleted, with
+      # why => 'live', about a room that was standing. Worse, the synthesized
+      # event carries id 0, so every parked agent would then have re-read the
+      # room from the beginning.
+      #
+      # An unreadable room is something to retry until the deadline, not
+      # something to announce.
+      return $settle->([], $state) if $state eq 'closed' || $state eq 'expired';
+
+      # Anything else is the store being briefly unreadable, which is a reason to
+      # try again rather than a reason to tell somebody their room was deleted.
+      #
+      # It must NOT return here. The timer is a one-shot that re-arms at the
+      # bottom of this sub, so an early return parks the caller forever -- which
+      # is what the first draft of this did, and the test for this very branch
+      # hung the whole suite until the deadline. That is the loudest a bug can
+      # be and the cheapest place to hear it.
+      $c->app->log->warn("chat: room state unreadable ($state), still waiting");
       $found = [];
     }
+    else {
+      $found = eval { $chat->messages($room, %$query) };
+      # A failed poll is logged and retried until the deadline, for the same
+      # reason: read-only for a moment is not a reason to hang up on anybody.
+      unless ($found) {
+        $c->app->log->warn("chat: poll failed: $@");
+        $found = [];
+      }
+    }
+
     return $settle->($found) if @$found;
     return $settle->([])     if time >= $deadline;
 
@@ -1530,6 +1554,43 @@ sub _chat_messages_json ($c, $room, $rows, $since, %opt) {
     messages => \@messages,
   });
 }
+
+# The gap an acknowledgement hands back, and how far it is honest to mark read.
+#
+# This used to hand back at most twenty headers and then mark the cursor to the
+# NEWEST event -- so everything between the twentieth header and the post was
+# marked read and could never be reached by since=unread again. A member sixty
+# events behind was told `unread: 20` and left with a real unread of zero: forty
+# events gone, silently, on the pattern the documentation actively encourages.
+# The comment here used to say "unread is the true count either way, so nothing
+# is hidden", and the test that would have caught it used a gap of two.
+#
+# So: `unread` is the whole gap, `truncated` says when the headers are only a
+# page of it, and the cursor moves no further than the last header actually
+# shown.
+helper chat_gap => sub ($c, $room, $session_id, $row) {
+  my $cap   = 20;
+  my $from  = $chat->read_cursor($room, $session_id) // 0;
+  my $total = $chat->unread_count($room, $session_id);
+
+  my $behind = $chat->messages($room, since => $from, limit => $cap + 1);
+  $behind = [grep { $_->{id} != $row->{id} } @$behind];
+
+  my $truncated = @$behind > $cap;
+  $behind = [@{$behind}[0 .. $cap - 1]] if $truncated;
+
+  # Trusted: post() authorised this caller a few lines ago, and making the guard
+  # re-judge its own callers is how an internal call refuses somebody already in.
+  my $to = $truncated ? $behind->[-1]{id} : $row->{id};
+  $chat->mark_read($room, $session_id, $to, trusted => 1);
+
+  return (
+    # The whole gap, minus the message just posted, which is in the answer.
+    unread    => $total > 0 ? $total - 1 : 0,
+    truncated => $truncated ? \1 : \0,
+    missed    => [map { $chat->header_public($_) } @$behind],
+  );
+};
 
 sub _no_room ($c) { return 'no such room — it was deleted, or it expired' }
 

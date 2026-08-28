@@ -2108,4 +2108,143 @@ subtest 'a forwarded address is only believed from a peer allowed to send one' =
   $t->app->store->sql->db->query('DELETE FROM upload_hits');
 };
 
+# ------------------------------------------------------ the cursor protocol --
+
+subtest 'posting never marks read what it did not show you' => sub {
+  # The worst finding in the audit, and it needs no attacker: it is the
+  # documented, encouraged pattern. Post hands back at most twenty headers of
+  # the gap -- then marked the cursor to the NEWEST event rather than to the
+  # last one it showed, so everything between the twentieth header and the post
+  # was marked read and could never be reached by since=unread again.
+  #
+  # The comment in that code asserted "unread is the true count either way, so
+  # nothing is hidden". It was false. The existing test used a gap of two, which
+  # is why it read as correct for three releases.
+  my $id = _room(topic => 'the gap')->{room}{id};
+  _join($id, session_id => 'quiet', name => 'quiet', about => 'goes away and comes back');
+  _join($id, session_id => 'noisy', name => 'noisy', about => 'keeps talking');
+
+  # Catch the quiet one up, then bury it far past the twenty-header cap.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=quiet"
+      . "&member_token=" . (_token($id, 'quiet') // ''));
+  _post($id, 'noisy', "message $_") for 1 .. 35;
+
+  my $ack = _post($id, 'quiet', 'my turn');
+  is $ack->{unread}, 35, 'the acknowledgement reports the WHOLE gap, not the page of it';
+  is scalar @{$ack->{missed}}, 20, 'and hands back as many headers as it carries';
+  is $ack->{truncated}, Mojo::JSON->true, 'saying plainly that it is a page';
+
+  # The fifteen it could not show are still unread. Before this fix they were
+  # gone: the cursor had jumped past them and mark_read never goes backwards.
+  my $left = $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=quiet"
+      . "&member_token=" . (_token($id, 'quiet') // ''))->tx->res->json;
+  is $left->{count}, 16, 'everything it did not show is still there to be read';
+  is $left->{events}[0]{body}, 'message 21', 'starting exactly where the page ended';
+
+  # And a gap that fits is closed completely, as it always was.
+  _post($id, 'noisy', 'just one');
+  my $small = _post($id, 'quiet', 'and again');
+  is $small->{unread}, 1, 'a small gap is reported whole';
+  is $small->{truncated}, Mojo::JSON->false, 'and is not a page';
+  is $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=quiet"
+      . "&member_token=" . (_token($id, 'quiet') // ''))->tx->res->json->{count}, 0,
+    'so posting did catch it up';
+};
+
+subtest 'a cursor that could not have come from this room is refused' => sub {
+  # Any \d+ of any magnitude was accepted and stored. 999999999999999999 silenced
+  # a member permanently, because mark_read refuses to go backwards. Twenty
+  # digits was worse: SQLite stored it as a REAL, it came back as "1e+20", that
+  # failed the integer test in messages(), the since clause was DROPPED, and the
+  # member got the whole tail on every call -- which also meant wait never
+  # parked, turning the documented backgrounded watcher into a hot loop.
+  my $id = _room(topic => 'silly cursors')->{room}{id};
+  _join($id, session_id => 'sess-c', name => 'reader', about => 'cursor test');
+  _post($id, 'sess-c', 'something');
+  my $tok = _token($id, 'sess-c');
+
+  for my $silly ('999999999999999999', '99999999999999999999') {
+    $t->post_ok("/api/v1/chatrooms/$id/members/sess-c/read" => json =>
+        {cursor => $silly, member_token => $tok})->status_is(400)
+      ->json_like('/error' => qr/cursor/i);
+  }
+
+  # And a read still parks afterwards, which is the symptom that mattered.
+  my $cursor = $t->get_ok("/api/v1/chatrooms/$id/events")->tx->res->json->{cursor};
+  my $started = time;
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$cursor&wait=1")->status_is(200)
+    ->json_is('/timed_out' => Mojo::JSON->true);
+  ok time - $started >= 1, 'a park is still a park';
+};
+
+subtest 'a since it cannot understand is an error, not a silent whole-room read' => sub {
+  # since=3.0, -1 and abc all dropped the WHERE clause and handed back the tail
+  # with missed:false. In a room past its cap that is a silent gap of thousands,
+  # with the one flag that exists to reveal it saying no.
+  my $id = _room(topic => 'bad cursors')->{room}{id};
+  _join($id, session_id => 'sess-b', name => 'reader', about => 'x');
+  _post($id, 'sess-b', $_) for qw(one two three);
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=$_")->status_is(400)
+      ->json_like('/error' => qr/since/i)
+    for ('3.0', '-1', 'abc', '1e5');
+
+  # The two forms that are real still work.
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=0")->status_is(200);
+  $t->get_ok("/api/v1/chatrooms/$id/events?since=unread&session_id=sess-b"
+      . "&member_token=" . (_token($id, 'sess-b') // ''))->status_is(200);
+};
+
+subtest 'asking to be woken only when wanted, without saying who you are' => sub {
+  # mentions_me with no session_id was silently dropped and the caller got the
+  # whole room -- "wake me when somebody needs me" quietly becoming "wake me for
+  # everything", which is the outcome the filter exists to prevent.
+  my $id = _room(topic => 'who are you')->{room}{id};
+  _join($id, session_id => 'sess-m', name => 'reader', about => 'x');
+  _post($id, 'sess-m', 'nothing for anybody');
+
+  $t->get_ok("/api/v1/chatrooms/$id/events?mentions_me=1")->status_is(400)
+    ->json_like('/error' => qr/session_id/);
+  ok _call(get_room_events => {room => $id, mentions_me => 1})->{isError},
+    'and over MCP too';
+};
+
+subtest 'a room that cannot be read is not a room that was destroyed' => sub {
+  # $live comes from an eval, so ANY failure of that query yields undef -- the
+  # store briefly read-only, a full disk, the failure this codebase has seen
+  # before. Every truthy state was then treated as closure, so a transient error
+  # told a parked reader "This room was closed. Everything in it has been
+  # deleted." with why => 'live', about a room that was standing. And because the
+  # synthesized event carries id 0, every parked agent would then have re-read
+  # its room from the beginning.
+  #
+  # Asserted against chat_await directly: the decision is one branch, and driving
+  # it through HTTP means mocking a lookup the route itself depends on.
+  my $id   = _room(topic => 'unreadable')->{room}{id};
+  my $chat = $t->app->chat;
+  my $room = $chat->find_room($id);
+
+  no warnings 'redefine';
+  local *Share::Chat::find_room  = sub { undef };       # the room cannot be read
+  local *Share::Chat::room_state = sub { 'unknown' };   # and nor can its state
+
+  my ($rows, $closed);
+  my $started = time;
+  $t->app->build_controller->chat_await($room, {since => 999999}, 2)
+    ->then(sub ($r, $c = undef) { ($rows, $closed) = ($r, $c) })->wait;
+
+  is $closed, undef, 'the park does not announce a death it cannot confirm';
+  is_deeply $rows, [], 'and comes back empty, the way a quiet room does';
+  ok time - $started >= 2, 'having waited out its deadline instead';
+
+  # A room that really has gone still settles at once, and says which way.
+  local *Share::Chat::room_state = sub { 'closed' };
+  my $why;
+  $started = time;
+  $t->app->build_controller->chat_await($room, {since => 999999}, 10)
+    ->then(sub ($r, $c = undef) { $why = $c })->wait;
+  is $why, 'closed', 'a room that is really gone is still reported';
+  ok time - $started < 5, 'and immediately';
+};
+
 done_testing;

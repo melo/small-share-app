@@ -717,14 +717,34 @@ sub members ($self, $room) {
 # it fires.
 sub read_cursor ($self, $room, $session_id) {
   my $member = $self->member($room, $session_id) or return undef;
-  return 0 + $member->{read_cursor};
+  my $at = $member->{read_cursor};
+  # Belt and braces for a row written before the clamp above existed: a REAL
+  # that stringifies to "1e+20" is not a position, and treating it as zero costs
+  # a re-read where trusting it costs every read forever.
+  return 0 unless defined $at && $at =~ /\A\d+\z/;
+  return 0 + $at;
 }
 
 sub mark_read ($self, $room, $session_id, $cursor, %args) {
   return unless defined $cursor && $cursor =~ /\A\d+\z/;
+
   # Before the lookup, for the same reason as leave_room: a silent 200 for a
   # stranger and a 403 for a member is a membership oracle.
   $self->authorise($room, $session_id, %args);
+
+  # And AFTER it, because the answer describes the room: telling an
+  # unauthorised caller that its cursor is past the end would hand over the
+  # room's id range, which is the traffic meter this release is closing.
+  #
+  # A cursor that could not have come from this room is a mistake, not a
+  # position. Storing one silenced a member permanently -- mark_read refuses to
+  # go backwards -- and a twenty-digit one was worse: SQLite kept it as a REAL,
+  # it came back as "1e+20", that failed the integer test in messages(), and the
+  # `since` clause was dropped altogether. The member then got the whole tail on
+  # every call, which also meant a park never parked.
+  _fail('that cursor is past the end of this room — hand back a cursor this room gave you')
+    if $cursor > $self->last_id($room);
+
   my $member = $self->member($room, $session_id) or return;
   # The quiet one. Set somebody's cursor forward and they skip exactly the
   # message another agent needed them to see — no error anywhere, and the room
@@ -920,8 +940,14 @@ sub messages ($self, $room, %opt) {
   my @where = ('room_id = ?');
   my @bind  = ($room->{id});
 
+  # Strictly an integer or nothing. `3.0`, `-1` and `abc` used to fall through
+  # to "no cursor at all", which handed back the newest hundred with
+  # `missed: false` -- in a room past its cap, a silent gap of thousands with the
+  # one flag that exists to reveal it saying no. Callers are told instead.
   my $since = $opt{since};
-  if (defined $since && $since =~ /\A\d+\z/) {
+  if (defined $since && length $since) {
+    _fail("that is not a cursor: `since` is a number this room gave you, or `unread`")
+      unless $since =~ /\A\d+\z/;
     push @where, 'id > ?';
     push @bind,  $since;
   }
