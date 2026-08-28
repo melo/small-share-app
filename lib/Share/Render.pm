@@ -113,6 +113,22 @@ sub _promote_mermaid ($dom) {
 sub _safe_url ($url, $allow_data_image) {
   return 0 unless defined $url;
   $url =~ s/\A\s+//;
+
+  # Any control character at all, anywhere, and the URL is refused.
+  #
+  # Stripping only LEADING whitespace was not enough. A tab or a newline INSIDE
+  # the scheme -- `javasc<TAB>ript:` -- makes the pattern below see no scheme, so
+  # the URL was treated as relative and kept verbatim; browsers then strip those
+  # characters before resolving it and run exactly the scheme this refuses.
+  #
+  # It was not a working attack: the output only ever lands in a frame sandboxed
+  # without allow-same-origin, under a CSP whose script-src has no
+  # 'unsafe-inline', and either of those alone stops a javascript: URL. But this
+  # module is documented as a security boundary that is NOT trusted alone, and
+  # leaving it to the other two layers is precisely the state that documentation
+  # exists to prevent.
+  return 0 if $url =~ /[\x00-\x20\x7f]/;
+
   return 1 unless $url =~ m{\A([a-zA-Z][a-zA-Z0-9+.\-]*):}s;
 
   my $scheme = lc $1;

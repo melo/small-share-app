@@ -2315,4 +2315,33 @@ subtest 'searching a room is a question, and questions are counted' => sub {
   $t->app->store->sql->db->query('DELETE FROM upload_hits');
 };
 
+# ------------------------------------------------- the layers, each alone ---
+
+subtest 'a foreign Origin cannot drive the MCP server' => sub {
+  # The DNS-rebinding defence the Streamable HTTP transport requires was absent
+  # on every deployment. The mount's comment said Origin validation "belongs to
+  # the library now"; the library only validates when handed a list of origins,
+  # and it never was. The app's own check existed and was called by nothing --
+  # and would have died if it had been, because it referenced a
+  # Share::MCP->VERSIONS that does not exist.
+  #
+  # It matters most exactly where this is usually run: bound to localhost or a
+  # tailnet, where a page a developer visits could otherwise drive their tools.
+  my %hdr = ('MCP-Protocol-Version' => $PROTOCOL, 'Mcp-Method' => 'tools/list');
+  my $body = {jsonrpc => '2.0', id => 9001, method => 'tools/list',
+    params => {_meta => {$META => $PROTOCOL, $CAPS => {}, $INFO => {name => 'x', version => '1'}}}};
+
+  $t->post_ok('/mcp' => {%hdr, Origin => 'https://evil.example.com'} => json => $body)
+    ->status_is(403)->json_like('/error' => qr/Origin/);
+
+  # A browser on this instance is fine, and so is localhost.
+  $t->post_ok('/mcp' => {%hdr, Origin => $t->app->config->{base_url}} => json => $body)
+    ->status_is(200);
+  $t->post_ok('/mcp' => {%hdr, Origin => 'http://127.0.0.1:8080'} => json => $body)
+    ->status_is(200);
+
+  # And the common case: a client that is not a browser sends no Origin at all.
+  $t->post_ok('/mcp' => \%hdr => json => $body)->status_is(200);
+};
+
 done_testing;

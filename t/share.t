@@ -18,7 +18,8 @@ use Mojo::File   qw(curfile);
 use Mojo::JSON   qw(encode_json from_json to_json);
 use Mojo::URL    ();
 use Mojo::Util   qw(b64_encode encode);
-use Share::Store ();
+use Share::Render ();
+use Share::Store  ();
 use Test::Mojo   ();
 use Test::More;
 
@@ -1183,6 +1184,28 @@ subtest 'a file does not name the session that shared it' => sub {
 
   $t->delete_ok("/api/v1/files/$file->{id}" =>
       {'X-Delete-Password' => $file->{delete_password}})->status_is(200);
+};
+
+subtest 'a URL with a control character in it is not a URL' => sub {
+  # _safe_url stripped only LEADING whitespace, so a tab or newline inside the
+  # scheme made the pattern see no scheme at all: the URL was treated as
+  # relative and kept verbatim, while a browser strips those characters before
+  # resolving it and runs the scheme this is meant to refuse.
+  #
+  # Not a working attack -- the output lands in a frame sandboxed without
+  # allow-same-origin, under a CSP with no 'unsafe-inline', and either alone
+  # stops it. But Render.pm is documented as a boundary that is not trusted
+  # alone, and leaving this to the other two layers is the state that
+  # documentation exists to prevent.
+  for my $payload ("javasc\t ript:alert(1)", "java\nscript:alert(1)",
+    "  javascript:alert(1)", "JaVaScRiPt:alert(1)") {
+    my $html = Share::Render::render_markdown("[click]($payload)")->{html};
+    unlike $html, qr/javascript/i, 'refused a control character in the scheme';
+  }
+
+  # An ordinary link is untouched.
+  like Share::Render::render_markdown('[docs](https://example.com/a%20b)')->{html},
+    qr{href="https://example\.com/a%20b"}, 'and a real URL still works';
 };
 
 done_testing;

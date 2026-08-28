@@ -483,7 +483,13 @@ get '/f/<secret:id>/view' => sub ($c) {
   # 'self' matches nothing at all.
   $c->res->headers->header('Content-Security-Policy' => join '; ',
     "default-src 'none'",
-    "img-src $origin data: https:",
+    # NOT https:. Agent-written markdown could name any host, and the request
+    # fires whenever a person opens the room or the file -- a beacon reporting
+    # that it was read, when, and from which network. The frame is opaque-origin
+    # so nothing leaks with it, but the fetch itself is the signal. Anything an
+    # agent wants shown can be uploaded here and referenced from this origin,
+    # which is the rule the rooms already state about attachments.
+    "img-src $origin data:",
     "style-src $origin 'unsafe-inline'",
     "script-src $origin",
     "font-src $origin data:",
@@ -719,7 +725,13 @@ get '/c/<room:id>/transcript' => sub ($c) {
   my $origin = $c->base_url;
   $c->res->headers->header('Content-Security-Policy' => join '; ',
     "default-src 'none'",
-    "img-src $origin data: https:",
+    # NOT https:. Agent-written markdown could name any host, and the request
+    # fires whenever a person opens the room or the file -- a beacon reporting
+    # that it was read, when, and from which network. The frame is opaque-origin
+    # so nothing leaks with it, but the fetch itself is the signal. Anything an
+    # agent wants shown can be uploaded here and referenced from this origin,
+    # which is the rule the rooms already state about attachments.
+    "img-src $origin data:",
     "style-src $origin",
     "script-src $origin",
     "font-src $origin data:",
@@ -1128,7 +1140,18 @@ $api->post('/chatrooms/<room:id>/messages' => sub ($c) {
 # What used to live here — 330 lines of it — is in the library's hands. See
 # lib/Share/MCP.pm for the four tools, which is all that is genuinely ours.
 
-any '/mcp' => Share::MCP->server(app)->to_action;
+# The transport owns the protocol; the Origin check in front of it is ours,
+# because the library only enforces one when it is given a list and passing that
+# list through ->to_action is not something it offers. An `under` is the seam:
+# nothing reaches the tools until this has run.
+under '/mcp' => sub ($c) {
+  my $refused = _mcp_preflight($c) or return 1;
+  my ($status, $body) = @$refused;
+  $c->render(json => $body, status => $status);
+  return 0;
+};
+
+any '/' => Share::MCP->server(app)->to_action;
 
 # --------------------------------------------------------------- helpers -----
 
@@ -1710,6 +1733,14 @@ sub _gone ($c, $what = 'file') {
 
 # DNS-rebinding defence, as the Streamable HTTP transport requires. Clients that
 # are not browsers send no Origin at all, and those are the ones we expect.
+#
+# This sub existed and was never called by anything, while a comment over the
+# /mcp mount claimed Origin validation "belongs to the library now" -- and the
+# library only validates when it is handed a list of origins, which it never was.
+# So every Origin was accepted: a page a developer visits could drive the MCP
+# server on their own machine, which is the whole failure the spec requires this
+# to prevent. It would also have died if it had ever run, because it called a
+# Share::MCP->VERSIONS that does not exist.
 sub _mcp_preflight ($c) {
   my $origin = $c->req->headers->origin;
   if (defined $origin && length $origin) {
@@ -1718,13 +1749,8 @@ sub _mcp_preflight ($c) {
     return [403, {error => "Origin $origin is not allowed"}] unless $ok;
   }
 
-  my $version = $c->req->headers->header('MCP-Protocol-Version');
-  if (defined $version && !grep { $_ eq $version } @{Share::MCP->VERSIONS}) {
-    return [
-      400,
-      {error => "unsupported MCP-Protocol-Version: $version", supported => Share::MCP->VERSIONS}
-    ];
-  }
+  # Version negotiation is the library's, and it does it properly -- this used to
+  # duplicate it against a constant that was never defined.
 
   return undef;
 }
