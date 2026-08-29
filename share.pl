@@ -292,6 +292,11 @@ my $reap = sub {
 
   my $rooms = eval { $chat->reap };
   return app->log->error("chat reaper failed: $@") unless $rooms;
+
+  # Every pass, not once in a migration: a deletion path that forgets its
+  # mentions leaks silently, and one already did.
+  my $orphans = eval { $chat->sweep_orphan_mentions };
+  app->log->info("chat: swept $orphans orphaned mention(s)") if $orphans;
   app->log->info(sprintf 'reaped %d chat room(s), %d message(s)',
     $rooms->{rooms}, $rooms->{messages})
     if $rooms->{rooms};

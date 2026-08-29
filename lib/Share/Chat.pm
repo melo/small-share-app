@@ -915,6 +915,17 @@ sub _prune ($self, $room) {
     $room->{id}, $cap)->array->[0];
   return unless defined $cut;
 
+  # Mentions first, exactly as _purge_room does.
+  #
+  # That fix went into the other deletion path only, and this one grew the same
+  # hole: rows pointing at events that no longer exist. They are not dangerous
+  # today -- SQLite hands out max(rowid)+1, and a pruned id is always below the
+  # room's own surviving maximum -- so this is an unbounded leak of rows in a
+  # busy room rather than the silent mis-flag the other path produced. It is one
+  # schema change away from becoming that, and the deletion path that was audited
+  # last time is not the one that grew the bug.
+  $db->query('DELETE FROM chat_mentions WHERE room_id = ? AND event_id <= ?',
+    $room->{id}, $cut);
   $db->query('DELETE FROM chat_events WHERE room_id = ? AND id <= ?', $room->{id}, $cut);
   # Remembered so that a caller polling from an id that has since been dropped
   # can be told it missed something, instead of being handed a gap it has no way
@@ -1116,6 +1127,21 @@ sub sweep_idle ($self, $now = time, %opt) {
 
 # Called from the file reaper's hourly pass, once it has won the claim, so there
 # is one timer and one worker doing all of the deleting.
+# Mention rows whose event, member or room has gone.
+#
+# Migration 3 swept these once, for the databases that had already run the
+# version that leaked them. Once is not a policy: any future deletion path that
+# forgets -- and one already did -- leaks again silently. The reaper is already
+# the thing that walks the schema looking for what should not be there, so it
+# does this too, every pass, for a few pence of a query.
+sub sweep_orphan_mentions ($self) {
+  return $self->sql->db->query(
+    'DELETE FROM chat_mentions
+      WHERE room_id   NOT IN (SELECT id FROM chat_rooms)
+         OR event_id  NOT IN (SELECT id FROM chat_events)
+         OR member_id NOT IN (SELECT id FROM chat_members)')->rows;
+}
+
 sub reap ($self, $now = time) {
   my $rooms = $self->sql->db->query('SELECT * FROM chat_rooms WHERE expires_at <= ?', $now)
     ->hashes->to_array;

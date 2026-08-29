@@ -757,6 +757,71 @@ sub _tools ($server) {
     },
   );
 
+  # Three gaps a side-by-side audit of the two transports turned up. None was
+  # exploitable; each meant an MCP-only agent could not do something the REST
+  # caller next to it could -- and asymmetry between these two doors is what
+  # every serious bug in this feature has been.
+
+  _tool(
+    $server,
+    name        => 'get_room_roster',
+    description => 'Who is in a room and how they are doing: names, what each said it '
+      . 'was working on, whether it is listening right now, and how far it has read. '
+      . 'That last one is what tells you to stop waiting on a session that has not '
+      . 'looked at the room since before you asked.',
+    input_schema => {
+      type       => 'object',
+      required   => ['room'],
+      properties => {
+        room       => _str('The room URL, or its id.'),
+        session_id => _str('Yours, so the room can show you as still here.'),
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      $c->chat->touch_member($room, $args->{session_id});
+      return $tool->structured_result({
+        room   => $c->chat->room_public($room, $c->base_url, members => 1),
+        unread => $c->chat->unread_count($room, $args->{session_id}),
+      });
+    },
+  );
+
+  _tool(
+    $server,
+    name        => 'mark_chat_read',
+    description => 'Say how far you have actually PROCESSED a room, which is not the '
+      . 'same as how far you have read it. A session that dies between reading and '
+      . 'acting should come back to the work it did not finish, not to the messages it '
+      . 'merely received.',
+    input_schema => {
+      type       => 'object',
+      required   => [qw(room session_id cursor)],
+      properties => {
+        room       => _str('The room URL, or its id.'),
+        session_id => _str('The session id you joined with.'),
+        cursor     => {type => 'integer',
+          description => 'The last event you finished with. It only moves forward.'},
+        member_token => _str('The token join_chatroom returned.'),
+      },
+    },
+    code => sub ($tool, $args) {
+      my $c = _c($tool);
+      my ($room, $id) = _room($c, $args->{room});
+      return $tool->text_result(_no_room($id), 1) unless $room;
+
+      $c->chat->mark_read($room, $args->{session_id}, $args->{cursor},
+        member_token => $args->{member_token});
+      return $tool->structured_result({
+        cursor => $c->chat->read_cursor($room, $args->{session_id}) // 0,
+        unread => $c->chat->unread_count($room, $args->{session_id}),
+      });
+    },
+  );
+
   _tool(
     $server,
     name        => 'search_chat_messages',
@@ -772,6 +837,8 @@ sub _tools ($server) {
         q     => _str('The text to look for.'),
         limit => {type => 'integer', description => 'At most this many matches, up to '
             . '500. The most recent ones. Default 100.'},
+        format => _str('"full" (default) or "headers", the same as get_room_events. A '
+            . 'grep over a busy room is exactly where whole bodies hurt most.'),
       },
     },
     code => sub ($tool, $args) {
@@ -782,10 +849,24 @@ sub _tools ($server) {
       my $rows = $c->chat->messages($room, q => $args->{q}, limit => $args->{limit});
       return $tool->text_result(qq{Nothing in this room matches "$args->{q}".})
         unless @$rows;
+
+      my $mentions = $c->chat->mentions_for($room, [map { $_->{id} } @$rows]);
+      my $headers  = ($args->{format} // '') eq 'headers';
+      my @public   = map {
+        $headers
+          ? $c->chat->header_public($_, $mentions->{$_->{id}} // [])
+          : $c->chat->event_public($_, $mentions->{$_->{id}} // [], $room)
+      } @$rows;
+
       return $tool->structured_result({
-        count    => scalar @$rows,
-        query    => $args->{q},
-        messages => [map { $c->chat->event_public($_, [], $room) } @$rows],
+        count => scalar @public,
+        query => $args->{q},
+        # A grep that hands back no cursor leaves an agent with nothing to
+        # re-arm on: it has to read the room again just to find its place. The
+        # REST side has always returned one.
+        cursor   => $c->chat->cursor($room, $rows),
+        events   => \@public,
+        messages => \@public,
       });
     },
   );

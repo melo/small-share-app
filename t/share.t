@@ -964,10 +964,10 @@ subtest 'MCP: tools/list' => sub {
   my $tools = $res->{result}{tools};
   is_deeply [sort map { $_->{name} } @$tools],
     [qw(create_chatroom delete_chatroom delete_shared_file fetch_chat_event
-      get_chat_messages get_room_events get_shared_file get_upload_url
-      join_chatroom leave_chatroom list_shared_files post_chat_message
-      search_chat_messages)],
-    'four tools for handing a file over, nine for talking to other agents';
+      get_chat_messages get_room_events get_room_roster get_shared_file
+      get_upload_url join_chatroom leave_chatroom list_shared_files
+      mark_chat_read post_chat_message search_chat_messages)],
+    'four tools for handing a file over, eleven for talking to other agents';
 
   # get_chat_messages is get_room_events under the name it had before a room had
   # an event stream. One code path, registered twice, so a session holding an
@@ -1206,6 +1206,34 @@ subtest 'a URL with a control character in it is not a URL' => sub {
   # An ordinary link is untouched.
   like Share::Render::render_markdown('[docs](https://example.com/a%20b)')->{html},
     qr{href="https://example\.com/a%20b"}, 'and a real URL still works';
+};
+
+subtest 'the API document describes the API that exists' => sub {
+  # It described the pre-1.5.0 shape: Member advertised a session_id the API no
+  # longer returns, Message advertised the old three-value kind, and Messages
+  # omitted events, unread, timed_out and closed -- every field a re-arming
+  # watcher has to switch on. A client generated from it mis-read the cursor
+  # protocol in exactly the ways the cursor bugs punished.
+  my $doc = $t->get_ok('/api?openapi=1')->status_is(200)->tx->res->json;
+  my $schemas = $doc->{components}{schemas};
+
+  ok !exists $schemas->{Member}{properties}{session_id},
+    'a member is not described as carrying a session id';
+  ok exists $schemas->{Member}{properties}{$_}, "a member has $_"
+    for qw(author presence online read_cursor);
+
+  ok !exists $schemas->{Message}{properties}{session_id}, 'nor is an event';
+  ok exists $schemas->{Message}{properties}{$_}, "an event has $_"
+    for qw(author type mentions);
+  ok scalar(grep { $_ eq 'member.joined' } @{$schemas->{Message}{properties}{type}{enum}}),
+    'and the vocabulary is the one the code writes';
+
+  ok exists $schemas->{Messages}{properties}{$_}, "a read answers with $_"
+    for qw(events timed_out unread closed);
+  ok exists $schemas->{Header}, 'and headers are described at all';
+
+  ok exists $doc->{paths}{'/chatrooms/{id}/events'}, 'the events path is documented';
+  ok exists $doc->{paths}{'/chatrooms/{id}/members/{session}'}, 'and leaving';
 };
 
 done_testing;

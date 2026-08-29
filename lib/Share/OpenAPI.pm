@@ -583,42 +583,105 @@ sub document ($class, $c) {
         Member => {
           type       => 'object',
           properties => {
-            session_id => {type => 'string'},
-            name       => {type => 'string'},
-            about      => {type => ['string', 'null'],
+            # NOT session_id. It is the string that authorises a write, and
+            # publishing it let anyone who could read a room write as anybody in
+            # it. `author` is derived from a per-member random and stands for an
+            # identity without describing it.
+            author => {type => 'string',
+              description => 'A stable handle for this member within this room. Not '
+                . 'their session id, and not reversible into one.'},
+            name  => {type => 'string'},
+            about => {type => ['string', 'null'],
               description => 'What they said they are working on.'},
             kind         => {type => 'string', enum => [qw(agent human)]},
             joined_at    => {type => 'string', format => 'date-time'},
             last_seen_at => {type => 'string', format => 'date-time'},
+            presence     => {type => 'string', enum => [qw(listening idle away gone)],
+              description => 'listening = holding an open long poll right now; idle = '
+                . 'seen recently; away = not seen within the grace window; gone = left, '
+                . 'or timed out after SHARE_CHAT_PRESENCE_TIMEOUT of silence.'},
+            online      => {type => 'boolean', description => 'listening or idle.'},
+            read_cursor => {type => 'integer',
+              description => 'How far this member has read. A crude "has not read '
+                . 'anything since 7" is what tells you to stop waiting on them.'},
           },
         },
         Message => {
           type        => 'object',
-          description => 'One message. `kind` is `message` for something somebody said, '
-            . '`join` for an arrival (the body is their paragraph) and `system` for the '
-            . 'room saying something, such as a rename.',
+          description => 'One event. A room is a single sequence of them, and a message '
+            . 'is one kind: somebody arriving or leaving, a rename, a file, the room '
+            . 'expiring or being destroyed are others. `kind` is an alias of `type`, '
+            . 'kept for callers written before rooms had an event stream.',
           properties => {
-            id         => {type => 'integer', description => 'Also the cursor.'},
-            session_id => {type => 'string'},
-            name       => {type => 'string', description => 'What the author was called '
-                . 'when they wrote it.'},
-            kind       => {type => 'string', enum => [qw(message join system)]},
-            body       => {type => 'string', description => 'Markdown.'},
+            id     => {type => 'integer', description => 'Also the cursor.'},
+            author => {type => 'string',
+              description => 'A stable handle for whoever wrote it, within this room. '
+                . 'Absent for the events the room produces on its own behalf.'},
+            name => {type => 'string', description => 'What the author was called when '
+                . 'they wrote it, or `system` for an event with no member behind it.'},
+            type => {type => 'string',
+              enum => [qw(message file member.joined member.left member.renamed
+                member.presence room.renamed room.expiring room.destroyed
+                message.edited message.deleted message.pinned)]},
+            kind      => {type => 'string', description => 'The same value as `type`.'},
+            body      => {type => 'string', description => 'Markdown.'},
+            mentions  => {type => 'array', items => {type => 'string'},
+              description => 'The names this event addressed, by @name or @agents.'},
+            target_id => {type => 'integer',
+              description => 'The event this one is about, for an edit or a deletion.'},
             markup     => {type => 'string', description => 'Only with ?html=1: the '
-                . 'message rendered and sanitised, for the room page.'},
+                . 'event rendered and sanitised, for the room page.'},
             created_at => {type => 'string', format => 'date-time'},
           },
         },
-        Messages => {
-          type       => 'object',
+        Header => {
+          type        => 'object',
+          description => 'One event with everything expensive left out, from '
+            . '`format=headers`. Catching up this way costs hundreds of tokens where '
+            . 'whole bodies cost thousands; fetch the one that matters by id.',
           properties => {
-            room     => {type => 'object', properties => {id => {type => 'string'},
+            id         => {type => 'integer'},
+            type       => {type => 'string'},
+            name       => {type => 'string'},
+            created_at => {type => 'string', format => 'date-time'},
+            mentions   => {type => 'array', items => {type => 'string'}},
+            bytes      => {type => 'integer', description => 'The size of the body.'},
+            preview    => {type => 'string',
+              description => 'The first of the body, cut on a word boundary.'},
+            truncated => {type => 'boolean', description => 'True when there is more.'},
+          },
+        },
+        Messages => {
+          type        => 'object',
+          description => 'What a read answers with. `events` and `messages` are the same '
+            . 'list under both names; the second is what it was called before rooms had '
+            . 'an event stream.',
+          properties => {
+            room   => {type => 'object', properties => {id => {type => 'string'},
               topic => {type => 'string'}}},
-            count    => {type => 'integer'},
-            cursor   => {type => 'integer', description => 'Hand this back as `since`.'},
-            missed   => {type => 'boolean', description => 'The cap dropped messages this '
-                . 'caller had not read.'},
-            messages => {type => 'array', items => {'$ref' => '#/components/schemas/Message'}},
+            count  => {type => 'integer'},
+            cursor => {type => 'integer', description => 'Hand this back as `since`.'},
+            missed => {type => 'boolean',
+              description => 'The cap dropped events this caller had not read.'},
+            # Every field a re-arming watcher has to switch on, and every one of
+            # them was missing from this document.
+            timed_out => {type => 'boolean',
+              description => 'The park ended because the wait ran out, not because '
+                . 'something happened. A loop must not infer this from count.'},
+            unread => {type => 'integer',
+              description => 'How far behind the session_id given still is.'},
+            closed => {type => 'boolean',
+              description => 'The room went while this call was parked on it. The single '
+                . 'event is room.destroyed.'},
+            members => {type => 'array', items => {'$ref' => '#/components/schemas/Member'},
+              description => 'Only with ?roster=1.'},
+            events => {type => 'array',
+              items => {oneOf => [{'$ref' => '#/components/schemas/Message'},
+                {'$ref' => '#/components/schemas/Header'}]}},
+            messages => {type => 'array',
+              items => {oneOf => [{'$ref' => '#/components/schemas/Message'},
+                {'$ref' => '#/components/schemas/Header'}]},
+              description => 'The same list as `events`.'},
           },
         },
         Briefing => {

@@ -2344,4 +2344,96 @@ subtest 'a foreign Origin cannot drive the MCP server' => sub {
   $t->post_ok('/mcp' => \%hdr => json => $body)->status_is(200);
 };
 
+subtest 'pruning a room takes its mentions with it' => sub {
+  # The 1.5.1 fix went into _purge_room only, and this deletion path grew the
+  # same hole. Not dangerous today -- SQLite hands out max(rowid)+1 and a pruned
+  # id is always below the room's surviving maximum -- so it leaks rows rather
+  # than mis-flagging anybody. It is one schema change from becoming the other.
+  my $chat = $t->app->chat;
+  my $was  = $chat->max_messages;
+  $chat->max_messages(6);
+
+  my $id = _room(topic => 'pruned')->{room}{id};
+  _join($id, session_id => 'sess-a', name => 'alpha', about => 'x');
+  _join($id, session_id => 'sess-b', name => 'bravo', about => 'x');
+  _post($id, 'sess-a', 'yours @bravo, number ' . $_) for 1 .. 8;
+
+  my $room = $chat->find_room($id);
+  my $db   = $chat->sql->db;
+  my $orphans = $db->query(
+    'SELECT COUNT(*) FROM chat_mentions n WHERE n.room_id = ?
+       AND n.event_id NOT IN (SELECT id FROM chat_events)', $room->{id})->array->[0];
+  is $orphans, 0, 'nothing points at an event the cap already dropped';
+
+  # The mentions that survive still work, which is the half that matters.
+  my $me = $chat->member($room, 'sess-b');
+  ok scalar @{$chat->messages($room, mentions_me => $me->{id})} > 0,
+    'and what is left is still addressed to whoever it named';
+
+  $chat->max_messages($was);
+};
+
+subtest 'the reaper sweeps orphaned mentions every pass, not once in a migration' => sub {
+  # Migration 3 cleaned up the databases that had already leaked. Once is not a
+  # policy: a future deletion path that forgets leaks again, silently, and one
+  # already did.
+  my $id   = _room(topic => 'sweeping')->{room}{id};
+  my $chat = $t->app->chat;
+  my $room = $chat->find_room($id);
+  _join($id, session_id => 'sess-o', name => 'orphan', about => 'x');
+  my $me = $chat->member($room, 'sess-o');
+
+  # Anything earlier subtests left behind is cleared first, so the count below
+  # is about these three rows and not about the whole file's history.
+  $chat->sweep_orphan_mentions;
+
+  # Exactly the shapes a forgetful deletion leaves behind.
+  $chat->sql->db->query(
+    'INSERT INTO chat_mentions (event_id, member_id, room_id) VALUES (?,?,?)', @$_)
+    for ([999001, $me->{id}, $room->{id}],        # the event is gone
+      [999002, 999003, $room->{id}],              # so is the member
+      [999004, $me->{id}, 999005]);               # and so is the room
+
+  is $chat->sweep_orphan_mentions, 3, 'all three shapes are swept';
+  is $chat->sweep_orphan_mentions, 0, 'and a second pass finds nothing';
+};
+
+subtest 'an MCP-only agent can do what the REST caller beside it can' => sub {
+  # Three gaps a side-by-side audit of the two transports turned up. None was
+  # exploitable; each meant an agent that only speaks MCP could not do something
+  # its REST twin could. Asymmetry between these two doors is what every serious
+  # bug in this feature has been, so it is worth closing even where it is only
+  # an inconvenience.
+  my $id = _room(topic => 'parity')->{room}{id};
+  _call(join_chatroom => {room => $id, session_id => 'sess-mcp',
+    name => 'mcponly', about => 'speaks only MCP'});
+  _join($id, session_id => 'sess-rest', name => 'restone', about => 'the other one');
+  _post($id, 'sess-rest', 'the migration is green');
+  _post($id, 'sess-rest', 'and so is the deploy');
+
+  # The roster, which previously meant re-joining just to see who was there.
+  my $roster = _call(get_room_roster => {room => $id, session_id => 'sess-mcp'})
+    ->{structuredContent};
+  is scalar @{$roster->{room}{members}}, 2, 'the roster is readable without rejoining';
+  ok exists $roster->{room}{members}[0]{presence}, 'with presence on it';
+  ok exists $roster->{unread}, 'and how far behind the asker is';
+
+  # Marking read explicitly, which is not the same as having read.
+  my $events = _call(get_room_events => {room => $id, session_id => 'sess-mcp', since => 0})
+    ->{structuredContent};
+  my $first = $events->{events}[0]{id};
+  my $marked = _call(mark_chat_read =>
+    {room => $id, session_id => 'sess-mcp', cursor => $first})->{structuredContent};
+  is $marked->{cursor}, $first, 'the cursor moves where it was told';
+  ok $marked->{unread} > 0, 'and what comes after is still unread';
+
+  # And a grep that hands back something to re-arm on, and can be cheap.
+  my $found = _call(search_chat_messages =>
+    {room => $id, q => 'migration', format => 'headers'})->{structuredContent};
+  is $found->{count}, 1, 'the search finds it';
+  ok $found->{cursor}, 'and hands back a cursor to carry on from';
+  ok !exists $found->{events}[0]{body}, 'headers work here too';
+  like $found->{events}[0]{preview}, qr/migration/, 'with enough to recognise it';
+};
+
 done_testing;
