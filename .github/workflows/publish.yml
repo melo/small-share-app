@@ -139,10 +139,30 @@ jobs:
             org.opencontainers.image.title=small-share-app
             org.opencontainers.image.description=Hand a file from an agent to a human, and back
 
-      # The builder stage runs the whole suite, so this cannot publish an image whose
-      # tests do not pass — the same guarantee ci.yml gives on every push to
-      # main, enforced again here because a tag can be cut from a commit CI
-      # never saw.
+      # The gate. It used to be implicit — the `builder` stage ended with
+      # pdi-run-tests, so anything that built an image ran the suite on the way
+      # — and that made every unrelated build pay for a test run it had not
+      # asked for. The suite is now the `test` stage and nothing reaches it by
+      # accident, so a release asks for it here, by name, on both
+      # architectures, before a byte is pushed.
+      #
+      # Same guarantee as before, and the same reason for it: a tag can be cut
+      # from a commit ci.yml never saw. If this step fails, nothing below runs
+      # and no image is published.
+      #
+      # It shares every layer up to `builder` with the push below, so the cost
+      # is the test run itself, not a second build.
+      - name: Run the suite on both architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Build and push
         id: push
         uses: docker/build-push-action@v6

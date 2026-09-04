@@ -16,18 +16,19 @@ help:
 	@echo "small-share-app — targets:"
 	@sed -n 's/^## //p' $(MAKEFILE_LIST) | awk -F': ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-## test: build the image up to the test stage, running the whole suite
-# This is the same thing CI runs, and the same stage the published image is
-# built through — one definition of "does it work".
+## test: build the `test` stage, running the whole suite
+# This is the same thing CI runs and the same thing publish.yml runs before it
+# pushes — one definition of "does it work". A stage of its own, so no other
+# build pays for it: `docker build .` and `--target devel` do not run the suite.
 test:
-	docker build --target builder --progress plain -t small-share-app-test .
+	docker build --target test --progress plain -t small-share-app-test .
 
 ## coverage: run the suite under Devel::Cover and enforce the floor
 # The same command CI runs. Slower than `make test` — Devel::Cover roughly
-# triples the run — which is why it is a separate target.
+# triples the run — which is why it is a stage, and a target, of its own.
 coverage:
-	docker build --target builder --progress plain \
-	  --build-arg COVERAGE=1 --build-arg COVERAGE_MIN=$(COVERAGE_MIN) \
+	docker build --target coverage --progress plain \
+	  --build-arg COVERAGE_MIN=$(COVERAGE_MIN) \
 	  -t small-share-app-coverage .
 
 ## e2e: the browser suite, against a throwaway instance (never production)

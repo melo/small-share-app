@@ -8,11 +8,15 @@ Issues and pull requests are welcome.
 make test
 ```
 
-That builds the image up to its `builder` stage, which ends with
-`pdi-run-tests`: every script in `bin/` is syntax-checked and everything under
-`t/` runs in full, against the exact dependency set the runtime image ships. It is the
-same thing CI runs and the same stage published images are built through, so if
-it passes locally it passes in CI.
+That builds the Dockerfile's `test` stage, which ends with `pdi-run-tests`:
+every script in `bin/` is syntax-checked and everything under `t/` runs in full,
+against the exact dependency set the runtime image ships. It is the same stage
+CI builds and the same stage a release builds before it pushes, so if it passes
+locally it passes in CI.
+
+Asking is the whole interface: no other build runs the suite. `docker build .`,
+`--target devel` and a development container rebuild all stop at `builder`, so
+they cost what they cost and nothing more.
 
 You need Docker and nothing else — no local Perl, no CPAN.
 

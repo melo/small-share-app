@@ -1,8 +1,9 @@
 # share — image build.
 #
-# Three stages: fetch the two vendored browser assets, build and test the app,
+# Fetch the two vendored browser assets, build the app against its dependencies,
 # then assemble a runtime image that carries neither a compiler nor a network
-# fetch.
+# fetch. Running the suite and measuring coverage are targets of their own,
+# `test` and `coverage`, asked for by name — see the note above each.
 #
 # Base is melopt/perl-alt (https://github.com/melo/docker-perl-alt): /app for the
 # code, /deps for its CPAN dependencies, and pdi-entrypoint to put both on
@@ -82,26 +83,42 @@ RUN pdi-build-deps
 
 COPY . /app/
 
+# -------------------------------------------------------------------- test ---
 # The suite in t/ exercises the sanitiser, every upload path, the viewer and the
-# whole MCP handshake. Running it here means a broken build never ships.
-# pdi-run-tests also syntax-checks everything in /app/bin.
+# whole MCP handshake; pdi-run-tests also syntax-checks everything in /app/bin.
+#
+#     docker build --target test .          # or: make test
+#
+# ASKED FOR BY NAME, never on the way to anything else. It used to be the last
+# RUN of `builder`, which meant every build of the runtime image, every
+# `--target devel`, and every rebuild of a development container ran the whole
+# suite first — minutes on a native machine and, under QEMU on the arm64 leg of
+# a release, the better part of half an hour. A test run is a question you ask,
+# not a toll you pay to get an image.
+#
+# It is a leaf: nothing FROMs this stage, so `docker build .` never builds it.
+# What still holds the line is CI — ci.yml builds this target on every push and
+# publish.yml builds it, on both architectures, before it pushes anything.
+
+FROM builder AS test
+
 RUN /usr/bin/pdi-entrypoint pdi-run-tests
 
-# Coverage, with a floor. Off by default because Devel::Cover roughly triples
-# the run time and every `docker build` would pay it; CI turns it on:
+# ---------------------------------------------------------------- coverage ---
+# The same suite instrumented, with a floor:
 #
-#     docker build --build-arg COVERAGE=1 --target builder .
+#     docker build --target coverage .      # or: make coverage
 #
-# The threshold is enforced by bin/coverage itself, so the build fails on a drop
-# rather than printing a number nobody reads.
-ARG COVERAGE=0
+# Separate from `test` rather than a flag on it, because Devel::Cover roughly
+# triples the run and there is no reason to pay that to answer "do the tests
+# pass". The threshold is enforced by bin/coverage itself, so the build fails on
+# a drop rather than printing a number nobody reads.
+
+FROM builder AS coverage
+
 ARG COVERAGE_MIN=90
-RUN if [ "$COVERAGE" = "1" ]; then \
-      cpm install -g --show-build-log-on-failure Devel::Cover \
-      && /usr/bin/pdi-entrypoint /app/bin/coverage "$COVERAGE_MIN"; \
-    else \
-      echo "coverage: skipped (build with --build-arg COVERAGE=1)"; \
-    fi
+RUN cpm install -g --show-build-log-on-failure Devel::Cover \
+    && /usr/bin/pdi-entrypoint /app/bin/coverage "$COVERAGE_MIN"
 
 # ------------------------------------------------------------------- devel ---
 # The stage a development container is built from — `ccc` targets this one, and
@@ -111,6 +128,10 @@ RUN if [ "$COVERAGE" = "1" ]; then \
 # from `builder`, never from here, and no stage depends on this one, so a plain
 # `docker build .` never builds it and the published image cannot grow by a byte
 # because of anything below.
+#
+# It comes off `builder` and not off `test`, so building a development container
+# does not run the suite. Run it when you want it: `make test`, or
+# `docker build --target test .`.
 #
 # The dependencies go into /deps/local alongside the app's own, which is the
 # only place pdi-entrypoint puts on PERL5LIB — a layer under /deps/layers would

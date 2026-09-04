@@ -129,13 +129,17 @@ this on, and only a tag pays it.
 
 **A tag is the only thing that publishes anything.** A push to the forge runs
 nothing at all. A push of `main` to `github` runs `ci.yml` and stops there: it
-builds the image through the `builder` stage, linux/amd64 only, runs the suite
-and the coverage floor, and pushes the result nowhere. There is no `:main` and
-no `:edge` any more. If you want an unreleased build, `docker build .` gives
-you the same thing CI just made.
+builds the `test` stage and the `coverage` stage, linux/amd64 only, and pushes
+the result nowhere. There is no `:main` and no `:edge` any more. If you want an
+unreleased build, `docker build .` gives you the same thing CI just made —
+faster, in fact, because it stops at `builder` and does not run the suite.
 
-The image is built through the `builder` stage, which runs the test suite, so a
-release whose tests fail cannot be published.
+`publish.yml` builds the `test` stage on **both** architectures before it pushes
+anything, so a release whose tests fail cannot be published. That used to happen
+implicitly, because the suite was the last step of `builder` and every build ran
+it; it is now a step of its own, named in the workflow. If you are reading this
+because a release stopped at that step: the suite failed on one of the two
+architectures, and the log says which.
 
 `workflow_dispatch` on `publish.yml` is the handle for re-running a release
 whose publish failed. **Run it from the tag** — it refuses any other ref, so a
@@ -309,13 +313,13 @@ lib/Share/Render.pm   markdown → HTML that is safe to show a human
 lib/Share/MCP.pm      ten tools on top of the CPAN MCP distribution
 lib/Share/OpenAPI.pm  the API description, built from the running config
 public/assets/        CSS, the uploader, the room, the mermaid bootstrap, the favicon
-t/share.t             files, pages and MCP — the suite the image build runs
+t/share.t             files, pages and MCP — the suite `make test` runs
 t/chat.t              chat rooms, in a process of their own
 e2e/                  the browser suite
 bin/health-check      core-Perl HTTP probe for HEALTHCHECK
 bin/reap              the manual handle behind `make reap`
 bin/coverage          the suite under Devel::Cover, with a floor
-Dockerfile            assets → build+test → runtime
+Dockerfile            assets → builder → runtime; test/coverage/devel off builder
 ```
 
 The base image is [melo/docker-perl-alt](https://github.com/melo/docker-perl-alt):

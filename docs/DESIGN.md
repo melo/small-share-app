@@ -427,18 +427,29 @@ For the record: mermaid 11 does **not** need `'unsafe-eval'`. The bundle is a
 self-contained esbuild UMD with no `new Function(`, no bare `eval(` and no
 dynamic import. Worth re-checking on a version bump; the CSP is tighter for it.
 
-## The image build runs the tests
+## The tests are a stage you ask for
 
-The `builder` stage ends with `pdi-run-tests`, which syntax-checks everything in
-`bin/` and runs everything under `t/` against the exact dependency set the runtime image
-ships. An image whose tests fail cannot be produced, let alone published.
+The `test` stage ends with `pdi-run-tests`, which syntax-checks everything in
+`bin/` and runs everything under `t/` against the exact dependency set the
+runtime image ships. `make test`, CI and the release workflow all build that one
+stage. There is one definition of "does it work".
 
-`make test`, CI and the release workflow all go through that one stage. There is
-one definition of "does it work".
+It is a **leaf**: nothing is built `FROM` it, so a plain `docker build .`, a
+`--target devel`, and a development container rebuild do not run the suite.
+
+It used to be the last `RUN` of `builder`, which put the suite on the path of
+every build that wanted an image at all. The guarantee that bought — "an image
+whose tests fail cannot be produced" — was real, but the price was paid by
+everyone who was not asking the question: a `--target devel` rebuild, and, on
+the arm64 leg of a release under QEMU, the better part of half an hour. The
+guarantee that mattered was never about `docker build` on someone's laptop; it
+was about what gets published. So publish.yml now builds `test` explicitly, on
+both architectures, before it pushes anything, and nothing is published whose
+tests do not pass. The toll is gone and the gate is still there.
 
 Coverage has a floor rather than a badge: `bin/coverage` runs the suite under
 Devel::Cover and *fails* below 90% statement coverage on `share.pl` and `lib/`.
-It is 94.9% today.
+It is 94.9% today. It is the `coverage` stage, and a leaf for the same reason.
 
 Two things in there were learned the hard way and are commented in the script,
 because both fail silently — green tests, no number:

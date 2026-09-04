@@ -6,10 +6,14 @@
 # has to be both quick and worth having.
 #
 # There is no separate "install Perl, install deps, run prove" job, and that is
-# deliberate. The Dockerfile's builder stage already runs the suite against the
-# exact dependency set the runtime image ships, so building that stage IS the
-# test run. One definition of "does it work", used by CI, by a contributor's
-# `make test`, and by anyone deploying.
+# deliberate. The Dockerfile's `test` stage runs the suite against the exact
+# dependency set the runtime image ships, so building that stage IS the test
+# run. One definition of "does it work", used by CI, by a contributor's
+# `make test`, and by publish.yml before it pushes anything.
+#
+# It is asked for by name. Nothing else builds it — not the runtime image, not
+# `--target devel` — so a build that only wants an image does not run the suite,
+# and a job that wants the suite says so. That is what these two steps are.
 #
 # linux/amd64 only, and nothing here is pushed anywhere. arm64 is emulated
 # through QEMU and compiles DBD::SQLite and CryptX from source, which costs
@@ -38,14 +42,14 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Stops at the builder stage, which ends with pdi-run-tests: every script
-      # in bin/ is syntax-checked and everything under t/ runs in full. A failure here is
-      # a failing test, printed in the log by prove.
+      # The `test` stage ends with pdi-run-tests: every script in bin/ is
+      # syntax-checked and everything under t/ runs in full. A failure here is a
+      # failing test, printed in the log by prove.
       - name: Build and run the suite
         uses: docker/build-push-action@v6
         with:
           context: .
-          target: builder
+          target: test
           platforms: linux/amd64
           push: false
           load: false
@@ -54,18 +58,19 @@ jobs:
 
       # The same suite again, this time instrumented, with the floor enforced by
       # bin/coverage so a drop fails the build instead of printing a number
-      # nobody reads. Separate step because Devel::Cover roughly triples the run
-      # and there is no reason to pay that on every local build.
+      # nobody reads. Its own stage because Devel::Cover roughly triples the run
+      # and there is no reason to pay that on every local build. It shares every
+      # layer up to `builder` with the step above, so it costs the instrumented
+      # run and nothing else.
       - name: Coverage
         uses: docker/build-push-action@v6
         with:
           context: .
-          target: builder
+          target: coverage
           platforms: linux/amd64
           push: false
           load: false
           build-args: |
-            COVERAGE=1
             COVERAGE_MIN=90
           cache-from: type=gha
           cache-to: type=gha,mode=max

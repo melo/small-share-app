@@ -6,10 +6,10 @@
 # only thing anybody watched was whether main was green, and main was amd64.
 #
 # So arm64 gets a place to be broken in the open. Push a branch, and both
-# architectures build here, through the full image — not just the `builder`
-# target — so the runtime stage is exercised too. Nothing is pushed to any
-# registry and nothing is tagged: this is a question ("does it build?"), not a
-# release.
+# architectures run the suite here and then build through the full image — not
+# just the stage the tests run in — so the runtime stage is exercised too.
+# Nothing is pushed to any registry and nothing is tagged: this is a question
+# ("does it build?"), not a release.
 #
 # WHY NOT ON MAIN: it takes roughly ten times what the amd64 build does,
 # because QEMU emulates every instruction of a from-source CPAN install. Paying
@@ -52,10 +52,23 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
-      # The whole image, both platforms, pushed nowhere. The builder stage runs
-      # the suite on each architecture in turn, so this answers "do the
-      # dependencies build and do the tests pass on arm64", which is the actual
-      # question.
+      # Two questions, in the order they fail in: do the dependencies build on
+      # arm64, and does the suite pass there. The suite is the `test` stage and
+      # has to be asked for by name — building the image alone no longer runs
+      # it, which is the point of it being a stage of its own.
+      - name: Run the suite on both architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The whole image, both platforms, pushed nowhere — so the runtime stage
+      # is exercised too, not just the stage the tests run in.
       - name: Build both architectures
         uses: docker/build-push-action@v6
         with:
