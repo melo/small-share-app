@@ -1886,7 +1886,24 @@ subtest 'a member who stops saying anything is eventually declared gone' => sub 
   my $chat = $t->app->chat;
   my $room = $chat->find_room($id);
 
+  # sweep_idle is instance-wide on purpose -- one worker sweeps every room --
+  # so its return value counts members this subtest never made. That is fine on
+  # a machine where the whole file runs inside presence_timeout, and it is not
+  # fine on one where it does not: the arm64 leg of the v1.6.0 publish emulates
+  # every instruction, took eleven minutes over t/chat.t alone, and members
+  # joined in the first few subtests aged past the five-minute timeout while
+  # this one was running. The sweep counted them, `only the silent one is
+  # swept' got 2 where it wanted 1, and no image was published.
+  #
+  # The subject here is this room, so everybody outside it is kept fresh and
+  # the number below is about the two members above and nothing else.
+  my $only_this_room = sub {
+    $chat->sql->db->query('UPDATE chat_members SET last_seen_at = ? WHERE room_id != ?',
+      time, $room->{id});
+  };
+
   # Both are present now, and a sweep concludes nothing.
+  $only_this_room->();
   is $chat->sweep_idle(time, force => 1), 0, 'nobody is stale yet';
 
   # The keep-alive is the cheapest thing in the API, and it is what a page with
@@ -1903,6 +1920,7 @@ subtest 'a member who stops saying anything is eventually declared gone' => sub 
   _alive($id, 'stayer');
   $t->status_is(200);
 
+  $only_this_room->();
   is $chat->sweep_idle(time, force => 1), 1, 'only the silent one is swept';
 
   my $members = $t->get_ok("/api/v1/chatrooms/$id")->tx->res->json->{room}{members};
@@ -1917,6 +1935,7 @@ subtest 'a member who stops saying anything is eventually declared gone' => sub 
     'and the room was told';
 
   # Idempotent: a second sweep has nothing left to conclude.
+  $only_this_room->();
   is $chat->sweep_idle(time, force => 1), 0, 'and it does not keep announcing it';
 
   # A member holding a long poll is present by definition, however quiet.
@@ -1924,6 +1943,7 @@ subtest 'a member who stops saying anything is eventually declared gone' => sub 
   $chat->sql->db->query(
     'UPDATE chat_members SET last_seen_at = ?, waiting_until = ? WHERE session_id = ?',
     $long_ago, time + 300, 'parked');
+  $only_this_room->();
   is $chat->sweep_idle(time, force => 1), 0, 'a parked listener is never swept';
 };
 
