@@ -26,9 +26,12 @@ naming the wrong commit:
    about to be tagged. It is what `/api/v1/health`, the MCP server and the
    OpenAPI document report, and a bump that ships without a matching tag is the
    failure `v1.2.3` records below.
-4. **Pushed.** `git push origin main` and `git push github main`. The laptop can
-   only tag a commit it can fetch, so an unpushed `main` is not a prepared
-   release however finished the code is.
+4. **Pushed to the forge.** `git push origin main`, and nothing else. The laptop
+   can only tag a commit it can fetch, so an unpushed `main` is not a prepared
+   release however finished the code is — but `github` is not the box's to push
+   to. It is step 6, it goes with the tag, and it is what publishes. This line
+   used to say "and `git push github main`", which contradicted step 3 two
+   screens below and got followed instead of it.
 
 The release message in `v<version>.msg` is what both the commit and the tag are
 made from, so it has to describe **what is actually in the commits being
@@ -76,6 +79,18 @@ git push origin main
 Nothing is tagged yet, so nothing publishes. This push exists so that the
 laptop has the commit to tag: a tag can only name a commit the machine making
 it already has.
+
+`github` is deliberately not pushed from here. The credential in the container
+cannot update `.github/workflows/` anyway, but that is not the reason — the
+reason is that the push to `github` is the release, it goes with the tag, and
+the tag is made on the laptop.
+
+**Then hand over the "On the laptop" block below as it is written**, with the
+version substituted and nothing else changed. Not a summary of it, not a
+reordering, not "the gist plus a note" — the same four code blocks in the same
+order, `j small-share-app` included. Whoever is reading it has done this a
+dozen times and is going to paste it; a release ritual that arrives worded
+differently every time is one that gets read every time instead of run.
 
 ### On the laptop
 

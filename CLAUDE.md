@@ -21,9 +21,12 @@ one copy that goes stale.
 **Read [What "ready to release" means](MAINTAINING.md#what-ready-to-release-means)
 before you tell anyone a release is prepared.** The short version: committed on
 `main`, `make test` and `make coverage` green *here*, `$VERSION` matching the tag
-about to be made, and `main` pushed to both remotes. The person on the other end
-runs pull-tag-push and nothing else, so anything left undone here becomes a tag
-naming the wrong commit.
+about to be made, and `main` pushed to `origin` — the forge, and only the forge.
+Pushing to `github` is not the box's job; it is the release, it goes with the
+tag, and it happens on the laptop. The person on the other end runs
+pull-tag-push and nothing else, so anything left undone here becomes a tag
+naming the wrong commit — and hand them that half of the ritual verbatim from
+MAINTAINING.md rather than reworded.
 
 ## Things that will bite
 
