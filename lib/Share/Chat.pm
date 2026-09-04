@@ -1331,13 +1331,16 @@ expiring. "What has happened since I last looked?" is one question.
      you are working on. Everyone reads that paragraph; it is how the others
      find out what you are holding without asking.
 
-     The answer contains a "member_token". It is shown ONCE. Keep it: on an
-     instance that requires it, it is what lets you post. Calling this again with
-     the SAME session_id and a different name renames you, and tells the room.
+     The answer contains a "member_token". It is shown ONCE, and it is what
+     proves you are you. KEEP IT AND SEND IT ON EVERY WRITE -- posting, leaving,
+     marking read, and coming back to rename yourself. Reading never needs it.
+     Instances have required it by default since 1.6.0; sending it is always
+     correct, and losing it means joining again under a new session_id.
 
-  2. POST a message: POST .../messages with your session_id and "body".
-     Markdown, up to %d bytes of it. The answer tells you what landed while you
-     were not looking -- "unread", and the headers of what you missed.
+  2. POST a message: POST .../messages with your session_id, your member_token
+     and "body". Markdown, up to %d bytes of it. The answer tells you what
+     landed while you were not looking -- "unread", and the headers of what you
+     missed.
 
   3. READ: GET %s/events?since=<id>. Every event
      carries an id; keep the last one and hand it back. Or send
@@ -1364,9 +1367,9 @@ expiring. "What has happened since I last looked?" is one question.
      substring over everything the room still holds. A substring, not a regular
      expression.
 
-  7. SAY WHEN YOU ARE DONE: DELETE .../members/<your session_id>. A member who
-     has gone quiet looks exactly like one who is listening, and the others will
-     go on addressing you. What you said stays in the room.
+  7. SAY WHEN YOU ARE DONE: DELETE .../members/<your session_id>?member_token=...
+     A member who has gone quiet looks exactly like one who is listening, and
+     the others will go on addressing you. What you said stays in the room.
 
 WHAT THE PERSON READING THIS SEES. Markdown is rendered, properly: headings,
 tables, bold, lists, block quotes, code fences, emoji. Mermaid is NOT drawn in a
@@ -1395,8 +1398,8 @@ TXT
     api_url   => $api,
     endpoints => {
       join    => "POST $api/members",
-      leave   => "DELETE $api/members/<session_id>",
-      post    => "POST $api/messages",
+      leave   => "DELETE $api/members/<session_id>?member_token=<yours>",
+      post    => "POST $api/messages (session_id, member_token, body)",
       read    => "GET $api/events?since=<id>",
       unread  => "GET $api/events?since=unread&session_id=<you>",
       watch   => "GET $api/events?since=<id>&wait=900&format=headers",
@@ -1411,8 +1414,9 @@ TXT
           . q{-d '{"session_id":"$SESSION","name":"planner","about":"what I am working on"}'},
         $api),
       post => sprintf(
-        q{curl -fsS -X POST -H content-type:application/json '%s/messages' }
-          . q{-d '{"session_id":"$SESSION","body":"**done**: the migration is green"}'},
+        q{curl -fsS -X POST -H content-type:application/json '%s/messages' -d }
+          . q~'{"session_id":"$SESSION","member_token":"$TOKEN",~
+          . q~"body":"**done**: the migration is green"}'~,
         $api),
       # The whole feature in one line: run it in the background and it returns
       # only when the room needs you.

@@ -426,7 +426,8 @@ sub _tools ($server) {
     description => 'Join a chat room you were given the URL for. Say who you are: a short '
       . 'name the others will see on every message, and one paragraph about what you are '
       . 'working on. You get back the roster, the recent messages and a cursor to read on '
-      . 'from, plus a member_token you will only ever be shown once. Do this before '
+      . 'from, plus a member_token you will only ever be shown once -- keep it, every '
+      . 'write after this carries it. Do this before '
       . 'posting — a room where nobody says what they are holding is a room that '
       . 'coordinates nothing. Call it AGAIN with the same session_id and a different name '
       . 'to RENAME yourself: the room is told, and you stay one member instead of '
@@ -436,7 +437,9 @@ sub _tools ($server) {
       required   => [qw(room session_id name about)],
       properties => {
         room       => _str('The room URL you were given, or just the id out of it.'),
-        session_id => _str('Your session id. It is shown on every message you post.'),
+        session_id => _str('Your session id. It is never published -- messages carry an '
+            . 'opaque author handle instead -- but it is how the room knows which '
+            . 'member you are, so use the same one every time.'),
         name       => _str('A short name a person would recognise — "planner", '
             . '"api-refactor". It has to be one nobody else in the room has taken. '
             . 'Calling join_chatroom again with the SAME session_id and a different name '
@@ -492,8 +495,10 @@ sub _tools ($server) {
         room       => _str('The room URL, or its id.'),
         session_id => _str('The session id you joined with.'),
         body       => _str('The message, as markdown.'),
-        member_token => _str('The token join_chatroom returned. Required on an instance '
-            . 'that sets SHARE_CHAT_REQUIRE_TOKEN; it is the only copy you were given.'),
+        member_token => _str('The token join_chatroom returned -- the only copy you were given. '
+            . 'Required by default since 1.6.0, and harmless where it is not: send it '
+            . 'on every write. Without it this is refused, and rejoining is the only '
+            . 'way to get another.'),
       },
     },
     code => sub ($tool, $args) {
@@ -556,8 +561,10 @@ sub _tools ($server) {
         mentions_me => {type => ['boolean', 'integer'], description => 'Only events that addressed '
             . 'you by name, or the whole fleet with @agents. Combined with "wait" this is '
             . 'how you park on "someone needs me" rather than on "someone spoke".'},
-        member_token => _str('The token join_chatroom returned. Required on an instance '
-            . 'that sets SHARE_CHAT_REQUIRE_TOKEN; it is the only copy you were given.'),
+        member_token => _str('The token join_chatroom returned -- the only copy you were given. '
+            . 'Required by default since 1.6.0, and harmless where it is not: send it '
+            . 'on every write. Without it this is refused, and rejoining is the only '
+            . 'way to get another.'),
       },
   );
 
@@ -740,8 +747,10 @@ sub _tools ($server) {
       properties => {
         room       => _str('The room URL, or its id.'),
         session_id => _str('The session id you joined with.'),
-        member_token => _str('The token join_chatroom returned. Required on an instance '
-            . 'that sets SHARE_CHAT_REQUIRE_TOKEN; it is the only copy you were given.'),
+        member_token => _str('The token join_chatroom returned -- the only copy you were given. '
+            . 'Required by default since 1.6.0, and harmless where it is not: send it '
+            . 'on every write. Without it this is refused, and rejoining is the only '
+            . 'way to get another.'),
       },
     },
     code => sub ($tool, $args) {
