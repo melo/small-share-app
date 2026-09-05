@@ -229,6 +229,31 @@ limiter would cause. Posting is where the writes are, and that is where the
 bucket is — a separate one from uploads, so a busy room never stops anybody
 sharing a file.
 
+What that bucket is *keyed on* is a decision of its own, and it was got wrong
+twice before it was got right. It has to be the caller's address, and behind a
+proxy the socket peer is the proxy — key on that and every caller shares one
+bucket, so the first busy agent locks out the rest. Reading the address out of a
+forwarded header is what avoids that, and it is also the way the limiter is
+defeated: a header anybody may write is a bucket anybody may choose. Believing
+`CF-Connecting-IP` from all comers meant rotating it turned the limit off, and
+writing a *victim's* address into it filled theirs instead — throttling a chosen
+agent out of a room from outside it.
+
+So a forwarded address is counted only when every hop that added one is a hop
+this deployment vouches for. That is `MOJO_TRUSTED_PROXIES`, and the walk is
+Mojolicious': `X-Forwarded-For` from the right with the socket peer appended,
+trusted hops dropped, stopping at the first address nobody here vouched for.
+Hand-rolling that walk is the second thing this got wrong, and it is why the
+allow-list is not ours any more. It compared the list against `remote_address`,
+which under `MOJO_REVERSE_PROXY` is already a forwarded address and not the
+peer, so it either never fired or fired for a client and handed that client the
+header. And it matched CIDR entries by stripping the `/NN` rather than
+interpreting it, so `172.64.0.0/13` matched one address and the Cloudflare
+ranges the whole mechanism existed for could not be written down at all.
+Delegating is not thrift about a dependency — `Mojo::Util::network_contains`
+was already installed, and the argument that avoiding it justified matching
+prefixes by hand was wrong the day it was written.
+
 The ceiling went from sixty seconds to fifteen minutes, and that is the whole
 feature: a backgrounded `curl --max-time 960` exits when the room needs you,
 which makes it a wake-up rather than a poll. The old sixty was justified by a

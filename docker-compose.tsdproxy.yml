@@ -78,12 +78,32 @@ services:
       # whose agents cannot be restarted yet.
       SHARE_CHAT_REQUIRE_TOKEN: ${SHARE_CHAT_REQUIRE_TOKEN:-1}
 
-      # Peers allowed to tell this instance who the real client is, as a
-      # comma-separated list of addresses or CIDR prefixes. Empty means trust
-      # nobody and count the peer itself -- which is right unless something in
-      # front sets CF-Connecting-IP or X-Forwarded-For. Believing that header
-      # from anyone lets a caller rotate it to escape the rate limit, or put
-      # somebody else's address in it to throttle them out of a room.
+      # Addresses and CIDR networks whose X-Forwarded-For this believes, as a
+      # comma-separated list -- bare addresses or real networks, v4 and v6
+      # alike (172.18.0.1, 10.0.0.0/8, 2400:cb00::/32). Mojolicious walks the
+      # header from the right with the socket peer appended, drops every hop
+      # that falls inside one of these, and counts the first that does not: the
+      # nearest hop nobody here vouched for, and so the one address a caller
+      # cannot choose for itself.
+      #
+      # Empty is right for this stack: the app is published on 127.0.0.1 where
+      # only tsdproxy reaches it, so the right-most entry -- the one
+      # MOJO_REVERSE_PROXY alone takes -- was written by tsdproxy. Fill it in
+      # when something further out is the real edge, Cloudflare's published
+      # ranges being the usual case.
+      #
+      # Erring generous is what this guards against: believing a forwarded
+      # address from anyone lets a caller rotate it to escape the rate limit,
+      # or put somebody else's address in it to throttle them out of a room.
+      MOJO_TRUSTED_PROXIES: ${MOJO_TRUSTED_PROXIES:-}
+
+      # Retired, and forwarded anyway on purpose: the app refuses to start when
+      # this arrives with a value, and names MOJO_TRUSTED_PROXIES instead. An
+      # .env still carrying the old spelling stops the stack rather than
+      # quietly counting the wrong thing -- which is what the old setting did on any
+      # stack with MOJO_REVERSE_PROXY on, where it was matched against a
+      # forwarded address and so could never match the proxy at all. Expected to
+      # go in a later release.
       SHARE_TRUSTED_PROXIES: ${SHARE_TRUSTED_PROXIES:-}
 
       # How long a member may say nothing at all before the room concludes they
@@ -99,7 +119,12 @@ services:
       SHARE_CHAT_MAX_WAITERS: ${SHARE_CHAT_MAX_WAITERS:-32}
 
       MOJO_MODE: production
-      # tsdproxy terminates TLS and forwards X-Forwarded-*.
+      # tsdproxy terminates TLS and forwards X-Forwarded-*. It also decides who
+      # the rate limiter counts: with MOJO_TRUSTED_PROXIES empty the right-most
+      # X-Forwarded-For entry is believed, which is safe here only because
+      # tsdproxy wrote it and the app is published where only tsdproxy reaches
+      # it. Front tsdproxy with anything further out and MOJO_TRUSTED_PROXIES
+      # has to be filled in.
       MOJO_REVERSE_PROXY: "1"
 
     volumes:

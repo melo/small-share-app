@@ -369,11 +369,11 @@ other files did nothing, and nothing said so.
 | `SHARE_CHAT_REQUIRE_TOKEN` | **on** | require the `member_token` join hands back in order to write. See below |
 | `SHARE_CHAT_PRESENCE_TIMEOUT` | `300` | how long a member may say nothing before the room marks them gone. A member holding a long poll is never swept |
 | `SHARE_CHAT_MAX_WAITERS` | `32` | callers who may be parked on one room at once, per worker. Asking is free; only holding a connection counts |
-| `SHARE_TRUSTED_PROXIES` | empty | peers whose `CF-Connecting-IP`/`X-Forwarded-For` are believed. Empty means the socket's address is the client |
 | `SHARE_SECRET_KEY` | generated into the workspace | HMAC key for signed upload URLs |
 | `SHARE_REQUIRE_SIGNED_UPLOADS` | off | reject any upload without a signed ticket from `get_upload_url` |
 | `SHARE_PORT` | `8080` | the port `bin/health-check` probes inside the container |
-| `MOJO_REVERSE_PROXY` | `0` | set to `1` behind a proxy that sets `X-Forwarded-*` |
+| `MOJO_TRUSTED_PROXIES` | empty | addresses and CIDR networks, v4 or v6, whose `X-Forwarded-For` is believed. Empty means the right-most forwarded entry, or the socket address when not behind a proxy |
+| `MOJO_REVERSE_PROXY` | `0` | set to `1` behind a proxy that sets `X-Forwarded-*`; the client is then the first `X-Forwarded-For` hop from the right that `MOJO_TRUSTED_PROXIES` does not vouch for |
 | `MOJO_MODE` | `production` | Mojolicious run mode; the compose files all set it |
 
 **Read by the compose files only.** The app never sees these — they decide what

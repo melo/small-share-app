@@ -45,6 +45,26 @@ $ENV{SHARE_RATE_PER_SECOND} = 1000;
 $ENV{SHARE_RATE_PER_MINUTE} = 1000;
 delete $ENV{SHARE_TTL_DAYS};
 
+# Reverse-proxy mode, and this process playing the part of the proxy.
+#
+# Up here, above Test::Mojo->new, or nowhere: both are lazy attributes on
+# Mojo::Server (reverse_proxy and trusted_proxies, Mojo/Server.pm), read out of
+# %ENV once and cached on the daemon the first time it builds a transaction. Set
+# either of them inside a subtest and it silently does nothing at all, which
+# reads exactly like the app ignoring the header.
+#
+# Test::Mojo's embedded daemon means the socket peer is 127.0.0.1 for every
+# request in this file, so declaring 127.0.0.1 trusted is what lets a test send
+# an X-Forwarded-For and have it believed — it is standing where Traefik stands.
+#
+# It costs the rest of the suite nothing. With no X-Forwarded-For at all Mojo
+# walks the list (127.0.0.1) — an empty header with the peer appended — finds
+# every hop trusted, and falls through to returning the first one. Identity is
+# 127.0.0.1 for every other subtest here, exactly as it was before these two
+# lines existed.
+$ENV{MOJO_REVERSE_PROXY}   = 1;
+$ENV{MOJO_TRUSTED_PROXIES} = '127.0.0.1';
+
 # Set, and empty. This is what a .env line with nothing after the `=` produces,
 # and what a compose file forwarding ${SHARE_MAX_TOTAL_BYTES:-} puts in the
 # environment when nobody set it — and it used to read as 0, which for this
@@ -715,6 +735,154 @@ subtest 'a hammering client is refused, in both dialects' => sub {
   $s->rate_per_minute(0);
   $s->sql->db->query('DELETE FROM upload_hits');
   _delete($made->{id}, $made->{delete_password})->code == 200 or die 'cleanup failed';
+};
+
+subtest 'which address a request is counted against' => sub {
+  # The derivation has never had a test. The two subtests above prove the bucket
+  # works — they hand rate_check literal strings — and say nothing whatever
+  # about who ends up in it, which is the half an attacker gets to choose.
+  #
+  # The limiter is the lever, because it is the only place the identity is
+  # visible from outside the process: with an allowance of one, a request that
+  # comes back 429 is a request whose bucket already had a hit in it, and a 201
+  # is a bucket that was empty. Plant a hit against a chosen address, send a
+  # request, read the status — that is the whole instrument.
+  my $s = $t->app->store;
+  $s->rate_per_second(1);
+  $s->rate_per_minute(1);
+
+  # Planted rather than earned, and it is the per-MINUTE allowance doing the
+  # work, for the reason the disk-ceiling subtest gives: two live requests can
+  # land either side of a second boundary, and then the per-second rule
+  # legitimately does not fire. A minute-wide window with a planted hit in it
+  # has no argument with the clock. Clearing first means each step below asserts
+  # against exactly one full bucket and no leftovers.
+  my $plant = sub ($client) {
+    $s->sql->db->query('DELETE FROM upload_hits');
+    # The bucket named rather than defaulted: uploads and chat posts are counted
+    # separately, and a plant that landed in the wrong one would make every
+    # assertion below a statement about an empty table.
+    $s->sql->db->insert('upload_hits', {bucket => 'upload', client => $client, at => time});
+  };
+
+  # Kept and deleted at the end, once the limits are off again — a cleanup that
+  # runs while the allowance is 1 would itself be refused.
+  my @made;
+  my $upload = sub ($name, @headers) {
+    $t->post_ok("/api/v1/files?filename=$name" => @headers => "# $name");
+    push @made, $t->tx->res->json if $t->tx->res->code == 201;
+    return $t;
+  };
+
+  # No header at all: the socket peer, which is what every other subtest in this
+  # file is quietly relying on still being true.
+  $plant->('127.0.0.1');
+  $upload->('who-a.md')->status_is(429);
+
+  # And it really was the peer that was consulted, not some catch-all bucket
+  # that everything falls into: somebody else's full bucket leaves a headerless
+  # request alone.
+  $plant->('203.0.113.5');
+  $upload->('who-b.md')->status_is(201);
+
+  # One hop, from a peer that is allowed to add one: the forwarded address is
+  # the client, and it is the address the limiter counts.
+  $plant->('203.0.113.5');
+  $upload->('who-c.md', {'X-Forwarded-For' => '203.0.113.5'})->status_is(429)
+    ->json_like('/error' => qr/too many uploads/)
+    ->header_like('Retry-After' => qr/\A\d+\z/);
+
+  # The peer is no longer the key once a forwarded address is believed. If it
+  # were, every client behind the proxy would share one bucket and the first
+  # busy agent would lock out all the others — a self-inflicted denial of
+  # service that a deployment behind Traefik would hit on day one.
+  $plant->('127.0.0.1');
+  $upload->('who-d.md', {'X-Forwarded-For' => '203.0.113.5'})->status_is(201);
+
+  # The security property, and the reason any of this changed.
+  #
+  # `9.9.9.9, 203.0.113.5` is what a hostile client produces by sending an
+  # X-Forwarded-For of its own: the proxy appends the address it actually saw
+  # (203.0.113.5) to whatever arrived, so the LEFT-most entry is the one entry
+  # in the list the client chose. The old hand-rolled _client believed exactly
+  # that entry — and CF-Connecting-IP ahead of it, unconditionally — which
+  # handed the limiter over in both directions: rotate the header and no bucket
+  # ever fills, so the limit is off; or write a victim's address into it and
+  # fill THEIRS instead, throttling a chosen agent out of a chat room from
+  # outside it.
+  #
+  # Right-to-left with the trusted hops skipped means the address the proxy
+  # appended is the one that counts and the client's contribution is inert. So
+  # this request is 203.0.113.5's, and 203.0.113.5's bucket is full.
+  $plant->('203.0.113.5');
+  $upload->('spoof-a.md', {'X-Forwarded-For' => '9.9.9.9, 203.0.113.5'})->status_is(429);
+
+  # The other half of the same property, and the half that names the victim: the
+  # spoofer must not be able to reach 9.9.9.9's bucket at all. Fill it, and the
+  # spoofed request sails through — it was never counted there, so nothing it
+  # sends can throttle 9.9.9.9.
+  $plant->('9.9.9.9');
+  $upload->('spoof-b.md', {'X-Forwarded-For' => '9.9.9.9, 203.0.113.5'})->status_is(201);
+
+  # ...while 9.9.9.9 itself, arriving through the same proxy as a single honest
+  # hop, is still refused on the hit planted just above. Deliberately no re-plant
+  # between these two: one state of the table, two different answers, which is
+  # what "separate buckets" means.
+  $upload->('spoof-c.md', {'X-Forwarded-For' => '9.9.9.9'})->status_is(429);
+
+  $s->rate_per_second(0);
+  $s->rate_per_minute(0);
+  $s->sql->db->query('DELETE FROM upload_hits');
+  _delete($_->{id}, $_->{delete_password})->code == 200 or die 'cleanup failed' for @made;
+};
+
+subtest 'the retired proxy setting refuses to boot' => sub {
+  # SHARE_TRUSTED_PROXIES is gone, and it is gone loudly. An instance upgraded
+  # with that line still in its .env is one where the operator believes
+  # forwarded addresses are being checked against a list and where nothing is:
+  # ignoring it quietly would leave the box less safe than the file it was
+  # configured from says it is. So the app declines to start and names the
+  # variable that replaced it.
+  #
+  # In a subprocess, because share.pl is already loaded in THIS one and
+  # Mojolicious::Lite's app is a singleton in main — the same trap the hammering
+  # subtest above documents. `version` is the command only because it is the
+  # cheapest one Mojolicious has: the check fires while the config is read, long
+  # before app->start looks at ARGV, so any command at all would do.
+  my $script = curfile->dirname->sibling('share.pl');
+
+  my $run = sub (%env) {
+    my $dir = File::Temp->newdir;
+    # An explicit environment rather than the parent's. This process has
+    # SHARE_ROOT, SHARE_NOTICE, both rate limits and both MOJO_ proxy settings
+    # in %ENV, and a child inheriting those would be answering a question nobody
+    # asked. PERL5LIB stays because it is how the dependencies are found at all.
+    local %ENV = (
+      PATH       => $ENV{PATH}     // '',
+      PERL5LIB   => $ENV{PERL5LIB} // '',
+      SHARE_ROOT => "$dir",
+      %env,
+    );
+    # 2>&1 because the refusal is a die, and a die goes to stderr; qx would
+    # otherwise hand back an empty string and the `like` below would fail for
+    # the wrong reason.
+    my $said = qx{"$^X" "$script" version 2>&1};
+    return ($? >> 8, $said);
+  };
+
+  my ($status, $said) = $run->(SHARE_TRUSTED_PROXIES => '172.18.0.1');
+  isnt $status, 0, 'a set SHARE_TRUSTED_PROXIES stops the app before it serves anything';
+  like $said, qr/MOJO_TRUSTED_PROXIES/, 'and the complaint names what to use instead';
+
+  # Set, and empty — the same shape as SHARE_MAX_TOTAL_BYTES at the top of this
+  # file, and the same trap. A compose file forwarding ${SHARE_TRUSTED_PROXIES:-}
+  # puts an empty string in the environment of every container when NOBODY has
+  # set it, so refusing on defined-ness rather than on length would take down
+  # every deployment that pulled the new image. This repo has been bitten by
+  # exactly that once already.
+  ($status, $said) = $run->(SHARE_TRUSTED_PROXIES => '');
+  is $status, 0, 'an empty one is nobody having said anything, and boots'
+    or diag $said;
 };
 
 # ----------------------------------------------------------------- viewer ----

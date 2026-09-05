@@ -45,6 +45,39 @@ package Share { use constant SOURCE_URL => 'https://github.com/melo/small-share-
 
 # --------------------------------------------------------------- config ------
 
+# SHARE_TRUSTED_PROXIES is gone, and a deployment that still sets it must not
+# come up. The name changed because the job moved to Mojolicious, and with it the
+# meaning of the value: what used to be a list of address prefixes matched by
+# hand is now a list of CIDR networks Mojolicious walks X-Forwarded-For against.
+# Ignoring the old name silently would leave an operator with a proxy allow-list
+# they believe is in force and a rate limiter counting whatever the proxy chose
+# to forward -- the failure this whole path exists to prevent. So refuse to boot,
+# here rather than at the first request, so that every command trips it and
+# nobody discovers the rename from a subtly wrong bucket a week later.
+#
+# `length` and not `defined`: a compose file forwarding `${SHARE_TRUSTED_PROXIES:-}`
+# puts an empty string in the environment when nobody set the variable at all,
+# and refusing to start for that would take down every deployment that copied a
+# compose file and never touched this. Set-and-empty is unset, which is the same
+# bargain _number() makes below.
+if (defined $ENV{SHARE_TRUSTED_PROXIES} && length $ENV{SHARE_TRUSTED_PROXIES}) {
+  die <<'END_RENAMED';    ## no critic (RequireCarping)
+SHARE_TRUSTED_PROXIES is no longer read: it was renamed to MOJO_TRUSTED_PROXIES,
+and Mojolicious now decides which forwarded address to believe.
+
+The value syntax changed with the name. It is a comma-separated list of CIDR
+networks, not address prefixes, and both IPv4 and IPv6 work:
+
+    MOJO_TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12
+
+Put the networks your proxies actually connect from in it. CF-Connecting-IP is
+no longer read at all -- Cloudflare appends the client to X-Forwarded-For too,
+so listing Cloudflare's ranges here gives the same answer.
+
+Unset SHARE_TRUSTED_PROXIES once MOJO_TRUSTED_PROXIES is set, and this starts.
+END_RENAMED
+}
+
 my %CFG = (
   root      => $ENV{SHARE_ROOT}      || '/workspace',
   base_url  => $ENV{SHARE_BASE_URL}  || '',
@@ -1275,13 +1308,6 @@ sub _delete_password ($c) {
   return defined $param && length $param ? $param : undef;
 }
 
-# Who is being limited.
-#
-# Behind Cloudflare the honest answer is CF-Connecting-IP; behind Traefik alone
-# it is the left-most X-Forwarded-For, which MOJO_REVERSE_PROXY already resolves
-# into remote_address. Neither is forgeable by a client that is actually behind
-# the proxy, and a deployment with nothing in front has no forwarded headers to
-# be confused by.
 # Who to count this request against.
 #
 # `CF-Connecting-IP` used to be believed unconditionally, and three of the four
@@ -1293,37 +1319,35 @@ sub _delete_password ($c) {
 # offender's -- so defeating the limiter was also a way to delete other people's
 # shares.
 #
-# A forwarded address is now only believed from a peer that is allowed to send
-# one. SHARE_TRUSTED_PROXIES is a comma-separated list of addresses or CIDR
-# prefixes; empty, the default, means trust nothing and use the peer.
-sub _client ($c) {
-  my $peer = $c->tx->remote_address // 'unknown';
-  return $peer unless _trusted_proxy($peer);
-
-  for my $header (qw(CF-Connecting-IP X-Forwarded-For)) {
-    my $value = $c->req->headers->header($header) // next;
-    # The left-most entry is the original client; everything after it was added
-    # by a hop. Only the nearest hop is trusted to have got it right.
-    my ($first) = split /\s*,\s*/, $value;
-    return $first if defined $first && length $first;
-  }
-  return $peer;
-}
-
-# Cheap prefix matching rather than real CIDR arithmetic: this is a small
-# allow-list an operator writes by hand, and pulling in a netmask library to
-# compare a handful of strings would be a new runtime dependency for nothing.
-# A prefix must end at a dot boundary so that 10.1.2 cannot match 10.1.20.
-sub _trusted_proxy ($peer) {
-  state $trusted = [grep { length } split /\s*,\s*/, ($ENV{SHARE_TRUSTED_PROXIES} // '')];
-  return 0 unless @$trusted;
-  for my $entry (@$trusted) {
-    my $prefix = $entry =~ s{/\d+\z}{}r;
-    return 1 if $peer eq $prefix;
-    return 1 if index($peer, "$prefix.") == 0;
-  }
-  return 0;
-}
+# The hand-rolled allow-list that replaced it was wrong twice over. It tested
+# SHARE_TRUSTED_PROXIES against remote_address, which under the shipped
+# MOJO_REVERSE_PROXY=1 is not the socket peer at all but an address out of
+# X-Forwarded-For -- so the setting either never fired, or fired for a client and
+# handed that client the header it was meant to be protected from. And its CIDR
+# entries had the /NN stripped rather than interpreted, so 172.64.0.0/13 matched
+# one address and no v6 range could be written at all: Cloudflare's own ranges,
+# the case the header existed for, were not expressible.
+#
+# So it is Mojolicious' job now. Given MOJO_TRUSTED_PROXIES it walks
+# X-Forwarded-For from the right with the socket peer appended, drops every hop
+# that Mojo::Util::network_contains places inside a trusted network -- real CIDR,
+# v4 and v6 -- and stops at the first address that is not one of ours. That is
+# the nearest hop nobody here vouched for, and so the one a client cannot choose
+# for itself: the identity the code this replaced was trying to hand-roll.
+#
+# An empty list is not the same as no proxy. With MOJO_REVERSE_PROXY set and
+# nothing trusted there is no walk to do, and Mojolicious takes the right-most
+# X-Forwarded-For entry as it stands -- right on the compose files precisely
+# because the app's port is reachable only from the sidecar that wrote that entry,
+# and wrong the moment anything else can reach it. Set neither and the socket
+# peer is all there is, which is the answer for a box with nothing in front.
+#
+# CF-Connecting-IP is deliberately no longer read. Cloudflare appends the client
+# to X-Forwarded-For as well, so with Cloudflare's ranges in MOJO_TRUSTED_PROXIES
+# -- expressible now, which they never were -- the walk arrives at the same
+# address the header would have carried, and there is one fewer header anyone
+# has to reason about.
+sub _client ($c) { return $c->tx->remote_address // 'unknown' }
 
 # Returns a Retry-After value when the caller must wait, undef when it may go.
 sub _rate_limited ($c) {

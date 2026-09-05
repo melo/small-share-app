@@ -67,12 +67,32 @@ services:
       # whose agents cannot be restarted yet.
       SHARE_CHAT_REQUIRE_TOKEN: ${SHARE_CHAT_REQUIRE_TOKEN:-1}
 
-      # Peers allowed to tell this instance who the real client is, as a
-      # comma-separated list of addresses or CIDR prefixes. Empty means trust
-      # nobody and count the peer itself -- which is right unless something in
-      # front sets CF-Connecting-IP or X-Forwarded-For. Believing that header
-      # from anyone lets a caller rotate it to escape the rate limit, or put
-      # somebody else's address in it to throttle them out of a room.
+      # Addresses and CIDR networks whose X-Forwarded-For this believes, as a
+      # comma-separated list -- bare addresses or real networks, v4 and v6
+      # alike (172.18.0.1, 10.0.0.0/8, 2400:cb00::/32). Mojolicious walks the
+      # header from the right with the socket peer appended, drops every hop
+      # that falls inside one of these, and counts the first that does not: the
+      # nearest hop nobody here vouched for, and so the one address a caller
+      # cannot choose for itself.
+      #
+      # Empty is right for a box with nothing in front of it: with
+      # MOJO_REVERSE_PROXY off the socket peer is the client, which is all
+      # there is to go on. Put a proxy of your own in front and both settings
+      # want filling in -- this one with the address or network that proxy
+      # speaks to the app from.
+      #
+      # Erring generous is what this guards against: believing a forwarded
+      # address from anyone lets a caller rotate it to escape the rate limit,
+      # or put somebody else's address in it to throttle them out of a room.
+      MOJO_TRUSTED_PROXIES: ${MOJO_TRUSTED_PROXIES:-}
+
+      # Retired, and forwarded anyway on purpose: the app refuses to start when
+      # this arrives with a value, and names MOJO_TRUSTED_PROXIES instead. An
+      # .env still carrying the old spelling stops the stack rather than
+      # quietly counting the wrong thing -- which is what the old setting did on any
+      # stack with MOJO_REVERSE_PROXY on, where it was matched against a
+      # forwarded address and so could never match the proxy at all. Expected to
+      # go in a later release.
       SHARE_TRUSTED_PROXIES: ${SHARE_TRUSTED_PROXIES:-}
 
       # How long a member may say nothing at all before the room concludes they
@@ -89,7 +109,11 @@ services:
       SHARE_NOTICE: ${SHARE_NOTICE:-}
       MOJO_MODE: ${MOJO_MODE:-production}
       # Only meaningful behind a proxy that sets X-Forwarded-*. Harmless
-      # otherwise, and wrong to trust if anything can reach the port directly.
+      # otherwise, and wrong to trust if anything can reach the port directly:
+      # on it, and with MOJO_TRUSTED_PROXIES empty, the right-most
+      # X-Forwarded-For entry is taken as the client, and whoever can reach the
+      # port writes that entry. Turn it on together with MOJO_TRUSTED_PROXIES,
+      # or leave both alone and be counted by socket address.
       MOJO_REVERSE_PROXY: ${MOJO_REVERSE_PROXY:-0}
 
     volumes:
